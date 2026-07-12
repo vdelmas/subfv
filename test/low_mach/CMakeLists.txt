@@ -1,0 +1,5 @@
+add_subdirectory(potential_flow_2d)
+add_subdirectory(potential_flow_2d_quad)
+add_subdirectory(kelvin_helmholtz_quad)
+add_subdirectory(gresho_quad)
+add_subdirectory(gresho_tri)

@@ -1,0 +1,100 @@
+\documentclass[a4paper]{article}
+\usepackage[margin=1.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{filemod}
+\captionsetup{justification=centering}
+\newcommand{\fmodhhmm}[7]{#4:#5}
+\newcommand{\filetime}[1]{\filemodparse{\fmodhhmm}{#1}}
+\newlength{\figheight}
+\title{Temperature / Cp / C$_H$ -- half\_cylinder\_tri\_ns -- Ordre~2 M\'ethode~4}
+\author{Vincent Delmas}
+\date{}
+\begin{document}
+\maketitle
+\setlength{\figheight}{\dimexpr\textwidth*9/16*4/10\relax}
+\begin{figure}[H]
+  \centering
+  \IfFileExists{outputs/two_wave/images/output_-1_mesh.png}{%
+    \includegraphics[width=\textwidth]{outputs/two_wave/images/output_-1_mesh.png}%
+  }{}%
+\end{figure}
+\clearpage
+\newcommand{\casefig}[2]{%
+  \begin{figure}[H]
+    \begin{subfigure}[t]{0.40\textwidth}
+      \centering
+      \begin{minipage}[c][\figheight][c]{\linewidth}
+        \centering
+        \IfFileExists{#1/images/output_-1_Temperature.png}{%
+          \includegraphics[width=\linewidth]{#1/images/output_-1_Temperature.png}%
+        }{%
+          \fbox{\begin{minipage}[c][\dimexpr\figheight*3/4-2\fboxsep-2\fboxrule\relax][c]%
+            {\dimexpr\linewidth*3/4-2\fboxsep-2\fboxrule\relax}%
+            \centering\small non disponible%
+          \end{minipage}}%
+        }%
+      \end{minipage}%
+    \end{subfigure}%
+    \hfill
+    \begin{subfigure}[t]{0.28\textwidth}
+      \centering
+      \begin{minipage}[c][\figheight][c]{\linewidth}
+        \centering
+        \IfFileExists{#1/plot_cp.pdf}{%
+          \includegraphics[width=\linewidth]{#1/plot_cp.pdf}%
+        }{%
+          \fbox{\begin{minipage}[c][\dimexpr\figheight*3/4-2\fboxsep-2\fboxrule\relax][c]%
+            {\dimexpr\linewidth*3/4-2\fboxsep-2\fboxrule\relax}%
+            \centering\small non disponible%
+          \end{minipage}}%
+        }%
+      \end{minipage}%
+    \end{subfigure}%
+    \hfill
+    \begin{subfigure}[t]{0.28\textwidth}
+      \centering
+      \begin{minipage}[c][\figheight][c]{\linewidth}
+        \centering
+        \IfFileExists{#1/plot_st.pdf}{%
+          \includegraphics[width=\linewidth]{#1/plot_st.pdf}%
+        }{%
+          \fbox{\begin{minipage}[c][\dimexpr\figheight*3/4-2\fboxsep-2\fboxrule\relax][c]%
+            {\dimexpr\linewidth*3/4-2\fboxsep-2\fboxrule\relax}%
+            \centering\small non disponible%
+          \end{minipage}}%
+        }%
+      \end{minipage}%
+    \end{subfigure}%
+    \IfFileExists{#1/images/output_-1_Temperature.png}{%
+      \caption*{\texttt{#2}\\\small%
+        \filemodprintdate{#1/images/output_-1_Temperature.png}~%
+        \filetime{#1/images/output_-1_Temperature.png}}%
+    }{%
+      \caption*{\texttt{#2}}%
+    }%
+  \end{figure}%
+}
+\casefig{outputs/two_wave_o2_4}{half\_cylinder\_tri\_ns\_two\_wave\_o2\_4}
+\casefig{outputs/three_wave_o2_4}{half\_cylinder\_tri\_ns\_three\_wave\_o2\_4}
+\casefig{outputs/modified_three_wave_o2_4}{half\_cylinder\_tri\_ns\_modified\_three\_wave\_o2\_4}
+\casefig{outputs/multi_point_o2_4}{half\_cylinder\_tri\_ns\_multi\_point\_o2\_4}
+\casefig{outputs/multi_point_iso_o2_4}{half\_cylinder\_tri\_ns\_multi\_point\_iso\_o2\_4}
+\casefig{outputs/ZB_AR1D_LS_o2_4}{half\_cylinder\_tri\_ns\_ZB\_AR1D\_LS\_o2\_4}
+\casefig{outputs/ZB_AR1D_LSM_o2_4}{half\_cylinder\_tri\_ns\_ZB\_AR1D\_LSM\_o2\_4}
+\casefig{outputs/ZB_ARMD_LS_o2_4}{half\_cylinder\_tri\_ns\_ZB\_ARMD\_LS\_o2\_4}
+\casefig{outputs/ZB_ARMD_LSM_o2_4}{half\_cylinder\_tri\_ns\_ZB\_ARMD\_LSM\_o2\_4}
+\casefig{outputs/ZB_ARMDM_LS_o2_4}{half\_cylinder\_tri\_ns\_ZB\_ARMDM\_LS\_o2\_4}
+\casefig{outputs/ZB_ARMDM_LSM_o2_4}{half\_cylinder\_tri\_ns\_ZB\_ARMDM\_LSM\_o2\_4}
+\casefig{outputs/ZB_ARMDMAT_LS_o2_4}{half\_cylinder\_tri\_ns\_ZB\_ARMDMAT\_LS\_o2\_4}
+\casefig{outputs/ZB_ARMDMAT_LSM_o2_4}{half\_cylinder\_tri\_ns\_ZB\_ARMDMAT\_LSM\_o2\_4}
+\casefig{outputs/ZB_ARMDMMAT_LS_o2_4}{half\_cylinder\_tri\_ns\_ZB\_ARMDMMAT\_LS\_o2\_4}
+\casefig{outputs/ZB_ARMDMMAT_LSM_o2_4}{half\_cylinder\_tri\_ns\_ZB\_ARMDMMAT\_LSM\_o2\_4}
+\casefig{outputs/ZB_AM_LS_o2_4}{half\_cylinder\_tri\_ns\_ZB\_AM\_LS\_o2\_4}
+\casefig{outputs/ZB_AM_LSM_o2_4}{half\_cylinder\_tri\_ns\_ZB\_AM\_LSM\_o2\_4}
+\casefig{outputs/ZB_AMISO_LS_o2_4}{half\_cylinder\_tri\_ns\_ZB\_AMISO\_LS\_o2\_4}
+\casefig{outputs/ZB_AMISO_LSM_o2_4}{half\_cylinder\_tri\_ns\_ZB\_AMISO\_LSM\_o2\_4}
+\end{document}

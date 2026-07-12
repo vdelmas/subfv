@@ -1,0 +1,256 @@
+\documentclass[a4paper]{article}
+\usepackage[margin=2cm]{geometry}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{caption}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, calc}
+\usepackage[backend=biber, style=numeric, sorting=none]{biblatex}
+\addbibresource{refs.bib}
+
+\captionsetup[figure]{skip=2pt}
+
+\newcommand{\schemeline}[1]{%
+  \noindent
+  \begin{minipage}[t]{0.32\linewidth}
+    \includegraphics[width=\linewidth]{residuals_#1.pdf}
+  \end{minipage}\hfill
+  \begin{minipage}[t]{0.32\linewidth}
+    \includegraphics[width=\linewidth]{errors_cp_#1.pdf}
+  \end{minipage}\hfill
+  \begin{minipage}[t]{0.32\linewidth}
+    \includegraphics[width=\linewidth]{errors_ch_#1.pdf}
+  \end{minipage}
+  \captionof{figure}{\texttt{#1}}
+  \vspace{4pt}
+}
+
+\begin{document}
+
+%% -----------------------------------------------------------------------
+%% Page 1 -- Test case description
+%% -----------------------------------------------------------------------
+\begin{center}
+  {\LARGE\bfseries Half-cylinder at Mach 17.605 -- Hybrid mesh study}
+\end{center}
+
+\bigskip
+
+\noindent
+\textbf{Test case.}
+We study the hypersonic flow over a half-cylinder at Mach $17.605$, taken from the NASA
+benchmark database~\cite{FUN3D} (see also~\cite{Delmas2026}, Chapter~6).  Reference solutions for the pressure coefficient~$C_p$
+and the heat-flux coefficient~$C_h$ (Stanton number) are provided by the LAURA and FUN3D
+solvers from NASA.  Adherence boundary conditions are applied on the cylinder wall with an
+imposed wall temperature of $\theta_\mathrm{wall} = 500~\mathrm{K}$.
+The free-stream conditions are listed in Table~\ref{tab:params}.
+
+\bigskip
+
+\begin{table}[h!]
+  \centering
+  \caption{Free-stream parameters for the half-cylinder at Mach $17.605$.}
+  \label{tab:params}
+  \renewcommand{\arraystretch}{1.3}
+  \begin{tabular}{lll}
+    \toprule
+    Parameter & Symbol & Value \\
+    \midrule
+    Mach number           & $\mathrm{Ma}_\infty$    & $17.605$ \\
+    Free-stream density   & $\rho_\infty$           & $10^{-3}~\mathrm{kg\,m^{-3}}$ \\
+    Free-stream velocity  & $V_\infty$              & $5000~\mathrm{m\,s^{-1}}$ \\
+    Free-stream pressure  & $p_\infty$              & $57.616~\mathrm{Pa}$ \\
+    Free-stream temperature & $\theta_\infty$       & $200~\mathrm{K}$ \\
+    Wall temperature      & $\theta_\mathrm{wall}$  & $500~\mathrm{K}$ \\
+    Prandtl number        & $\mathrm{Pr}$           & $0.71$ \\
+    Reynolds number       & $Re_L$                  & $3.7693\times10^5~\mathrm{m^{-1}}$ \\
+    Dynamic viscosity     & $\mu$                   & Sutherland's law \\
+    Heat conductivity     & $\kappa$                & From Prandtl number \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\bigskip
+
+\noindent
+\textbf{Mesh.}
+All computations presented here use a \textbf{hybrid} mesh: the boundary layer is
+discretised with quadrilateral (quad) cells aligned with the wall, while the rest of
+the domain (far field) is filled with unstructured triangles.
+The boundary layer zone contains 156 cells in the tangential direction and 24 cells in
+the normal direction.
+This hybrid configuration is more representative of practical unstructured meshes
+encountered in industrial applications than a fully structured quad mesh.
+
+\bigskip
+
+\noindent
+\textbf{Compared schemes.}
+All schemes are subface-based, cell-centered finite volume approximate Riemann solvers
+developed in~\cite{Delmas2025,Delmas2026}.
+They share the same positivity-preserving wave-speed computation (ensuring positive
+intermediate densities and internal energies) and differ only in how they treat the
+contact wave and tangential velocity.
+
+\begin{description}
+  \item[\texttt{two\_wave}] (HLL-like)
+    A single intermediate star state is assumed.
+    Both contact discontinuities and shear layers are diffused, which leads to excessive
+    numerical viscosity in the boundary layer and a significant overestimate of the wall
+    heat flux at first order~\cite{Delmas2026}.
+
+  \item[\texttt{three\_wave}] (HLLC-like)
+    A central contact wave separates two star regions with distinct densities and
+    tangential velocities.
+    Shear layers and contact discontinuities aligned with the mesh are resolved exactly.
+    However, this scheme is susceptible to carbuncle-type instabilities~\cite{Delmas2025},
+    which appear strongly on unstructured and hybrid meshes.
+
+  \item[\texttt{modified\_three\_wave}] (HLLCM-like)
+    The three-wave density structure is retained but the tangential velocity is averaged
+    as in the two-wave scheme.
+    This suppresses carbuncle instabilities while preserving sharp contact resolution.
+    However, the residual viscosity on shear layers does not vanish with normal-direction
+    mesh refinement on anisotropic elements, preventing convergence to the correct heat
+    flux~\cite{Delmas2026}.
+
+  \item[\texttt{multi\_point\_iso}] (Isotropic multi-point)
+    A node-conservative scheme that couples all Riemann problems sharing a mesh node
+    through a local linear system, introducing genuine multidimensional coupling.
+    The nodal velocity is computed with isotropic weights that cancel face-area
+    anisotropy, so that the numerical diffusion on shear layers decreases when the mesh
+    is refined in the wall-normal direction without growing when refined along the wall.
+    This scheme is stable (no carbuncle) and accurately predicts heat fluxes on
+    anisotropic hybrid meshes~\cite{Delmas2025,Delmas2026}.
+\end{description}
+
+\bigskip
+
+\newpage
+
+\noindent
+\textbf{Parametric study.}
+The sensitivity of the four Eulerian schemes (\texttt{two\_wave}, \texttt{three\_wave},
+\texttt{modified\_three\_wave}, \texttt{multi\_point\_iso}) to the mesh resolution is
+assessed by varying two independent parameters:
+\begin{itemize}
+  \item \textbf{First cell size} $d_\mathrm{wall}$ (x-axis): size of the first
+        quadrilateral cell at the wall in the boundary layer, ranging from
+        $2\times10^{-5}$ to $10^{-3}$ (10 values, logarithmically spaced).
+  \item \textbf{Far-field cell size} (y-axis): characteristic size of the triangular
+        cells in the far-field region, ranging from $0.2$ to $2.0$ (10 values,
+        linearly spaced).
+\end{itemize}
+This produces a $10\times10$ grid of 100 simulations per scheme.
+For each simulation, the RMSE relative error (\%) on $C_p$ and $C_h$ with respect to
+the NASA reference solution and the normalised final residual $R_\mathrm{final}/R_0$
+are collected and displayed on the maps on the following pages.
+
+\bigskip
+
+\noindent
+\textbf{Reading the maps.}
+The diagram on the following page illustrates how the mesh resolution varies across the
+parameter space.
+Each map covers the same $10\times10$ grid; a point near a given corner corresponds to
+the mesh configuration described by the arrows.
+For each corner, the left image shows the full mesh and the right image is a close-up
+of the boundary layer.
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+    >=Stealth,
+    every node/.style={font=\small},
+    box/.style={draw, minimum width=4cm, minimum height=3cm, fill=white},
+    img/.style={draw=gray!60, thick, inner sep=1pt}
+  ]
+
+  % Box: fond blanc, cellules de coin colorées, grille 10x10, bordure
+  \fill[white] (-2,-1.5) rectangle (2,1.5);
+  \fill[blue!15] (-2,1.2) rectangle (-1.6,1.5);
+  \fill[blue!15] (1.6,1.2) rectangle (2,1.5);
+  \fill[blue!15] (-2,-1.5) rectangle (-1.6,-1.2);
+  \fill[blue!15] (1.6,-1.5) rectangle (2,-1.2);
+  \draw[gray!50, very thin, xstep=0.4, ystep=0.3] (-2,-1.5) grid (2,1.5);
+  \node[draw, minimum width=4cm, minimum height=3cm, inner sep=0, fill=none] (map) at (0,0) {};
+
+  \node[anchor=north, font=\footnotesize\itshape] at (map.south)
+    {First cell size $d_\mathrm{wall}$};
+  \node[rotate=90, anchor=south, font=\footnotesize\itshape] at (map.west)
+    {Far-field cell size};
+
+  % Points aux centres des cellules de coin
+  \filldraw[black] (-1.8, 1.35) circle (2pt);
+  \filldraw[black] ( 1.8, 1.35) circle (2pt);
+  \filldraw[black] (-1.8,-1.35) circle (2pt);
+  \filldraw[black] ( 1.8,-1.35) circle (2pt);
+
+  %% Top-left: coarse FF, fine BL  (above box, left side)
+  \node[img] (tl) at (-3.5, 4.5) {%
+    \begin{tabular}{@{}c@{\hspace{2pt}}c@{}}
+      \includegraphics[width=3cm, trim={2434bp 1200bp 2436bp 1200bp}, clip]%
+        {corners_visu/top_left_mesh.png} &
+      \includegraphics[width=3cm, trim={3600bp 2442bp 3200bp 2442bp}, clip]%
+        {corners_visu/top_left_mesh.png}
+    \end{tabular}};
+  \node[font=\tiny\bfseries, align=center, anchor=north] at (tl.south)
+    {Coarse FF / Fine BL \quad $f_\infty=2.0$,\ $d_w=2{\times}10^{-5}$};
+  \draw[->] (-1.8, 1.35) -- (tl.south);
+
+  %% Top-right: coarse FF, coarse BL  (above box, right side)
+  \node[img] (tr) at (3.5, 4.5) {%
+    \begin{tabular}{@{}c@{\hspace{2pt}}c@{}}
+      \includegraphics[width=3cm, trim={2434bp 1200bp 2436bp 1200bp}, clip]%
+        {corners_visu/top_right_mesh.png} &
+      \includegraphics[width=3cm, trim={3600bp 2442bp 3200bp 2442bp}, clip]%
+        {corners_visu/top_right_mesh.png}
+    \end{tabular}};
+  \node[font=\tiny\bfseries, align=center, anchor=north] at (tr.south)
+    {Coarse FF / Coarse BL \quad $f_\infty=2.0$,\ $d_w=10^{-3}$};
+  \draw[->] ( 1.8, 1.35) -- (tr.south);
+
+  %% Bottom-left: fine FF, fine BL  (below box, left side)
+  \node[img] (bl) at (-3.5, -4.5) {%
+    \begin{tabular}{@{}c@{\hspace{2pt}}c@{}}
+      \includegraphics[width=3cm, trim={2434bp 1200bp 2436bp 1200bp}, clip]%
+        {corners_visu/bottom_left_mesh.png} &
+      \includegraphics[width=3cm, trim={3600bp 2442bp 3200bp 2442bp}, clip]%
+        {corners_visu/bottom_left_mesh.png}
+    \end{tabular}};
+  \node[font=\tiny\bfseries, align=center, anchor=south] at (bl.north)
+    {Fine FF / Fine BL \quad $f_\infty=0.2$,\ $d_w=2{\times}10^{-5}$};
+  \draw[->] (-1.8,-1.35) -- (bl.north);
+
+  %% Bottom-right: fine FF, coarse BL  (below box, right side)
+  \node[img] (br) at (3.5, -4.5) {%
+    \begin{tabular}{@{}c@{\hspace{2pt}}c@{}}
+      \includegraphics[width=3cm, trim={2434bp 1200bp 2436bp 1200bp}, clip]%
+        {corners_visu/bottom_right_mesh.png} &
+      \includegraphics[width=3cm, trim={3600bp 2442bp 3200bp 2442bp}, clip]%
+        {corners_visu/bottom_right_mesh.png}
+    \end{tabular}};
+  \node[font=\tiny\bfseries, align=center, anchor=south] at (br.north)
+    {Fine FF / Coarse BL \quad $f_\infty=0.2$,\ $d_w=10^{-3}$};
+  \draw[->] ( 1.8,-1.35) -- (br.north);
+
+\end{tikzpicture}}
+\end{center}
+
+%% -----------------------------------------------------------------------
+%% Following pages -- one row per scheme: residual | Cp error | Ch error
+%% -----------------------------------------------------------------------
+
+\newpage
+\schemeline{two\_wave}
+\schemeline{three\_wave}
+\schemeline{modified\_three\_wave}
+\schemeline{multi\_point\_iso}
+\schemeline{ZB\_AMISO\_LVPPP}
+
+\newpage
+\printbibliography
+
+\end{document}

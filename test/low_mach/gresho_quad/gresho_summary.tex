@@ -1,0 +1,79 @@
+\documentclass[a4paper]{article}
+\usepackage[margin=1.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{caption}
+\usepackage{booktabs}
+\usepackage{array}
+
+\captionsetup[figure]{skip=2pt}
+
+\newcommand{\schemefig}[1]{%
+  \begin{minipage}[t]{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{outputs/#1/velocity_profile.pdf}\\[2pt]
+    {\small\bfseries #1}
+  \end{minipage}}
+
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries Gresho vortex -- Velocity norm vs radius}
+\end{center}
+
+\bigskip
+
+\noindent
+\textbf{Test case.}
+Gresho vortex on a $20\times20$ quad mesh, $[0,1]^2$ domain, center at $(0.5,0.5)$.
+Mach number $M_\infty = 10^{-5}$ (very low Mach, compressible solver).
+CFL$=0.4$, $t_\mathrm{max}=10^{-4}$.
+Analytical solution: $v_\theta = 5r$ for $r < 0.2$, $v_\theta = 2 - 5r$ for $0.2 \le r < 0.4$, $v_\theta = 0$ for $r \ge 0.4$.
+
+\medskip
+\noindent
+\textbf{Note.}
+The large gap between numerical and analytical results is expected at first order on this
+coarse mesh in the very-low-Mach regime: compressible solvers exhibit $O(M^{-2})$ excess
+dissipation, which effectively damps the vortex over $t_\mathrm{max}=10^{-4}$.
+
+\bigskip
+
+%% --- Row 1: classical schemes ---
+\noindent
+\schemefig{two\_wave}\hfill\schemefig{three\_wave}
+
+\noindent
+\schemefig{modified\_three\_wave}\hfill\schemefig{multi\_point}
+
+\noindent
+\schemefig{multi\_point\_iso}\hfill\phantom{\schemefig{multi\_point\_iso}}
+
+\newpage
+
+%% --- Row 2: ZB AR1D ---
+\noindent
+\schemefig{ZB\_AR1D\_LS}\hfill\schemefig{ZB\_AR1D\_LSM}
+
+\medskip\noindent
+\schemefig{ZB\_ARMD\_LS}\hfill\schemefig{ZB\_ARMD\_LSM}
+
+\medskip\noindent
+\schemefig{ZB\_ARMDM\_LS}\hfill\schemefig{ZB\_ARMDM\_LSM}
+
+\medskip\noindent
+\schemefig{ZB\_ARMDMAT\_LS}\hfill\schemefig{ZB\_ARMDMAT\_LSM}
+
+\newpage
+
+%% --- Row 3: ZB ARMDMMAT + AM + AMISO ---
+\noindent
+\schemefig{ZB\_ARMDMMAT\_LS}\hfill\schemefig{ZB\_ARMDMMAT\_LSM}
+
+\medskip\noindent
+\schemefig{ZB\_AM\_LS}\hfill\schemefig{ZB\_AM\_LSM}
+
+\medskip\noindent
+\schemefig{ZB\_AMISO\_LS}\hfill\schemefig{ZB\_AMISO\_LSM}
+
+\end{document}

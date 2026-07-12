@@ -1,0 +1,6 @@
+add_subdirectory(riemann_problem_1d)
+add_subdirectory(sedov)
+add_subdirectory(half_cylinder)
+add_subdirectory(shear)
+add_subdirectory(low_mach)
+add_subdirectory(scaling_mpi)

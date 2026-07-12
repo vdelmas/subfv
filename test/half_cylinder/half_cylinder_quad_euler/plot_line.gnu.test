@@ -1,0 +1,10 @@
+set terminal pdf enhanced font 'Times,12' size 4in,3in
+set output 'plot_line.pdf'
+set datafile separator ','
+set grid
+set xlabel 'x'
+set ylabel 'Density'
+set xrange [-2:-1]
+set key top left
+set pointsize 0.5
+plot 'outputs/two_wave/line_export.csv' using 19:22 w lp lw 2 title 'Two Wave'

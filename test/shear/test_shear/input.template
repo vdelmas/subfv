@@ -1,0 +1,11 @@
+&INPUT_PARAM
+
+  meshfile_path='',
+  meshfile='MESH_PLACEHOLDER.msh'
+
+  scheme='SCHEME_PLACEHOLDER',
+
+  boundary_2d=.true.
+  error_2d_h=1e-3,
+
+  /

@@ -1,0 +1,219 @@
+\documentclass[aspectratio=169, 10pt]{beamer}
+
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, calc}
+\usepackage[backend=biber, style=numeric, sorting=none]{biblatex}
+\addbibresource{refs.bib}
+
+\usetheme{default}
+\usecolortheme{seahorse}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+\setbeamerfont{frametitle}{size=\large, series=\bfseries}
+
+\title{Half-cylinder at Mach 17.605\\[4pt] Hybrid mesh parametric study}
+\author{V. Delmas \and R. Loub\`ere \and P.-H. Maire}
+\institute{Universit\'e de Bordeaux / CEA Cesta}
+\date{}
+
+%% convenience macro: one row of 3 maps for a scheme
+\newcommand{\schemeslide}[2]{%
+  \begin{frame}{Results -- \texttt{#1} \hfill\small #2}
+    \centering
+    \includegraphics[width=0.32\textwidth]{residuals_#1.pdf}\hfill
+    \includegraphics[width=0.32\textwidth]{errors_cp_#1.pdf}\hfill
+    \includegraphics[width=0.32\textwidth]{errors_ch_#1.pdf}
+  \end{frame}%
+}
+
+\begin{document}
+
+%% -----------------------------------------------------------------------
+\begin{frame}
+  \titlepage
+\end{frame}
+
+%% -----------------------------------------------------------------------
+\begin{frame}{Test case -- NASA half-cylinder at Mach 17.605~\cite{FUN3D}}
+  \begin{columns}[T]
+    \begin{column}{0.48\textwidth}
+      \textbf{Configuration}
+      \begin{itemize}
+        \item Half-cylinder, flow at $\mathrm{Ma}_\infty = 17.605$
+        \item Wall temperature $\theta_\mathrm{wall} = 500~\mathrm{K}$
+        \item Reference $C_p$ and $C_h$ from NASA LAURA / FUN3D
+      \end{itemize}
+      \bigskip
+      \textbf{Mesh}
+      \begin{itemize}
+        \item \textbf{Hybrid}: quads in BL (156$\times$24) + triangles in far field
+        \item Representative of industrial unstructured grids
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \renewcommand{\arraystretch}{1.2}
+      \begin{tabular}{lll}
+        \toprule
+        Parameter & Symbol & Value \\
+        \midrule
+        Mach number    & $\mathrm{Ma}_\infty$  & $17.605$ \\
+        Density        & $\rho_\infty$         & $10^{-3}~\mathrm{kg\,m^{-3}}$ \\
+        Velocity       & $V_\infty$            & $5000~\mathrm{m\,s^{-1}}$ \\
+        Pressure       & $p_\infty$            & $57.6~\mathrm{Pa}$ \\
+        Temperature    & $\theta_\infty$       & $200~\mathrm{K}$ \\
+        Wall temp.     & $\theta_w$            & $500~\mathrm{K}$ \\
+        Prandtl        & $\mathrm{Pr}$         & $0.71$ \\
+        Reynolds       & $Re_L$                & $3.77\times10^5~\mathrm{m^{-1}}$ \\
+        \bottomrule
+      \end{tabular}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+%% -----------------------------------------------------------------------
+\begin{frame}{Compared schemes~\cite{Delmas2025, Delmas2026}}
+  All schemes: subface-based, cell-centered FV approximate Riemann solvers.
+  Same positivity-preserving wave speeds; differ in contact wave / tangential velocity treatment.
+  \bigskip
+  \begin{description}
+    \item[\texttt{two\_wave}] (HLL-like) — single star state; over-diffuses shear layers
+      $\Rightarrow$ over-estimates wall heat flux
+    \item[\texttt{three\_wave}] (HLLC-like) — exact contact resolution; \alert{carbuncle} on hybrid meshes
+    \item[\texttt{modified\_three\_wave}] (HLLCM-like) — stable contact, averaged tangential velocity;
+      residual diffusion on BL cells prevents convergence of $C_h$
+    \item[\texttt{multi\_point\_iso}] (Isotropic multi-point) — node-conservative, isotropic weights;
+      \textbf{stable + accurate} on anisotropic hybrid meshes
+  \end{description}
+\end{frame}
+
+%% -----------------------------------------------------------------------
+\begin{frame}[shrink=5]{Parameter space -- 100 simulations per scheme}
+  \begin{columns}[c]
+    \begin{column}{0.38\textwidth}
+      \small
+      \textbf{Two free parameters:}
+      \begin{itemize}
+        \item $d_\mathrm{wall}$: first BL cell size\\
+              ($2\times10^{-5}$ to $10^{-3}$, log-spaced)
+        \item $f_\infty$: far-field cell size\\
+              ($0.2$ to $2.0$, linear)
+      \end{itemize}
+      \medskip
+      $\Rightarrow$ $10\times10 = 100$ meshes per scheme.\\[4pt]
+      Highlighted corners: mesh images on the right.\\[4pt]
+      \textbf{Metrics:} $R_\mathrm{final}/R_0$,
+      relative RMSE on $C_p$ and $C_h$ (\%).
+    \end{column}
+    \begin{column}{0.58\textwidth}
+      \centering
+      \resizebox{\textwidth}{!}{%
+      \begin{tikzpicture}[
+          >=Stealth,
+          every node/.style={font=\small},
+          img/.style={draw=gray!60, thick, inner sep=1pt}
+        ]
+
+        %% Box: fond blanc, coins colorés, grille 10x10, bordure
+        \fill[white] (-2,-1.5) rectangle (2,1.5);
+        \fill[blue!15] (-2,1.2) rectangle (-1.6,1.5);
+        \fill[blue!15] (1.6,1.2) rectangle (2,1.5);
+        \fill[blue!15] (-2,-1.5) rectangle (-1.6,-1.2);
+        \fill[blue!15] (1.6,-1.5) rectangle (2,-1.2);
+        \draw[gray!50, very thin, xstep=0.4, ystep=0.3] (-2,-1.5) grid (2,1.5);
+        \node[draw, minimum width=4cm, minimum height=3cm, inner sep=0, fill=none] (map) at (0,0) {};
+
+        \node[anchor=north, font=\footnotesize\itshape] at (map.south)
+          {First cell size $d_\mathrm{wall}$ \textrightarrow};
+        \node[rotate=90, anchor=south, font=\footnotesize\itshape] at (map.west)
+          {Far-field size $f_\infty$ \textrightarrow};
+
+        \filldraw[black] (-1.8, 1.35) circle (2pt);
+        \filldraw[black] ( 1.8, 1.35) circle (2pt);
+        \filldraw[black] (-1.8,-1.35) circle (2pt);
+        \filldraw[black] ( 1.8,-1.35) circle (2pt);
+
+        %% Top-left
+        \node[img] (tl) at (-3.5, 4.2) {%
+          \begin{tabular}{@{}c@{\hspace{2pt}}c@{}}
+            \includegraphics[width=2cm, trim={2434bp 1200bp 2436bp 1200bp}, clip]%
+              {corners_visu/top_left_mesh.png} &
+            \includegraphics[width=2cm, trim={3600bp 2442bp 3200bp 2442bp}, clip]%
+              {corners_visu/top_left_mesh.png}
+          \end{tabular}};
+        \node[font=\tiny\bfseries, align=center, anchor=north] at (tl.south)
+          {Coarse FF / Fine BL};
+        \draw[->] (-1.8, 1.35) -- (tl.south);
+
+        %% Top-right
+        \node[img] (tr) at (3.5, 4.2) {%
+          \begin{tabular}{@{}c@{\hspace{2pt}}c@{}}
+            \includegraphics[width=2cm, trim={2434bp 1200bp 2436bp 1200bp}, clip]%
+              {corners_visu/top_right_mesh.png} &
+            \includegraphics[width=2cm, trim={3600bp 2442bp 3200bp 2442bp}, clip]%
+              {corners_visu/top_right_mesh.png}
+          \end{tabular}};
+        \node[font=\tiny\bfseries, align=center, anchor=north] at (tr.south)
+          {Coarse FF / Coarse BL};
+        \draw[->] ( 1.8, 1.35) -- (tr.south);
+
+        %% Bottom-left
+        \node[img] (bl) at (-3.5, -4.2) {%
+          \begin{tabular}{@{}c@{\hspace{2pt}}c@{}}
+            \includegraphics[width=2cm, trim={2434bp 1200bp 2436bp 1200bp}, clip]%
+              {corners_visu/bottom_left_mesh.png} &
+            \includegraphics[width=2cm, trim={3600bp 2442bp 3200bp 2442bp}, clip]%
+              {corners_visu/bottom_left_mesh.png}
+          \end{tabular}};
+        \node[font=\tiny\bfseries, align=center, anchor=south] at (bl.north)
+          {Fine FF / Fine BL};
+        \draw[->] (-1.8,-1.35) -- (bl.north);
+
+        %% Bottom-right
+        \node[img] (br) at (3.5, -4.2) {%
+          \begin{tabular}{@{}c@{\hspace{2pt}}c@{}}
+            \includegraphics[width=2cm, trim={2434bp 1200bp 2436bp 1200bp}, clip]%
+              {corners_visu/bottom_right_mesh.png} &
+            \includegraphics[width=2cm, trim={3600bp 2442bp 3200bp 2442bp}, clip]%
+              {corners_visu/bottom_right_mesh.png}
+          \end{tabular}};
+        \node[font=\tiny\bfseries, align=center, anchor=south] at (br.north)
+          {Fine FF / Coarse BL};
+        \draw[->] ( 1.8,-1.35) -- (br.north);
+
+      \end{tikzpicture}}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+%% -----------------------------------------------------------------------
+%% One slide per scheme: residual | Cp error | Ch error
+%% -----------------------------------------------------------------------
+
+\schemeslide{two\_wave}{HLL-like}
+\schemeslide{three\_wave}{HLLC-like}
+\schemeslide{modified\_three\_wave}{HLLCM-like}
+\schemeslide{multi\_point\_iso}{Isotropic multi-point}
+
+%% -----------------------------------------------------------------------
+\begin{frame}{Summary}
+  \begin{columns}[T]
+    \begin{column}{0.48\textwidth}
+      \textbf{Key findings}
+      \begin{itemize}
+        \item \texttt{two\_wave}: always converges but large $C_h$ error
+        \item \texttt{three\_wave}: carbuncle instabilities for fine BL
+        \item \texttt{modified\_three\_wave}: stable but $C_h$ does not converge with BL refinement
+        \item \texttt{multi\_point\_iso}: \textbf{stable and accurate} for all parameter combinations
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \textbf{References}
+      \printbibliography[heading=none]
+    \end{column}
+  \end{columns}
+\end{frame}
+
+\end{document}

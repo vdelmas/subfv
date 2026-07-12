@@ -1,0 +1,48 @@
+&INPUT_PARAM
+
+  meshfile_path='',
+  meshfile='double_mach_quad.msh'
+
+  use_cylinder_map = .false.
+  dim_cylinder_map = 2
+
+  n_iter_print=1000
+  n_iter_write_sol=10000000
+  n_max_iter=10000000
+  final_res=1e-20
+
+  second_order = SECOND_ORDER_PLACEHOLDER
+  method = METHOD_PLACEHOLDER,
+  activate_diffusion = .false.
+
+  local_time_step=.false.
+  cfl=0.9
+
+  init_double_mach=.true.
+
+  n_bc=4,
+  bc_name='left','right','bottom','top',
+  bc_type='freestream','outflowsupersonic','double_mach_bottom','inout_double_mach',
+  bc_val=8., 7.145, -4.125, 0., 116.5
+        1.4, 0., 0., 0., 1.
+        1.4, 0., 0., 0., 1.
+        8., 7.145, -4.125, 0., 116.5
+
+  bc_type_V='','','','',
+  bc_val_V=0., 0., 0.
+           0., 0., 0.
+           0., 0., 0.
+           0., 0., 0.
+
+  bc_type_T='','','','',
+  bc_val_T=0., 0., 0., 0.
+
+  bc_style = 2,
+  boundary_2d=.true.
+  exclude_bound_vert=.false.
+
+  scheme='SCHEME_PLACEHOLDER',
+
+  write_residual=.false.
+  n_iter_residual=1000
+  /

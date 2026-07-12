@@ -1,0 +1,112 @@
+\documentclass[a4paper]{article}
+\usepackage[margin=1.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{filemod}
+\captionsetup{justification=centering}
+\newcommand{\fmodhhmm}[7]{#4:#5}
+\newcommand{\filetime}[1]{\filemodparse{\fmodhhmm}{#1}}
+
+\newlength{\figheight}
+
+\title{Temperature -- half\_cylinder\_quad\_euler -- Ordre~1}
+\author{Vincent Delmas}
+\date{}
+
+\begin{document}
+\maketitle
+
+\setlength{\figheight}{\dimexpr\textwidth*27/100\relax}
+
+\begin{figure}[H]
+  \centering
+  \IfFileExists{outputs/two_wave/images/output_-1_mesh.png}{%
+    \includegraphics[width=\textwidth]{outputs/two_wave/images/output_-1_mesh.png}%
+  }{}%
+\end{figure}
+\clearpage
+
+\newcommand{\testfig}[2]{%
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \begin{minipage}[c][\figheight][c]{\linewidth}
+      \centering
+      \IfFileExists{#1}{%
+        \includegraphics[width=\linewidth]{#1}%
+      }{%
+        \fbox{\begin{minipage}[c][\dimexpr\figheight*3/4-2\fboxsep-2\fboxrule\relax][c]%
+          {\dimexpr\linewidth*3/4-2\fboxsep-2\fboxrule\relax}%
+          \centering\small non disponible%
+        \end{minipage}}%
+      }%
+    \end{minipage}%
+    \IfFileExists{#1}{%
+      \caption*{\texttt{#2}\\\small\filemodprintdate{#1} \filetime{#1}}%
+    }{%
+      \caption*{\texttt{#2}}%
+    }%
+  \end{subfigure}%
+}
+
+\begin{figure}[H]
+  \testfig{outputs/two_wave/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_two\_wave}
+  \hfill
+  \testfig{outputs/three_wave/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_three\_wave}
+\end{figure}
+
+\begin{figure}[H]
+  \testfig{outputs/modified_three_wave/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_modified\_three\_wave}
+  \hfill
+  \testfig{outputs/multi_point/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_multi\_point}
+\end{figure}
+
+\begin{figure}[H]
+  \testfig{outputs/multi_point_iso/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_multi\_point\_iso}
+  \hfill
+  \testfig{outputs/ZB_AR1D_LS/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_ZB\_AR1D\_LS}
+\end{figure}
+
+\begin{figure}[H]
+  \testfig{outputs/ZB_AR1D_LSM/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_ZB\_AR1D\_LSM}
+  \hfill
+  \testfig{outputs/ZB_ARMD_LS/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_ZB\_ARMD\_LS}
+\end{figure}
+
+\begin{figure}[H]
+  \testfig{outputs/ZB_ARMD_LSM/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_ZB\_ARMD\_LSM}
+  \hfill
+  \testfig{outputs/ZB_ARMDM_LS/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_ZB\_ARMDM\_LS}
+\end{figure}
+
+\begin{figure}[H]
+  \testfig{outputs/ZB_ARMDM_LSM/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_ZB\_ARMDM\_LSM}
+  \hfill
+  \testfig{outputs/ZB_ARMDMAT_LS/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_ZB\_ARMDMAT\_LS}
+\end{figure}
+
+\begin{figure}[H]
+  \testfig{outputs/ZB_ARMDMAT_LSM/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_ZB\_ARMDMAT\_LSM}
+  \hfill
+  \testfig{outputs/ZB_ARMDMMAT_LS/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_ZB\_ARMDMMAT\_LS}
+\end{figure}
+
+\begin{figure}[H]
+  \testfig{outputs/ZB_ARMDMMAT_LSM/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_ZB\_ARMDMMAT\_LSM}
+  \hfill
+  \testfig{outputs/ZB_AM_LS/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_ZB\_AM\_LS}
+\end{figure}
+
+\begin{figure}[H]
+  \testfig{outputs/ZB_AM_LSM/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_ZB\_AM\_LSM}
+  \hfill
+  \testfig{outputs/ZB_AMISO_LS/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_ZB\_AMISO\_LS}
+\end{figure}
+
+\begin{figure}[H]
+  \testfig{outputs/ZB_AMISO_LSM/images/output_-1_Temperature.png}{half\_cylinder\_quad\_euler\_ZB\_AMISO\_LSM}
+\end{figure}
+
+\end{document}

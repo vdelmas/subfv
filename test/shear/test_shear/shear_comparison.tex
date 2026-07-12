@@ -1,0 +1,66 @@
+\documentclass[a4paper]{article}
+\pdfsuppresswarningpagegroup=1
+\usepackage[margin=1.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{filemod}
+\captionsetup{justification=centering}
+\newcommand{\fmodhhmm}[7]{#4:#5}
+\newcommand{\filetime}[1]{\filemodparse{\fmodhhmm}{#1}}
+
+\title{Shear test -- error vs.\ angle}
+\author{Vincent Delmas}
+\date{}
+
+\begin{document}
+\maketitle
+
+\newcommand{\meshsizes}{Left: 200$\times$200\quad Center: 400$\times$200\quad Right: 800$\times$200}
+
+\newcommand{\shearfig}[1]{%  #1 = path to PDF
+  \begin{subfigure}[t]{0.32\textwidth}
+    \centering
+    \IfFileExists{#1}{%
+      \includegraphics[width=\linewidth]{#1}%
+    }{%
+      \fbox{\begin{minipage}[c][5cm][c]{\linewidth}%
+        \centering\small non disponible%
+      \end{minipage}}%
+    }%
+  \end{subfigure}%
+}
+
+\newcommand{\shearrow}[2]{%  #1 = scheme (path), #2 = scheme (display)
+  \begin{figure}[H]
+    \shearfig{outputs/#1/mesh_shear_1/error_shear_#1_mesh_shear_1.pdf}%
+    \hfill%
+    \shearfig{outputs/#1/mesh_shear_2/error_shear_#1_mesh_shear_2.pdf}%
+    \hfill%
+    \shearfig{outputs/#1/mesh_shear_4/error_shear_#1_mesh_shear_4.pdf}%
+    \caption*{\texttt{#2} \quad \meshsizes}
+  \end{figure}
+}
+
+\shearrow{two_wave}{two\_wave}
+\shearrow{three_wave}{three\_wave}
+\shearrow{modified_three_wave}{modified\_three\_wave}
+\shearrow{multi_point}{multi\_point}
+\shearrow{multi_point_iso}{multi\_point\_iso}
+\shearrow{ZB_AR1D_LS}{ZB\_AR1D\_LS}
+\shearrow{ZB_AR1D_LSM}{ZB\_AR1D\_LSM}
+\shearrow{ZB_ARMD_LS}{ZB\_ARMD\_LS}
+\shearrow{ZB_ARMD_LSM}{ZB\_ARMD\_LSM}
+\shearrow{ZB_ARMDM_LS}{ZB\_ARMDM\_LS}
+\shearrow{ZB_ARMDM_LSM}{ZB\_ARMDM\_LSM}
+\shearrow{ZB_ARMDMAT_LS}{ZB\_ARMDMAT\_LS}
+\shearrow{ZB_ARMDMAT_LSM}{ZB\_ARMDMAT\_LSM}
+\shearrow{ZB_ARMDMMAT_LS}{ZB\_ARMDMMAT\_LS}
+\shearrow{ZB_ARMDMMAT_LSM}{ZB\_ARMDMMAT\_LSM}
+\shearrow{ZB_AM_LS}{ZB\_AM\_LS}
+\shearrow{ZB_AM_LSM}{ZB\_AM\_LSM}
+\shearrow{ZB_AMISO_LS}{ZB\_AMISO\_LS}
+\shearrow{ZB_AMISO_LSM}{ZB\_AMISO\_LSM}
+
+\end{document}
