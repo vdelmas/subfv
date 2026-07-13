@@ -22,6 +22,8 @@ program main
   integer(kind=ENTIER) :: count_rate, count_max, start_count, end_count
   real(kind=DOUBLE) :: res
   real(kind=DOUBLE), dimension(5) :: res_vect
+  integer(kind=ENTIER_D) :: teu_total
+  real(kind=DOUBLE) :: wall_time
 
   type(mesh_type) :: mesh
   type(mpi_send_recv_type) :: mpi_send_recv
@@ -107,10 +109,21 @@ program main
   call system_clock(end_count)
   call write_sol(mesh, sol, delta_sol, cell_grad, vp, h_p, mat_h_p, me, -1)
   if (write_residual .and. me == 0) close(fn_residual)
-  if (num_procs > 1) call MPI_ALLREDUCE(MPI_IN_PLACE, end_count, 1, &
-    MPI_INT, MPI_MAX, MPI_COMM_WORLD, mpi_ierr)
-  if (me == 0) print *, "CPU Time (s) ", &
-    real(end_count - start_count, DOUBLE)/real(count_rate, DOUBLE)
+
+  wall_time = real(end_count - start_count, DOUBLE) / real(count_rate, DOUBLE)
+  teu_total = int(iter, ENTIER_D) * int(mesh%n_elems, ENTIER_D)
+  if (num_procs > 1) then
+    call MPI_ALLREDUCE(MPI_IN_PLACE, teu_total, 1, MPI_INTEGER8,         MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, end_count, 1, MPI_INT,              MPI_MAX, MPI_COMM_WORLD, mpi_ierr)
+    wall_time = real(end_count - start_count, DOUBLE) / real(count_rate, DOUBLE)
+  end if
+  if (me == 0) then
+    print *, "  --------------------------------------------------------"
+    print *, "  Total element updates (TEU) =", teu_total
+    print *, "  Total CPU time (wall)       =", wall_time
+    print *, "  Total CPU time / TEU        =", wall_time / real(teu_total, DOUBLE)
+    print *, "  --------------------------------------------------------"
+  end if
   call MPI_FINALIZE(mpi_ierr)
 
 contains
