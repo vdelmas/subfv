@@ -1,4 +1,0 @@
-add_subdirectory(half_cylinder_quad_euler)
-add_subdirectory(half_cylinder_tri_euler)
-add_subdirectory(half_cylinder_quad_ns)
-add_subdirectory(half_cylinder_tri_ns)
