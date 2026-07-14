@@ -3,7 +3,6 @@
   meshfile_path='',
   meshfile='gresho_quad.msh'
 
-  periodic_mesh = .true.
 
   use_cylinder_map = .false.
   dim_cylinder_map = 2

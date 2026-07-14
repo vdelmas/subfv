@@ -24,6 +24,6 @@ gmsh -3 ../../potential_flow_2d_tri.geo -o potential_flow_2d_tri.msh
 if [ "$NPROC" -gt 1 ]; then
   subfv-gmsh -3 potential_flow_2d_tri.msh -part $NPROC -part_split -part_ghosts
 fi
-mpirun ${MPIRUN_FLAGS} -np $NPROC ../../../../../build/subfvns input_data.f > log.txt
+mpirun ${MPIRUN_FLAGS} -np $NPROC ../../../../build/subfvns input_data.f > log.txt
 
 date > run.timestamp

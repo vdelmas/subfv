@@ -33,7 +33,7 @@ for FSIZE in $(grep -v '^#\|^$' fsize.txt); do
         -e "s/half_cylinder_tri_ns\.msh/${GEO}.msh/" \
       ${ROOT}/input.template > input_data.f
 
-    mpirun ${MPIRUN_FLAGS} -np $NPROC ../../../../../build/subfvns input_data.f > log.txt
+    mpirun ${MPIRUN_FLAGS} -np $NPROC ../../../../build/subfvns input_data.f > log.txt
 
     date > run.timestamp
     popd > /dev/null

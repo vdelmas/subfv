@@ -26,7 +26,7 @@ gmsh -3 ../../gresho_quad.geo -o gresho_quad.msh
 if [ "$NPROC" -gt 1 ]; then
   subfv-gmsh -3 gresho_quad.msh -part $NPROC -part_split -part_ghosts
 fi
-mpirun ${MPIRUN_FLAGS} -np $NPROC ../../../../../build/subfvns input_data.f > log.txt
+mpirun ${MPIRUN_FLAGS} -np $NPROC ../../../../build/subfvns input_data.f > log.txt
 
 # (optionnel)
 # pvbatch ../../visualize.py

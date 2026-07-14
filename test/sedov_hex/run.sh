@@ -27,6 +27,6 @@ if [ "$NPROC" -gt 1 ]; then
   subfv-gmsh -3 spherical_sedov_hex.msh -part $NPROC -part_split -part_ghosts
 fi
 
-mpirun ${MPIRUN_FLAGS} -np $NPROC ../../../../../build/subfvns input_data.f > log.txt
+mpirun ${MPIRUN_FLAGS} -np $NPROC ../../../../build/subfvns input_data.f > log.txt
 
 date > run.timestamp

@@ -26,7 +26,7 @@ gmsh -3 ../../half_cylinder_quad_ns.geo -o half_cylinder_quad_ns.msh
 if [ "$NPROC" -gt 1 ]; then
   subfv-gmsh -3 half_cylinder_quad_ns.msh -part $NPROC -part_split -part_ghosts
 fi
-mpirun ${MPIRUN_FLAGS} -np $NPROC ../../../../../build/subfvns input_data.f > log.txt
+mpirun ${MPIRUN_FLAGS} -np $NPROC ../../../../build/subfvns input_data.f > log.txt
 
 # (optionnel)
 # pvbatch ../../visualize.py
