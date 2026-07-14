@@ -18,7 +18,7 @@
 
   local_time_step=.false.
   cfl=0.8
-  tmax=1e-2
+  tmax=1e-3
 
   !mu_p = 1.1343085e-4
   !gamma = 1.4
