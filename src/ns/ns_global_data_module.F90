@@ -57,6 +57,7 @@ module ns_global_data_module
   integer, parameter :: BC_EULER_INOUT_DOUBLE_MACH     = 6  ! "inout_double_mach"
   integer, parameter :: BC_EULER_DOUBLE_MACH_BOTTOM    = 7  ! "double_mach_bottom"
   integer, parameter :: BC_EULER_POTENTIAL_FLOW_2D    = 8  ! "potential_flow_2d"
+  integer, parameter :: BC_EULER_POTENTIAL_FLOW_3D    = 9  ! "potential_flow_3d"
   integer, dimension(:), allocatable :: bc_V_id
   integer, dimension(:), allocatable :: bc_T_id
   integer, dimension(:), allocatable :: bc_euler_id
@@ -110,6 +111,7 @@ module ns_global_data_module
   logical :: init_isentropic_vortex = .FALSE.
   logical :: init_gresho = .FALSE.
   logical :: init_potential_flow_2d = .FALSE.
+  logical :: init_potential_flow_3d = .FALSE.
   logical :: error_2d = .FALSE.
   real(kind=DOUBLE) :: error_2d_h = 0.025_DOUBLE
   logical :: thermal_couette = .false. !Computes error
@@ -185,6 +187,7 @@ contains
       init_isentropic_vortex, &
       init_gresho, &
       init_potential_flow_2d, &
+      init_potential_flow_3d, &
       init_kelvin, &
       init_double_mach, &
       init_1drp, sol_w_1drp_l, sol_w_1drp_r, x1drp, &
@@ -251,6 +254,8 @@ contains
         bc_euler_id(i) = BC_EULER_DOUBLE_MACH_BOTTOM
       else if (t == "potential_flow_2d") then
         bc_euler_id(i) = BC_EULER_POTENTIAL_FLOW_2D
+      else if (t == "potential_flow_3d") then
+        bc_euler_id(i) = BC_EULER_POTENTIAL_FLOW_3D
       else
         print *, "ERROR: bc_type unrecognized for BC ", i, ": '", trim(t), "'"
         error stop

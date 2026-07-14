@@ -56,6 +56,11 @@ contains
         call sol_potential_flow_2d(mesh%elem(i)%coord, w)
         sol(:, i) = primit_to_conserv(w)
       end do
+    else if (init_potential_flow_3d) then
+      do i = 1, mesh%n_elems
+        call sol_potential_flow_3d(mesh%elem(i)%coord, w)
+        sol(:, i) = primit_to_conserv(w)
+      end do
     else if (init_sedov) then
       rmin = huge(1.0_DOUBLE)
       imin = -1

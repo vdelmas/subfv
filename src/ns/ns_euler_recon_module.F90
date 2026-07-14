@@ -333,8 +333,8 @@ contains
       bc_euler_id, BC_EULER_WALL, BC_EULER_ADHERENCE_WALL, BC_EULER_FREESTREAM, &
       BC_EULER_OUTFLOWSUPERSONIC, BC_EULER_INFLOW_POND, &
       BC_EULER_INOUT_DOUBLE_MACH, BC_EULER_DOUBLE_MACH_BOTTOM, &
-      BC_EULER_POTENTIAL_FLOW_2D
-    use ns_euler_exact_sol_module, only: sol_potential_flow_2d
+      BC_EULER_POTENTIAL_FLOW_2D, BC_EULER_POTENTIAL_FLOW_3D
+    use ns_euler_exact_sol_module, only: sol_potential_flow_2d, sol_potential_flow_3d
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -395,6 +395,11 @@ contains
         id_face = mesh%sub_face(id_sub_face)%mesh_face
         face_coord = mesh%face(id_face)%coord
         call sol_potential_flow_2d(face_coord, w_pf)
+        sol_r = primit_to_conserv(w_pf)
+      case (BC_EULER_POTENTIAL_FLOW_3D)
+        id_face = mesh%sub_face(id_sub_face)%mesh_face
+        face_coord = mesh%face(id_face)%coord
+        call sol_potential_flow_3d(face_coord, w_pf)
         sol_r = primit_to_conserv(w_pf)
       case default
         print *, "BC TYPE NOT RECOGNIZED !"

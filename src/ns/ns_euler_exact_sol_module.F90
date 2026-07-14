@@ -18,7 +18,7 @@ contains
     m_gresho = 1e-5
     p_gresho = 1.0_DOUBLE/(gamma*m_gresho**2)
 
-    coord2(:) = x - (/0.5_DOUBLE, 0.5_DOUBLE, 0.5_DOUBLE/)
+    coord2(:) = x - (/0._DOUBLE, 0._DOUBLE, 0._DOUBLE/)
     r = norm2(coord2(:2))
 
     if (r < w_gresho) then
@@ -135,6 +135,38 @@ contains
     w(4) = 0.0_DOUBLE
     w(5) = pinf + 0.5_DOUBLE*rhoinf*(vinf**2 - vmag2)
   end subroutine sol_potential_flow_2d
+
+  pure subroutine sol_potential_flow_3d(x, w)
+    use ns_global_data_module, only: gamma
+    implicit none
+
+    real(kind=DOUBLE), dimension(3), intent(in) :: x
+    real(kind=DOUBLE), dimension(5), intent(inout) :: w
+
+    real(kind=DOUBLE), parameter :: r0 = 0.5_DOUBLE
+    real(kind=DOUBLE) :: r, f, ux, uy, uz, vmag2
+
+    real(kind=DOUBLE), parameter :: rhoinf = 1.4_DOUBLE
+    real(kind=DOUBLE), parameter :: mach = 1e-4_DOUBLE
+    real(kind=DOUBLE), parameter :: pinf = 1.0_DOUBLE
+    real(kind=DOUBLE) :: vinf
+
+    vinf = mach*sqrt(gamma*pinf/rhoinf)
+
+    r = sqrt(x(1)**2 + x(2)**2 + x(3)**2)
+    f = r0**3 / (2.0_DOUBLE * r**5)
+
+    ux = vinf * (1.0_DOUBLE + f*(r**2 - 3.0_DOUBLE*x(1)**2))
+    uy = -3.0_DOUBLE * vinf * f * x(1) * x(2)
+    uz = -3.0_DOUBLE * vinf * f * x(1) * x(3)
+    vmag2 = ux**2 + uy**2 + uz**2
+
+    w(1) = rhoinf
+    w(2) = ux
+    w(3) = uy
+    w(4) = uz
+    w(5) = pinf + 0.5_DOUBLE*rhoinf*(vinf**2 - vmag2)
+  end subroutine sol_potential_flow_3d
 
   function kelvin_helmholtz(y) result(v)
     use ns_global_data_module, only: pi
