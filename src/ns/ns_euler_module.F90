@@ -168,23 +168,28 @@ contains
     real(kind=DOUBLE), dimension(3, 3, mesh%n_vert), intent(in) :: mat_h_p
     logical, intent(in) :: second_order
 
-    integer(kind=ENTIER) :: j, idse, ide, id_vert, nsfn, nsen
-    real(kind=DOUBLE), dimension(3) :: u_vert
+    integer(kind=ENTIER) :: j, idse, ide, id_vert, nsfn, nsen, max_nsen
+    real(kind=DOUBLE), dimension(3) :: v_vert
     real(kind=DOUBLE), dimension(:), allocatable :: sum_lambda_vert
     real(kind=DOUBLE), dimension(:, :), allocatable :: flux_sum_vert
 
     rhs = 0.0_DOUBLE
-    u_vert = 0.0_DOUBLE
+    v_vert = 0.0_DOUBLE
     sum_lambda = 1e-12_DOUBLE
+
+    max_nsen = 0
+    do id_vert = 1, mesh%n_vert
+      max_nsen = max(max_nsen, mesh%vert(id_vert)%n_sub_elems_neigh)
+    end do
+    allocate(sum_lambda_vert(max_nsen))
+    allocate(flux_sum_vert(5, max_nsen))
 
     if (scheme_id == SCHEME_ZB) then
       do id_vert = 1, mesh%n_vert
         nsfn = mesh%vert(id_vert)%n_sub_faces_neigh
         nsen = mesh%vert(id_vert)%n_sub_elems_neigh
-        allocate(sum_lambda_vert(nsen))
-        sum_lambda_vert = 0.0_DOUBLE
-        allocate(flux_sum_vert(5, nsen))
-        flux_sum_vert = 0.0_DOUBLE
+        sum_lambda_vert(1:nsen) = 0.0_DOUBLE
+        flux_sum_vert(:, 1:nsen) = 0.0_DOUBLE
 
         select case (scheme_adv_id)
         case (SCHEME_ADV_AR1D)
@@ -193,11 +198,11 @@ contains
             flux_sum_vert, second_order, id_vert)
         case (SCHEME_ADV_AM)
           call compute_rhs_around_vert_AM(mesh, sol, grad, &
-            nsen, u_vert, sum_lambda_vert, &
+            nsen, v_vert, sum_lambda_vert, &
             flux_sum_vert, second_order, id_vert, h_p)
         case (SCHEME_ADV_AMISO)
           call compute_rhs_around_vert_AMISO(mesh, sol, grad, &
-            nsen, u_vert, sum_lambda_vert, &
+            nsen, v_vert, sum_lambda_vert, &
             flux_sum_vert, second_order, id_vert, h_p)
         case (SCHEME_ADV_ARMD)
           call compute_rhs_around_vert_ARMD(mesh, sol, grad, &
@@ -269,18 +274,15 @@ contains
           rhs(:, ide) = rhs(:, ide) - flux_sum_vert(:, j)
           sum_lambda(ide) = sum_lambda(ide) + sum_lambda_vert(j)
         end do
-        deallocate(sum_lambda_vert, flux_sum_vert)
       end do
     else
       do id_vert = 1, mesh%n_vert
         nsfn = mesh%vert(id_vert)%n_sub_faces_neigh
         nsen = mesh%vert(id_vert)%n_sub_elems_neigh
-        allocate(sum_lambda_vert(nsen))
-        sum_lambda_vert = 0.0_DOUBLE
-        allocate(flux_sum_vert(5, nsen))
-        flux_sum_vert = 0.0_DOUBLE
+        sum_lambda_vert(1:nsen) = 0.0_DOUBLE
+        flux_sum_vert(:, 1:nsen) = 0.0_DOUBLE
         call compute_rhs_around_vert(mesh, sol, grad, &
-          nsfn, nsen, u_vert, sum_lambda_vert, &
+          nsfn, nsen, v_vert, sum_lambda_vert, &
           flux_sum_vert, second_order, id_vert, vp)
 
         do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
@@ -289,13 +291,13 @@ contains
           rhs(:, ide) = rhs(:, ide) - flux_sum_vert(:, j)
           sum_lambda(ide) = sum_lambda(ide) + sum_lambda_vert(j)
         end do
-        deallocate(sum_lambda_vert, flux_sum_vert)
       end do
     end if
+    deallocate(sum_lambda_vert, flux_sum_vert)
   end subroutine compute_euler_flux
 
   subroutine compute_rhs_around_vert(mesh, sol, grad, &
-      nsfn, nsen, u_vert, sum_lambda_vert, flux_sum_vert, &
+      nsfn, nsen, v_vert, sum_lambda_vert, flux_sum_vert, &
       second_order, id_vert, vp)
     use ns_global_data_module, only: bc_style, scheme, exclude_bound_vert, &
       scheme_id, &
@@ -310,7 +312,7 @@ contains
     real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(inout) :: vp
     real(kind=DOUBLE), dimension(:, :, :), intent(in) :: grad
     integer(kind=ENTIER), intent(in) :: nsfn, nsen
-    real(kind=DOUBLE), dimension(3), intent(inout) :: u_vert
+    real(kind=DOUBLE), dimension(3), intent(inout) :: v_vert
     real(kind=DOUBLE), dimension(nsen), intent(inout) :: &
       sum_lambda_vert
     real(kind=DOUBLE), dimension(5, nsen), intent(inout) :: &
@@ -324,16 +326,16 @@ contains
     real(kind=DOUBLE), dimension(5, 2, nsfn) :: sol_w_lr
     real(kind=DOUBLE), dimension(5, 2, nsfn) :: lr_flux
     real(kind=DOUBLE), dimension(2, nsfn) :: lambda
-    real(kind=DOUBLE), dimension(nsfn) :: u_bars, warea
+    real(kind=DOUBLE), dimension(nsfn) :: v_bars, warea
     real(kind=DOUBLE), dimension(5, 2, nsfn) :: lr_flux_3w
     rse_loc = 0
     flux_sum_vert = 0.0_DOUBLE
-    u_vert = 0.0_DOUBLE
+    v_vert = 0.0_DOUBLE
     sum_lambda_vert = 0.0_DOUBLE
     sol_w_lr = 0.0_DOUBLE
     lr_flux = 0.0_DOUBLE
     lr_flux_3w= 0.0_DOUBLE
-    u_bars = 0.0_DOUBLE
+    v_bars = 0.0_DOUBLE
     warea = 0.0_DOUBLE
 
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
@@ -348,7 +350,6 @@ contains
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
         second_order, sol_w_lr(:, 1, j), sol_w_lr(:, 2, j))
 
-      call base_change(sol_w_lr(2:4, 1, j), sol_w_lr(2:4, 2, j), mesh%sub_face(id_sub_face)%norm, .TRUE.)
     end do
 
     warea = minval(warea)/warea
@@ -357,22 +358,22 @@ contains
     case (SCHEME_MULTI_POINT)
       lambda(:, :) = 0.0_DOUBLE
       if( mesh%vert(id_vert)%is_bound .and. exclude_bound_vert) then
-        u_vert = 0.0_DOUBLE
-        vp(:, id_vert) = u_vert
+        v_vert = 0.0_DOUBLE
+        vp(:, id_vert) = v_vert
       else
         call compute_lambdas_and_solve_nodal_velocity(mesh, id_vert, &
-          sol_w_lr, lambda, u_bars, u_vert, p_bound)
-        vp(:, id_vert) = u_vert
+          sol_w_lr, lambda, v_bars, v_vert, p_bound)
+        vp(:, id_vert) = v_vert
       end if
     case (SCHEME_MULTI_POINT_ISO)
       lambda(:, :) = 0.0_DOUBLE
       if( mesh%vert(id_vert)%is_bound .and. exclude_bound_vert) then
-        u_vert = 0.0_DOUBLE
-        vp(:, id_vert) = u_vert
+        v_vert = 0.0_DOUBLE
+        vp(:, id_vert) = v_vert
       else
         call compute_lambdas_and_solve_nodal_velocity_iso(mesh, id_vert, &
-          sol_w_lr, lambda, u_bars, u_vert, p_bound)
-        vp(:, id_vert) = u_vert
+          sol_w_lr, lambda, v_bars, v_vert, p_bound)
+        vp(:, id_vert) = v_vert
       end if
     end select
 
@@ -393,51 +394,53 @@ contains
       select case (scheme_id)
       case (SCHEME_MULTI_POINT)
         if( mesh%vert(id_vert)%is_bound .and. exclude_bound_vert) then
-          call two_wave(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), lr_flux(:, :, j), sl, sr)
+          call two_wave(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+            mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
         else
           if (is_wall(re) ) then
             call multi_point(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
-              lr_flux(:, :, j), 0.0_DOUBLE, &
+              mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), 0.0_DOUBLE, &
               lambda(1, j), lambda(2, j), sl, sr)
           else
             call multi_point(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
-              lr_flux(:, :, j), &
-              dot_product(u_vert, mesh%sub_face(id_sub_face)%norm), &
+              mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), &
+              dot_product(v_vert, mesh%sub_face(id_sub_face)%norm), &
               lambda(1, j), lambda(2, j), sl, sr)
           end if
         end if
       case (SCHEME_MULTI_POINT_ISO)
         if( mesh%vert(id_vert)%is_bound .and. exclude_bound_vert) then
-          call two_wave(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), lr_flux(:, :, j), sl, sr)
+          call two_wave(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+            mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
         else
           if (is_wall(re) ) then
             call multi_point(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
-              lr_flux(:, :, j), 0.0_DOUBLE, &
+              mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), 0.0_DOUBLE, &
               lambda(1, j), lambda(2, j), sl, sr)
           else
             call multi_point(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
-              lr_flux(:, :, j), &
-              dot_product(u_vert, mesh%sub_face(id_sub_face)%norm), &
+              mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), &
+              dot_product(v_vert, mesh%sub_face(id_sub_face)%norm), &
               lambda(1, j), lambda(2, j), sl, sr)
           end if
         end if
-        call three_wave(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), lr_flux_3w(:, :, j), sl, sr)
+        call three_wave(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+          mesh%sub_face(id_sub_face)%norm, lr_flux_3w(:, :, j), sl, sr)
         lr_flux(:, :, j) = warea(j) * lr_flux(:, :, j) &
           + (1.0_DOUBLE - warea(j)) * lr_flux_3w(:, :, j)
       case (SCHEME_THREE_WAVE)
-        call three_wave(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), lr_flux(:, :, j), sl, sr)
+        call three_wave(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+          mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
       case (SCHEME_TWO_WAVE)
-        call two_wave(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), lr_flux(:, :, j), sl, sr)
+        call two_wave(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+          mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
       case (SCHEME_MODIFIED_THREE_WAVE)
-        call modified_three_wave(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), lr_flux(:, :, j), sl, sr)
+        call modified_three_wave(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+          mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
       case default
         print*,"Unknown scheme"
         error stop
       end select
-
-      !Rotate flux back
-      call base_change(lr_flux(2:4, 1, j), lr_flux(2:4, 2, j), &
-        mesh%sub_face(id_sub_face)%norm, .FALSE.)
 
       sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
         + mesh%sub_face(id_sub_face)%area*max(0.0_DOUBLE, -sl)
