@@ -7,9 +7,9 @@
   use_cylinder_map = .false.
   dim_cylinder_map = 2
 
-  n_iter_print=100
-  n_iter_write_sol=10000
-  n_max_iter=10000
+  n_iter_print=1000
+  n_iter_write_sol=100000
+  n_max_iter=100000
   final_res=1e-12
 
   second_order = SECOND_ORDER_PLACEHOLDER
@@ -18,7 +18,7 @@
 
   local_time_step=.false.
   cfl=0.8
-  tmax=1e-3
+  tmax=1e-2
 
   !mu_p = 1.1343085e-4
   !gamma = 1.4

@@ -2739,4 +2739,187 @@ contains
       end if
     end do
   end subroutine compute_rhs_around_vert_LS1D
+
+  subroutine build_grad_nodal_system(mesh, id_vert, N, S, S_tilde_T, B)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: id_vert
+    real(kind=DOUBLE), dimension(mesh%vert(id_vert)%n_sub_faces_neigh, mesh%vert(id_vert)%n_sub_faces_neigh), &
+      intent(inout) :: N
+    real(kind=DOUBLE), dimension(mesh%vert(id_vert)%n_sub_faces_neigh, mesh%vert(id_vert)%n_sub_elems_neigh), &
+      intent(inout) :: S
+    real(kind=DOUBLE), dimension(mesh%vert(id_vert)%n_sub_elems_neigh, mesh%vert(id_vert)%n_sub_faces_neigh), &
+      intent(inout) :: S_tilde_T
+    real(kind=DOUBLE), dimension(mesh%vert(id_vert)%n_sub_faces_neigh), intent(inout) :: B
+
+    integer(kind=ENTIER) :: l, p
+    integer(kind=ENTIER) :: id_sub_elem, id_elem, id_sub_elem_loc
+    integer(kind=ENTIER) :: nsfn, nsen
+    integer(kind=ENTIER) :: isfl, isfp, isfl_loc, isfp_loc, ifl, ifp
+    real(kind=DOUBLE) :: blc_1
+    real(kind=DOUBLE), dimension(3) :: norml, normp
+
+    nsfn = mesh%vert(id_vert)%n_sub_faces_neigh
+    nsen = mesh%vert(id_vert)%n_sub_elems_neigh
+
+    N = 0.0_DOUBLE
+    S = 0.0_DOUBLE
+    S_tilde_T = 0.0_DOUBLE
+    B = 0.0_DOUBLE
+
+    !Build NT = ST + B
+    do l = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+      isfl = mesh%vert(id_vert)%sub_face_neigh(l)
+      isfl_loc = mesh%sub_face(isfl)%id_loc_around_node
+      ifl = mesh%sub_face(isfl)%mesh_face
+
+      !Left sub elem
+      id_sub_elem = mesh%sub_face(isfl)%left_sub_elem_neigh
+      id_elem = mesh%face(ifl)%left_neigh
+      id_sub_elem_loc = mesh%sub_elem(id_sub_elem)%id_loc_around_node
+      norml = mesh%sub_face(isfl)%norm
+
+      !Add terms in N, S, and S_tilde
+      do p = 1, mesh%sub_elem(id_sub_elem)%n_sub_faces
+        isfp = mesh%sub_elem(id_sub_elem)%sub_face(p)
+        isfp_loc = mesh%sub_face(isfp)%id_loc_around_node
+        ifp = mesh%sub_face(isfp)%mesh_face
+        if (mesh%sub_face(isfp)%left_sub_elem_neigh == id_sub_elem) then
+          normp = mesh%sub_face(isfp)%norm
+        else
+          normp = -mesh%sub_face(isfp)%norm
+        end if
+        blc_1 = mesh%sub_face(isfl)%area*mesh%sub_face(isfp)%area &
+          *(1.0_DOUBLE/mesh%sub_elem(id_sub_elem)%volume) &
+          *dot_product(normp, norml)
+        N(isfl_loc, isfp_loc) = N(isfl_loc, isfp_loc) + blc_1
+        S(isfl_loc, id_sub_elem_loc) = S(isfl_loc, id_sub_elem_loc) + blc_1
+        S_tilde_T(id_sub_elem_loc, isfl_loc) = &
+          S_tilde_T(id_sub_elem_loc, isfl_loc) + blc_1
+      end do
+
+      !Right sub elem
+      norml = -mesh%sub_face(isfl)%norm
+      id_sub_elem = mesh%sub_face(isfl)%right_sub_elem_neigh
+      id_elem = mesh%face(ifl)%right_neigh
+      if (id_sub_elem > 0) then
+        id_sub_elem_loc = mesh%sub_elem(id_sub_elem)%id_loc_around_node
+
+        !Add terms in N, S, and S_tilde
+        do p = 1, mesh%sub_elem(id_sub_elem)%n_sub_faces
+          isfp = mesh%sub_elem(id_sub_elem)%sub_face(p)
+          isfp_loc = mesh%sub_face(isfp)%id_loc_around_node
+          ifp = mesh%sub_face(isfp)%mesh_face
+          if (mesh%sub_face(isfp)%left_sub_elem_neigh == id_sub_elem) then
+            normp = mesh%sub_face(isfp)%norm
+          else
+            normp = -mesh%sub_face(isfp)%norm
+          end if
+          blc_1 = mesh%sub_face(isfl)%area*mesh%sub_face(isfp)%area &
+            *(1.0_DOUBLE/mesh%sub_elem(id_sub_elem)%volume) &
+            *dot_product(normp, norml)
+          N(isfl_loc, isfp_loc) = N(isfl_loc, isfp_loc) + blc_1
+          S(isfl_loc, id_sub_elem_loc) = S(isfl_loc, id_sub_elem_loc) + blc_1
+          S_tilde_T(id_sub_elem_loc, isfl_loc) = &
+            S_tilde_T(id_sub_elem_loc, isfl_loc) + blc_1
+        end do
+      end if
+    end do
+  end subroutine build_grad_nodal_system
+
+  subroutine compute_rhs_around_vert_LPF(mesh, sol, grad, &
+      nsen, flux_sum_vert, &
+      id_vert, second_order)
+    use ns_global_data_module, only: bc_style, scheme, &
+      exclude_bound_vert, boundary_2d
+    use linear_solver_module
+    use mpi
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(:, :, :), intent(in) :: grad
+    integer(kind=ENTIER), intent(in) :: nsen
+    real(kind=DOUBLE), dimension(5, nsen), intent(inout) :: &
+      flux_sum_vert
+    integer(kind=ENTIER), intent(in) :: id_vert
+    logical, intent(in) :: second_order
+
+    integer(kind=ENTIER) :: j, id_sub_face, id_face
+    integer(kind=ENTIER) :: le, re, lse, rse, lse_loc, rse_loc
+    real(kind=DOUBLE), dimension(3) :: norm
+
+    real(kind=DOUBLE) :: lambda_l, lambda_r, rhol, rhor
+    real(kind=DOUBLE), dimension(5) :: fminus, fplus
+    real(kind=DOUBLE), dimension(5) :: fmp_l, fmp_r
+    real(kind=DOUBLE), dimension(3) :: vp
+
+    real(kind=DOUBLE) :: rho_avg, a_avg, pbar, vbar, pl, pr
+    real(kind=DOUBLE) :: vnl, vnr, al, ar, wpcf, pp
+    real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, ff, sol_w
+
+
+    integer(kind=ENTIER) :: id_elem, id_sub_elem
+
+    real(kind=DOUBLE), dimension(mesh%vert(id_vert)%n_sub_elems_neigh) :: p_elem
+    real(kind=DOUBLE), dimension(mesh%vert(id_vert)%n_sub_faces_neigh) :: p_face
+
+    real(kind=DOUBLE), dimension(mesh%vert(id_vert)%n_sub_faces_neigh, &
+      mesh%vert(id_vert)%n_sub_faces_neigh) :: N
+    real(kind=DOUBLE), dimension(mesh%vert(id_vert)%n_sub_faces_neigh, &
+      mesh%vert(id_vert)%n_sub_elems_neigh) :: S
+    real(kind=DOUBLE), dimension(mesh%vert(id_vert)%n_sub_elems_neigh, &
+      mesh%vert(id_vert)%n_sub_faces_neigh) :: S_tilde_T
+    real(kind=DOUBLE), dimension(mesh%vert(id_vert)%n_sub_faces_neigh) :: B
+
+    rse_loc = 0
+    call compute_nodal_velocity_LVP(mesh, id_vert, sol, grad, vp, second_order)
+    call compute_nodal_pressure_LPP(mesh, id_vert, sol, grad, pp, second_order)
+
+    do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
+      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
+      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+      sol_w  = conserv_to_primit(sol(:, id_elem))
+      p_elem(j) = sol_w(5)
+    end do
+
+    call build_grad_nodal_system(mesh, id_vert, N, S, S_tilde_T, B)
+
+    call inv_lapack(mesh%vert(id_vert)%n_sub_faces_neigh, N)
+    p_face = matmul(N, matmul(S, p_elem) + B)
+
+    !print*, p_elem
+    !print*, p_face
+
+    !error stop
+
+    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+      id_face = mesh%sub_face(id_sub_face)%mesh_face
+      le = mesh%face(id_face)%left_neigh
+      re = mesh%face(id_face)%right_neigh
+      lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
+      lse_loc = mesh%sub_elem(lse)%id_loc_around_node
+      rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
+      if( rse > 0 ) then
+        rse_loc = mesh%sub_elem(rse)%id_loc_around_node
+      end if
+      norm = mesh%sub_face(id_sub_face)%norm
+
+      ff(1) = 0.0_DOUBLE
+      ff(2:4) = p_face(j) * norm
+      ff(5) = dot_product(vp, norm) * p_face(j)
+
+      fminus = ff
+      fplus = fminus
+
+      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+
+      if (re > 0) then
+        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+      end if
+    end do
+  end subroutine compute_rhs_around_vert_LPF
+
 end module ns_euler_zb_module

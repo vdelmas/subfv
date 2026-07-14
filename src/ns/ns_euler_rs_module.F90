@@ -552,6 +552,148 @@ contains
     end do
   end subroutine compute_lambdas_and_solve_nodal_velocity_iso
 
+  subroutine multi_point_pressure(sol_w_l, sol_w_r, n, lr_flux, p_nodal, &
+      lambda_l, lambda_r, sl, sr)
+    implicit none
+
+    real(kind=DOUBLE), intent(in) :: p_nodal
+    real(kind=DOUBLE), dimension(5), intent(in) :: sol_w_l, sol_w_r
+    real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), dimension(5) :: sol_l, sol_r
+    real(kind=DOUBLE), intent(inout) :: lambda_l, lambda_r
+    real(kind=DOUBLE), dimension(5, 2), intent(inout) :: lr_flux
+    real(kind=DOUBLE), intent(inout) :: sl, sr
+
+    real(kind=DOUBLE) :: rhol, rhor, vn_l, vn_r, pl, pr, el, er
+    real(kind=DOUBLE) :: vn_bar, vn_l_et, vn_r_et, rhol_et, rhor_et
+    real(kind=DOUBLE), dimension(3) :: vt_l, vt_r
+    real(kind=DOUBLE), dimension(5) :: fl, fr, sol_l_et, sol_r_et
+
+    rhol  = sol_w_l(1)
+    vn_l  = dot_product(sol_w_l(2:4), n)
+    pl    = sol_w_l(5)
+    vt_l  = sol_w_l(2:4) - vn_l*n
+    sol_l = primit_to_conserv(sol_w_l)
+    el    = sol_l(5)/rhol
+
+    rhor  = sol_w_r(1)
+    vn_r  = dot_product(sol_w_r(2:4), n)
+    pr    = sol_w_r(5)
+    vt_r  = sol_w_r(2:4) - vn_r*n
+    sol_r = primit_to_conserv(sol_w_r)
+    er    = sol_r(5)/rhor
+
+    fl(1)   = vn_l*sol_l(1)
+    fl(2:4) = vn_l*sol_l(2:4) + pl*n
+    fl(5)   = (sol_l(5) + pl)*vn_l
+
+    fr(1)   = vn_r*sol_r(1)
+    fr(2:4) = vn_r*sol_r(2:4) + pr*n
+    fr(5)   = (sol_r(5) + pr)*vn_r
+
+    vn_bar = (lambda_l*vn_l + lambda_r*vn_r - (pr - pl))/(lambda_r + lambda_l)
+
+    vn_l_et  = vn_l - (p_nodal - pl)/lambda_l
+    rhol_et  = 1.0_DOUBLE/(1.0_DOUBLE/rhol + (vn_bar - vn_l)/lambda_l)
+    sol_l_et(1)   = rhol_et
+    sol_l_et(2:4) = rhol_et*(vt_l + vn_l_et*n)
+    sol_l_et(5)   = rhol_et*(el + (pl*vn_l - p_nodal*vn_bar)/lambda_l)
+
+    vn_r_et  = vn_r + (p_nodal - pr)/lambda_r
+    rhor_et  = 1.0_DOUBLE/(1.0_DOUBLE/rhor + (vn_r - vn_bar)/lambda_r)
+    sol_r_et(1)   = rhor_et
+    sol_r_et(2:4) = rhor_et*(vt_r + vn_r_et*n)
+    sol_r_et(5)   = rhor_et*(er + (p_nodal*vn_bar - pr*vn_r)/lambda_r)
+
+    sl = vn_l - lambda_l/rhol
+    sr = vn_r + lambda_r/rhor
+
+    lr_flux(:, 1) = 0.5_DOUBLE*(fl + fr) - 0.5_DOUBLE* &
+      (abs(sl)*(sol_l_et - sol_l) + &
+      abs(vn_bar)*(sol_r_et - sol_l_et) + &
+      abs(sr)*(sol_r - sol_r_et))
+    lr_flux(:, 2) = -lr_flux(:, 1)
+  end subroutine multi_point_pressure
+
+  subroutine compute_lambdas_and_solve_nodal_pressure(mesh, id_vert, sol_w_lr, lambda, p_bars, p_node)
+    use ns_global_data_module, only: bc_style
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: id_vert
+    real(kind=DOUBLE), dimension(5, 2, mesh%vert(id_vert)%n_sub_faces_neigh), &
+      intent(in) :: sol_w_lr
+    real(kind=DOUBLE), dimension(2, mesh%vert(id_vert)%n_sub_faces_neigh), &
+      intent(inout) :: lambda
+    real(kind=DOUBLE), dimension(mesh%vert(id_vert)%n_sub_faces_neigh), &
+      intent(inout) :: p_bars
+    real(kind=DOUBLE), intent(inout) :: p_node
+
+    integer(kind=ENTIER) :: j, id_sub_face, le, re, iter, n_iter
+    real(kind=DOUBLE) :: rhol, vn_l, pl, al, lambda_l
+    real(kind=DOUBLE) :: rhor, vn_r, pr, ar, lambda_r
+    real(kind=DOUBLE) :: s1, s2
+
+    n_iter = 10
+    p_node = 0.0_DOUBLE
+    do iter = 1, n_iter
+      s1 = 0.0_DOUBLE
+      s2 = 0.0_DOUBLE
+
+      do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+        id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+        le = mesh%face(mesh%sub_face(id_sub_face)%mesh_face)%left_neigh
+        re = mesh%face(mesh%sub_face(id_sub_face)%mesh_face)%right_neigh
+
+        rhol    = sol_w_lr(1, 1, j)
+        vn_l    = dot_product(sol_w_lr(2:4, 1, j), mesh%sub_face(id_sub_face)%norm)
+        pl      = sol_w_lr(5, 1, j)
+        al      = sound_speed_w(sol_w_lr(:, 1, j))
+
+        rhor    = sol_w_lr(1, 2, j)
+        vn_r    = dot_product(sol_w_lr(2:4, 2, j), mesh%sub_face(id_sub_face)%norm)
+        pr      = sol_w_lr(5, 2, j)
+        ar      = sound_speed_w(sol_w_lr(:, 2, j))
+
+        lambda_l = lambda(1, j)
+        lambda_r = lambda(2, j)
+
+        if (iter == 1) then
+          lambda_l = max(lambda_l, al*rhol, sqrt(rhol*max(0.0_DOUBLE, pr - pl)), -rhol*(vn_r - vn_l))
+          lambda_r = max(lambda_r, ar*rhor, sqrt(rhor*max(0.0_DOUBLE, pl - pr)), -rhor*(vn_r - vn_l))
+
+          p_bars(j) = (lambda_r*pl + lambda_l*pr - lambda_r*lambda_l*(vn_r - vn_l))/(lambda_r + lambda_l)
+          lambda_l = max(lambda_l, al*rhol + 1.5_DOUBLE*sqrt(max(0.0_DOUBLE, (p_bars(j) - pl)*rhol)))
+          lambda_r = max(lambda_r, ar*rhor + 1.5_DOUBLE*sqrt(max(0.0_DOUBLE, (p_bars(j) - pr)*rhor)))
+        else
+          if (bc_style == 1 .and. is_wall(re)) then
+            lambda_l = max(lambda_l, al*rhol + 1.5_DOUBLE*sqrt(max(0.0_DOUBLE, (p_bars(j) - pl)*rhol)))
+            lambda_r = max(lambda_r, ar*rhor + 1.5_DOUBLE*sqrt(max(0.0_DOUBLE, (p_bars(j) - pr)*rhor)))
+          else
+            lambda_l = max(lambda_l, al*rhol + 1.5_DOUBLE*sqrt(max(0.0_DOUBLE, (p_node - pl)*rhol)))
+            lambda_r = max(lambda_r, ar*rhor + 1.5_DOUBLE*sqrt(max(0.0_DOUBLE, (p_node - pr)*rhor)))
+          end if
+        end if
+
+        p_bars(j) = (lambda_r*pl + lambda_l*pr - lambda_r*lambda_l*(vn_r - vn_l))/(lambda_r + lambda_l)
+
+        if (bc_style == 1 .and. is_wall(re)) then
+          s1 = s1 + (1.0_DOUBLE/lambda_r + 1.0_DOUBLE/lambda_l)*mesh%sub_face(id_sub_face)%area &
+            *(lambda_r*pl + lambda_r*lambda_l*vn_l)/(lambda_r + lambda_l)
+          s2 = s2 + (1.0_DOUBLE/lambda_l)*mesh%sub_face(id_sub_face)%area
+        else
+          s1 = s1 + (1.0_DOUBLE/lambda_r + 1.0_DOUBLE/lambda_l)*mesh%sub_face(id_sub_face)%area*p_bars(j)
+          s2 = s2 + (1.0_DOUBLE/lambda_r + 1.0_DOUBLE/lambda_l)*mesh%sub_face(id_sub_face)%area
+        end if
+
+        lambda(1, j) = lambda_l
+        lambda(2, j) = lambda_r
+      end do
+
+      p_node = s1/s2
+    end do
+  end subroutine compute_lambdas_and_solve_nodal_pressure
+
   subroutine compute_lambdas_and_solve_nodal_velocity_new(ng, weight, norm, &
       lambda_l, lambda_r, sol_w_l, sol_w_r, v_node)
     use ns_global_data_module, only: bc_style, boundary_2d

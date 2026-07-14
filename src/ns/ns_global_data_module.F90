@@ -68,6 +68,7 @@ module ns_global_data_module
   integer, parameter :: SCHEME_THREE_WAVE           = 3  ! "three_wave"
   integer, parameter :: SCHEME_TWO_WAVE             = 4  ! "two_wave"
   integer, parameter :: SCHEME_MODIFIED_THREE_WAVE  = 5  ! "modified_three_wave"
+  integer, parameter :: SCHEME_MULTI_POINT_PRESSURE = 6  ! "multi_point_pressure"
   integer, parameter :: SCHEME_ZB                   = 42 ! "ZB_*_*"
   ! ZB advection sub-scheme IDs
   integer, parameter :: SCHEME_ADV_AR1D     = 1  ! "AR1D"
@@ -88,6 +89,7 @@ module ns_global_data_module
   integer, parameter :: SCHEME_LAG_LPP = 5  ! "LPP"
   integer, parameter :: SCHEME_LAG_LVPPP = 6  ! "LVPPP"
   integer, parameter :: SCHEME_LAG_LS1D = 7  ! "LS1D"
+  integer, parameter :: SCHEME_LAG_LPF  = 8  ! "LPF"
   ! Runtime scheme selection (set by init_bc_flags)
   integer :: scheme_id = 0
   integer :: scheme_adv_id = 0
@@ -273,6 +275,8 @@ contains
       scheme_id = SCHEME_TWO_WAVE
     else if (t == "modified_three_wave") then
       scheme_id = SCHEME_MODIFIED_THREE_WAVE
+    else if (t == "multi_point_pressure") then
+      scheme_id = SCHEME_MULTI_POINT_PRESSURE
     else if (t(1:2) == "ZB") then
       scheme_id = SCHEME_ZB
       ! Parse ZB_adv_lag into sub-scheme strings
@@ -303,6 +307,7 @@ contains
       if (t_lag == "LSU") then; scheme_lag_id = SCHEME_LAG_LSU;   recognized = .true.; end if
       if (t_lag == "LSM") then; scheme_lag_id = SCHEME_LAG_LSM;   recognized = .true.; end if
       if (t_lag == "LS1D") then; scheme_lag_id = SCHEME_LAG_LS1D; recognized = .true.; end if
+      if (t_lag == "LPF")  then; scheme_lag_id = SCHEME_LAG_LPF;  recognized = .true.; end if
       if (.not. recognized) then
         print *, "ERROR: ZB Lagrange unrecognized: '", trim(t_lag), "'"
         error stop

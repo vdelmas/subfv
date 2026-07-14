@@ -158,7 +158,7 @@ contains
       SCHEME_ADV_ARMD, SCHEME_ADV_ARMDU, SCHEME_ADV_ARMDM, &
       SCHEME_ADV_ARMDMAT, SCHEME_ADV_ARMDUMAT, SCHEME_ADV_ARMDMMAT, &
       SCHEME_LAG_LS, SCHEME_LAG_LSU, SCHEME_LAG_LSM, SCHEME_ADV_ARMDWIP, &
-      SCHEME_LAG_LSWIP, SCHEME_LAG_LPP, SCHEME_LAG_LVPPP, SCHEME_LAG_LS1D
+      SCHEME_LAG_LSWIP, SCHEME_LAG_LPP, SCHEME_LAG_LVPPP, SCHEME_LAG_LS1D, SCHEME_LAG_LPF
     use linear_solver_module
     use mpi
     implicit none
@@ -268,6 +268,9 @@ contains
         case (SCHEME_LAG_LS1D)
           call compute_rhs_around_vert_LS1D(mesh, sol, grad, &
             nsen, flux_sum_vert, id_vert, second_order)
+        case (SCHEME_LAG_LPF)
+          call compute_rhs_around_vert_LPF(mesh, sol, grad, &
+            nsen, flux_sum_vert, id_vert, second_order)
         case default
           print*,"Unknown ZB Lagrange"
           error stop
@@ -306,7 +309,7 @@ contains
       second_order, id_vert, vp)
     use ns_global_data_module, only: bc_style, scheme, exclude_bound_vert, &
       scheme_id, &
-      SCHEME_MULTI_POINT, SCHEME_MULTI_POINT_ISO, &
+      SCHEME_MULTI_POINT, SCHEME_MULTI_POINT_ISO, SCHEME_MULTI_POINT_PRESSURE, &
       SCHEME_THREE_WAVE, SCHEME_TWO_WAVE, SCHEME_MODIFIED_THREE_WAVE
     use linear_solver_module
     use mpi
@@ -327,11 +330,11 @@ contains
 
     integer(kind=ENTIER) :: j, id_sub_face, id_face
     integer(kind=ENTIER) :: le, re, lse, rse, lse_loc, rse_loc
-    real(kind=DOUBLE) :: p_bound, sl, sr
+    real(kind=DOUBLE) :: p_bound, p_nodal, sl, sr
     real(kind=DOUBLE), dimension(5, 2, nsfn) :: sol_w_lr
     real(kind=DOUBLE), dimension(5, 2, nsfn) :: lr_flux
     real(kind=DOUBLE), dimension(2, nsfn) :: lambda
-    real(kind=DOUBLE), dimension(nsfn) :: v_bars, warea
+    real(kind=DOUBLE), dimension(nsfn) :: v_bars, p_bars, warea
     real(kind=DOUBLE), dimension(5, 2, nsfn) :: lr_flux_3w
     rse_loc = 0
     flux_sum_vert = 0.0_DOUBLE
@@ -380,6 +383,11 @@ contains
           sol_w_lr, lambda, v_bars, v_vert, p_bound)
         vp(:, id_vert) = v_vert
       end if
+    case (SCHEME_MULTI_POINT_PRESSURE)
+      lambda(:, :) = 0.0_DOUBLE
+      p_nodal = 0.0_DOUBLE
+      call compute_lambdas_and_solve_nodal_pressure(mesh, id_vert, &
+        sol_w_lr, lambda, p_bars, p_nodal)
     end select
 
     !!Compute flux across each sub_face
@@ -442,6 +450,10 @@ contains
       case (SCHEME_MODIFIED_THREE_WAVE)
         call modified_three_wave(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
           mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
+      case (SCHEME_MULTI_POINT_PRESSURE)
+        call multi_point_pressure(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+          mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), p_nodal, &
+          lambda(1, j), lambda(2, j), sl, sr)
       case default
         print*,"Unknown scheme"
         error stop
