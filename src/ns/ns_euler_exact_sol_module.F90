@@ -41,7 +41,6 @@ contains
       w(4) = 0.0_DOUBLE
       w(5) = p_gresho - 2.0_DOUBLE + 4.0_DOUBLE*log(2.0_DOUBLE)
     end if
-    w(2) = w(2) + 100000.0_DOUBLE
   end subroutine sol_gresho
 
   pure subroutine sol_isentropic_vortex(coord, w, t)
