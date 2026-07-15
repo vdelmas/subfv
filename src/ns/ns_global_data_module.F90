@@ -25,6 +25,7 @@ module ns_global_data_module
   !Mesh
   character(len=255) :: meshfile_path, meshfile
   logical :: rescale = .false.
+  logical :: periodic_mesh = .FALSE.
   real(kind=DOUBLE) :: rescale_factor=1.0_QUAD
 
   !Cylinder mapping of the original mesh
@@ -173,6 +174,7 @@ contains
     namelist /INPUT_PARAM/ &
       meshfile_path, meshfile, &
       rescale, rescale_factor, &
+      periodic_mesh, &
       use_cylinder_map, dim_cylinder_map, &
       n_bc, bc_name, bc_type, bc_val, &
       bc_type_V, bc_val_V, bc_type_T, bc_val_T, &

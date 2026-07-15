@@ -16,3 +16,5 @@ Extrude {0, 0, 1} {
 Physical Volume("fluid", 28) = {1};
 //+
 MeshSize {3, 4, 10, 14, 1, 5, 2, 6} = ls;
+//+
+Physical Surface("all_surf", 29) = {22, 5, 26, 27, 14, 18};

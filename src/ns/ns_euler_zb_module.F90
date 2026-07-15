@@ -53,9 +53,8 @@ contains
     mat = 0.0_DOUBLE
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
         second_order, sol_w_l, sol_w_r)
       if( re > 0 ) then
@@ -127,9 +126,8 @@ contains
     grad_p = 0.0_DOUBLE
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
         second_order, sol_w_l, sol_w_r)
       grad_p = grad_p + (sol_w_r(5) - sol_w_l(5)) &
@@ -193,9 +191,8 @@ contains
     grad_p = 0.0_DOUBLE
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
         second_order, sol_w_l, sol_w_r)
       grad_p = grad_p + (sol_w_r(5) - sol_w_l(5)) &
@@ -256,9 +253,8 @@ contains
     div_v = 0.0_DOUBLE
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
         second_order, sol_w_l, sol_w_r)
       div_v = div_v &
@@ -312,9 +308,8 @@ contains
     div_v = 0.0_DOUBLE
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
         second_order, sol_w_l, sol_w_r)
       div_v = div_v &
@@ -367,9 +362,8 @@ contains
     div_v = 0.0_DOUBLE
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
         second_order, sol_w_l, sol_w_r)
       div_v = div_v &
@@ -427,9 +421,8 @@ contains
     grad_sol = 0.0_DOUBLE
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -456,9 +449,8 @@ contains
 
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -489,14 +481,16 @@ contains
       !Used for local timestepping
       lambda = max(1e-8_DOUBLE, -vnl, vnr)+max(al,ar)
 
-      sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
-        + mesh%sub_face(id_sub_face)%area*lambda
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
-
-      if (re > 0) then
-        sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
           + mesh%sub_face(id_sub_face)%area*lambda
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+            + mesh%sub_face(id_sub_face)%area*lambda
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_ARMDMAT
@@ -545,9 +539,8 @@ contains
     grad_sol = 0.0_DOUBLE
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -572,9 +565,8 @@ contains
 
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -605,14 +597,16 @@ contains
       !Used for local timestepping
       lambda = max(1e-8_DOUBLE, -vnl, vnr)+max(al,ar)
 
-      sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
-        + mesh%sub_face(id_sub_face)%area*lambda
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
-
-      if (re > 0) then
-        sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
           + mesh%sub_face(id_sub_face)%area*lambda
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+            + mesh%sub_face(id_sub_face)%area*lambda
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_ARMDUMAT
@@ -662,9 +656,8 @@ contains
     grad_sol = 0.0_DOUBLE
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -691,9 +684,8 @@ contains
 
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -724,14 +716,16 @@ contains
       !Used for local timestepping
       lambda = max(1e-8_DOUBLE, -vnl, vnr)+max(al,ar)
 
-      sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
-        + mesh%sub_face(id_sub_face)%area*lambda
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
-
-      if (re > 0) then
-        sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
           + mesh%sub_face(id_sub_face)%area*lambda
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+            + mesh%sub_face(id_sub_face)%area*lambda
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_ARMDMMAT
@@ -780,9 +774,8 @@ contains
     grad_sol = 0.0_DOUBLE
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -804,9 +797,8 @@ contains
 
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -837,14 +829,16 @@ contains
       !Used for local timestepping
       lambda = max(1e-8_DOUBLE, -vnl, vnr)+max(al,ar)
 
-      sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
-        + mesh%sub_face(id_sub_face)%area*lambda
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
-
-      if (re > 0) then
-        sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
           + mesh%sub_face(id_sub_face)%area*lambda
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+            + mesh%sub_face(id_sub_face)%area*lambda
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_ARMD
@@ -892,9 +886,8 @@ contains
     grad_sol = 0.0_DOUBLE
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -914,9 +907,8 @@ contains
 
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -947,14 +939,16 @@ contains
       !Used for local timestepping
       lambda = max(1e-8_DOUBLE, -vnl, vnr)+max(al,ar)
 
-      sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
-        + mesh%sub_face(id_sub_face)%area*lambda
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
-
-      if (re > 0) then
-        sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
           + mesh%sub_face(id_sub_face)%area*lambda
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+            + mesh%sub_face(id_sub_face)%area*lambda
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_ARMDU
@@ -1003,9 +997,8 @@ contains
     grad_sol = 0.0_DOUBLE
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -1028,9 +1021,8 @@ contains
 
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -1061,14 +1053,16 @@ contains
       !Used for local timestepping
       lambda = max(1e-8_DOUBLE, -vnl, vnr)+max(al,ar)
 
-      sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
-        + mesh%sub_face(id_sub_face)%area*lambda
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
-
-      if (re > 0) then
-        sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
           + mesh%sub_face(id_sub_face)%area*lambda
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+            + mesh%sub_face(id_sub_face)%area*lambda
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_ARMDM
@@ -1104,9 +1098,8 @@ contains
     rse_loc = 0
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -1133,14 +1126,16 @@ contains
       !Used for local timestepping
       lambda = max(1e-8_DOUBLE, -vnl, vnr)+max(al,ar)
 
-      sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
-        + mesh%sub_face(id_sub_face)%area*lambda
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
-
-      if (re > 0) then
-        sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
           + mesh%sub_face(id_sub_face)%area*lambda
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+            + mesh%sub_face(id_sub_face)%area*lambda
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_AR1D
@@ -1182,9 +1177,8 @@ contains
 
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -1202,10 +1196,12 @@ contains
         fplus = 0.0_DOUBLE
       end if
 
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-      if (re > 0) then
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_LSU
@@ -1248,9 +1244,8 @@ contains
 
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -1268,10 +1263,12 @@ contains
         fplus = 0.0_DOUBLE
       end if
 
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-      if (re > 0) then
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_LS
@@ -1314,9 +1311,8 @@ contains
 
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -1334,10 +1330,12 @@ contains
         fplus = 0.0_DOUBLE
       end if
 
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-      if (re > 0) then
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_LSM
@@ -1390,9 +1388,8 @@ contains
     sum_area = 0.0_DOUBLE
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       norm = mesh%sub_face(id_sub_face)%norm
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
         second_order, sol_w_l, sol_w_r)
@@ -1430,9 +1427,8 @@ contains
     !!Compute flux across each sub_face
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -1468,14 +1464,16 @@ contains
       !Used for local timestepping
       lambda = max(1e-8_DOUBLE, -vnl, vnr)+max(al,ar)
 
-      sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
-        + mesh%sub_face(id_sub_face)%area*lambda
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
-
-      if (re > 0) then
-        sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
           + mesh%sub_face(id_sub_face)%area*lambda
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+            + mesh%sub_face(id_sub_face)%area*lambda
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_AM
@@ -1525,9 +1523,8 @@ contains
     min_apf = huge(1.0_DOUBLE)
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       if( re > 0 ) then
         min_apf = min(min_apf, mesh%sub_face(id_sub_face)%area)
       end if
@@ -1542,9 +1539,8 @@ contains
     sum_area = 0.0_DOUBLE
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       norm = mesh%sub_face(id_sub_face)%norm
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
         second_order, sol_w_l, sol_w_r)
@@ -1584,9 +1580,8 @@ contains
     !!Compute flux across each sub_face
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -1626,14 +1621,16 @@ contains
       !Used for local timestepping
       lambda = max(1e-8_DOUBLE, -vnl, vnr)+max(al,ar)
 
-      sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
-        + mesh%sub_face(id_sub_face)%area*lambda
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
-
-      if (re > 0) then
-        sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
           + mesh%sub_face(id_sub_face)%area*lambda
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+            + mesh%sub_face(id_sub_face)%area*lambda
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_AMISO
@@ -1953,9 +1950,8 @@ contains
     div_v = 0.0_DOUBLE
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
         second_order, sol_w_l, sol_w_r)
       div_v = div_v &
@@ -1968,9 +1964,8 @@ contains
     grad_p = 0.0_DOUBLE
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
         second_order, sol_w_l, sol_w_r)
       if( re > 0 ) then
@@ -2026,9 +2021,8 @@ contains
     div_v = 0.0_DOUBLE
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
         second_order, sol_w_l, sol_w_r)
       div_v = div_v &
@@ -2088,9 +2082,8 @@ contains
     grad_sol = 0.0_DOUBLE
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -2117,9 +2110,8 @@ contains
 
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -2155,14 +2147,16 @@ contains
       !Used for local timestepping
       lambda = max(1e-8_DOUBLE, -vnl, vnr)+max(al,ar)
 
-      sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
-        + mesh%sub_face(id_sub_face)%area*lambda
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
-
-      if (re > 0) then
-        sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
           + mesh%sub_face(id_sub_face)%area*lambda
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+            + mesh%sub_face(id_sub_face)%area*lambda
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_ARMDWIP
@@ -2213,9 +2207,8 @@ contains
 
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -2261,10 +2254,12 @@ contains
         fplus = 0.0_DOUBLE
       end if
 
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-      if (re > 0) then
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_LSWIP
@@ -2304,9 +2299,8 @@ contains
 
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -2368,10 +2362,12 @@ contains
         fplus = wpcf*fmp_r + (1.0_DOUBLE-wpcf)*ff
       end if
 
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-      if (re > 0) then
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_LPP
@@ -2399,9 +2395,8 @@ contains
     denomsum = 0.0_DOUBLE
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       norm = mesh%sub_face(id_sub_face)%norm
 
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
@@ -2458,9 +2453,8 @@ contains
     rhs = 0.0_DOUBLE
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       norm = mesh%sub_face(id_sub_face)%norm
 
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
@@ -2536,9 +2530,8 @@ contains
     denomsum = 0.0_DOUBLE
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       norm = mesh%sub_face(id_sub_face)%norm
 
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
@@ -2623,9 +2616,8 @@ contains
 
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -2643,10 +2635,12 @@ contains
         fplus = 0.0_DOUBLE
       end if
 
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-      if (re > 0) then
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_LVPPP
@@ -2685,9 +2679,8 @@ contains
     rse_loc = 0
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
@@ -2730,12 +2723,14 @@ contains
         fplus = 0.0_DOUBLE
       end if
 
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) &
-        + mesh%sub_face(id_sub_face)%area*fminus
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) &
+          + mesh%sub_face(id_sub_face)%area*fminus
 
-      if (re > 0) then
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) &
-          - mesh%sub_face(id_sub_face)%area*fplus
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) &
+            - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_LS1D
@@ -2832,7 +2827,7 @@ contains
       nsen, flux_sum_vert, &
       id_vert, second_order)
     use ns_global_data_module, only: bc_style, scheme, &
-      exclude_bound_vert, boundary_2d
+      exclude_bound_vert, boundary_2d, gamma
     use linear_solver_module
     use mpi
     implicit none
@@ -2853,14 +2848,11 @@ contains
     real(kind=DOUBLE) :: lambda_l, lambda_r, rhol, rhor
     real(kind=DOUBLE), dimension(5) :: fminus, fplus
     real(kind=DOUBLE), dimension(5) :: fmp_l, fmp_r
-    real(kind=DOUBLE), dimension(3) :: vp
+    real(kind=DOUBLE), dimension(3) :: vp, vpc
 
     real(kind=DOUBLE) :: rho_avg, a_avg, pbar, vbar, pl, pr
     real(kind=DOUBLE) :: vnl, vnr, al, ar, wpcf, pp
     real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, ff, sol_w
-
-
-    integer(kind=ENTIER) :: id_elem, id_sub_elem
 
     real(kind=DOUBLE), dimension(mesh%vert(id_vert)%n_sub_elems_neigh) :: p_elem
     real(kind=DOUBLE), dimension(mesh%vert(id_vert)%n_sub_faces_neigh) :: p_face
@@ -2873,8 +2865,12 @@ contains
       mesh%vert(id_vert)%n_sub_faces_neigh) :: S_tilde_T
     real(kind=DOUBLE), dimension(mesh%vert(id_vert)%n_sub_faces_neigh) :: B
 
+    integer(kind=ENTIER) :: id_elem, id_sub_elem, k, id_sub_face_loc
+    real(kind=DOUBLE) :: aelem
+    real(kind=DOUBLE), dimension(3, mesh%vert(id_vert)%n_sub_elems_neigh) :: grad_p_tilde
+    real(kind=DOUBLE), dimension(3,3, mesh%vert(id_vert)%n_sub_elems_neigh) :: mat
+
     rse_loc = 0
-    call compute_nodal_velocity_LVP(mesh, id_vert, sol, grad, vp, second_order)
     call compute_nodal_pressure_LPP(mesh, id_vert, sol, grad, pp, second_order)
 
     do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
@@ -2889,35 +2885,67 @@ contains
     call inv_lapack(mesh%vert(id_vert)%n_sub_faces_neigh, N)
     p_face = matmul(N, matmul(S, p_elem) + B)
 
-    !print*, p_elem
-    !print*, p_face
+    grad_p_tilde = 0.0_DOUBLE
+    mat = 0.0_DOUBLE
+    do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
+      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
+      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+      sol_w = conserv_to_primit(sol(:, id_elem))
+      aelem = sqrt(gamma*sol_w(5)/sol_w(1))
+      do k=1, mesh%sub_elem(id_sub_elem)%n_sub_faces
+        id_sub_face = mesh%sub_elem(id_sub_elem)%sub_face(k)
+        id_sub_face_loc = mesh%sub_face(id_sub_face)%id_loc_around_node
+        grad_p_tilde(:, j) = grad_p_tilde(:, j) &
+          + (p_face(id_sub_face_loc) - p_elem(j)) &
+          * mesh%sub_face(id_sub_face)%area * mesh%sub_face(id_sub_face)%norm
+        mat(: ,:, j) = mat(:, :, j) + mesh%sub_face(id_sub_face)%area &
+        * sol_w(1) * aelem &
+        * tensor_product(mesh%sub_face(id_sub_face)%norm, mesh%sub_face(id_sub_face)%norm)
+      end do
+      call inv_lapack(3, mat(:, :, j))
+      grad_p_tilde(:, j) = matmul(mat(: ,:, j), grad_p_tilde(:, j))
+    end do
 
-    !error stop
+    vp = 0.0_DOUBLE
+    do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
+      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
+      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+      sol_w = conserv_to_primit(sol(:, id_elem))
+      vp = vp + mesh%sub_elem(id_sub_elem)%volume*sol_w(2:4)
+    end do
+    vp = vp / mesh%vert(id_vert)%volume
+
+    !call compute_nodal_velocity_LVP(mesh, id_vert, sol, grad, vp, second_order)
 
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      le = mesh%face(id_face)%left_neigh
-      re = mesh%face(id_face)%right_neigh
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
       lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
       lse_loc = mesh%sub_elem(lse)%id_loc_around_node
+      if (mesh%sub_elem(lse)%mesh_vert /= id_vert) cycle
       rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
       if( rse > 0 ) then
         rse_loc = mesh%sub_elem(rse)%id_loc_around_node
       end if
       norm = mesh%sub_face(id_sub_face)%norm
 
+      vpc = vp - grad_p_tilde(:, lse_loc)
+      !vpc = vp
+
       ff(1) = 0.0_DOUBLE
-      ff(2:4) = p_face(j) * norm
-      ff(5) = dot_product(vp, norm) * p_face(j)
+      ff(2:4) = pp * norm
+      ff(5) = dot_product(vpc, norm) * pp
 
       fminus = ff
       fplus = fminus
 
-      flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-      if (re > 0) then
-        flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_LPF

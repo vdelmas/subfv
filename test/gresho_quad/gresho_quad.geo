@@ -14,3 +14,5 @@ Extrude {0, 0, 1} {
 }
 //+
 Physical Volume("fluid", 28) = {1};
+//+
+Physical Surface("all_surf", 29) = {26, 5, 22, 18, 27, 14};

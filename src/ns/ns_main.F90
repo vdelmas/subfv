@@ -42,7 +42,7 @@ program main
   call read_mesh_msh(mesh, meshfile_path, meshfile, &
     n_bc, bc_name, me, num_procs, mpi_send_recv)
   if (use_cylinder_map) call map_cylinder(mesh, dim_cylinder_map)
-  call build_mesh(mesh, num_procs, mpi_send_recv, .TRUE., boundary_2d)
+  call build_mesh(mesh, num_procs, mpi_send_recv, .TRUE., boundary_2d, periodic_mesh)
   call compute_geometry_mesh(mesh, .TRUE., boundary_2d, me, num_procs)
   if (rescale) then
     call rescale_mesh(mesh, rescale_factor)

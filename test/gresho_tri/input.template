@@ -3,7 +3,7 @@
   meshfile_path='',
   meshfile='gresho_tri.msh'
 
-
+  periodic_mesh = .true.
   use_cylinder_map = .false.
   dim_cylinder_map = 2
 
@@ -18,7 +18,7 @@
 
   local_time_step=.false.
   cfl=0.8
-  tmax=1e-2
+  tmax=1e-4
 
   !mu_p = 1.1343085e-4
   !gamma = 1.4
@@ -34,9 +34,9 @@
 
   init_gresho=.true.,
 
-  n_bc=3,
-  bc_name='in_surf','out_surf','cyl_surf',
-  bc_type='freestream', 'outflowsupersonic','wall', 
+  n_bc=1,
+  bc_name='all_surf','out_surf','cyl_surf',
+  bc_type='wall', 'outflowsupersonic','wall', 
   bc_val=1e-3,5000.,0.,0., 57.615576818289696
   0., 0., 0., 0., 0.
   0., 0., 0., 0., 0.

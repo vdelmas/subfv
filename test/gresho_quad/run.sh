@@ -21,6 +21,11 @@ sed -e "s/SCHEME_PLACEHOLDER/$SCHEME/" \
     -e "s/METHOD_PLACEHOLDER/$METHOD/" \
   ../../input.template > input_data.f
 
+# periodic mesh requires single proc
+if grep -q "periodic_mesh *= *\.true\." input_data.f; then
+  NPROC=1
+fi
+
 # exécution
 gmsh -3 ../../gresho_quad.geo -o gresho_quad.msh
 if [ "$NPROC" -gt 1 ]; then

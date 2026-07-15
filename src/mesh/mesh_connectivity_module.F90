@@ -9,7 +9,7 @@ module mesh_connectivity_module
   public :: build_mesh
 contains
 
-  subroutine build_mesh(mesh, num_procs, mpi_send_recv, use_sub_entities, b2d)
+  subroutine build_mesh(mesh, num_procs, mpi_send_recv, use_sub_entities, b2d, periodic_mesh)
     use mpi_module
     implicit none
 
@@ -17,6 +17,13 @@ contains
     integer, intent(in) :: num_procs
     type(mpi_send_recv_type), intent(inout) :: mpi_send_recv
     logical, intent(in) :: use_sub_entities, b2d
+    logical, intent(in), optional :: periodic_mesh
+
+    integer(kind=ENTIER) :: i, j
+    logical :: do_periodic
+
+    do_periodic = .false.
+    if (present(periodic_mesh)) do_periodic = periodic_mesh
 
     call build_node_elem_neigh(mesh)
     call renumber_vert_mesh(mesh)
@@ -33,6 +40,21 @@ contains
     if (use_sub_entities) call compute_n_max_sub_faces_around_node(mesh)
     call compute_neigh_by_vert(mesh)
     if (num_procs > 1) call compute_ghost_vert(mesh)
+
+    if (do_periodic) then
+      ! compute face centroids needed by stitch_periodic_faces (vertex average, planar faces)
+      do i = 1, mesh%n_faces
+        mesh%face(i)%coord = 0.0_DOUBLE
+        do j = 1, mesh%face(i)%n_vert
+          mesh%face(i)%coord = mesh%face(i)%coord + mesh%vert(mesh%face(i)%vert(j))%coord
+        end do
+        mesh%face(i)%coord = mesh%face(i)%coord / real(mesh%face(i)%n_vert, DOUBLE)
+      end do
+      call stitch_periodic_faces(mesh)
+      if (use_sub_entities) call build_periodic_stencil(mesh)
+    end if
+
+    ! run after periodic stitching so that stitched faces (right_neigh > 0) are not treated as walls
     call find_if_vert_is_bound(mesh, b2d)
   end subroutine build_mesh
 
@@ -950,4 +972,315 @@ contains
       end do
     end do
   end subroutine renumber_faces_mesh
+
+  subroutine stitch_periodic_faces(mesh)
+    implicit none
+
+    type(mesh_type), intent(inout) :: mesh
+
+    integer(kind=ENTIER) :: i, j, ii, jj
+
+    integer(kind=ENTIER) :: nxl, nxr
+    integer(kind=ENTIER), dimension(:), allocatable :: fxl, fxr
+    integer(kind=ENTIER) :: nyl, nyr
+    integer(kind=ENTIER), dimension(:), allocatable :: fyl, fyr
+    integer(kind=ENTIER) :: nzl, nzr
+    integer(kind=ENTIER), dimension(:), allocatable :: fzl, fzr
+
+    real(kind=DOUBLE), parameter :: tol=1e-12_DOUBLE
+    real(kind=DOUBLE), parameter :: xl=-0.5_DOUBLE, xr=0.5_DOUBLE
+    real(kind=DOUBLE), parameter :: yl=-0.5_DOUBLE, yr=0.5_DOUBLE
+    real(kind=DOUBLE), parameter :: zl=-0.5_DOUBLE, zr=0.5_DOUBLE
+
+    nxl = 0; nxr = 0; nyl = 0; nyr = 0; nzl = 0; nzr = 0
+    do i=1, mesh%n_faces
+      if( mesh%face(i)%coord(1) < xl + tol .and. mesh%face(i)%coord(1) > xl - tol) nxl = nxl + 1
+      if( mesh%face(i)%coord(1) < xr + tol .and. mesh%face(i)%coord(1) > xr - tol) nxr = nxr + 1
+      if( mesh%face(i)%coord(2) < yl + tol .and. mesh%face(i)%coord(2) > yl - tol) nyl = nyl + 1
+      if( mesh%face(i)%coord(2) < yr + tol .and. mesh%face(i)%coord(2) > yr - tol) nyr = nyr + 1
+      if( mesh%face(i)%coord(3) < zl + tol .and. mesh%face(i)%coord(3) > zl - tol) nzl = nzl + 1
+      if( mesh%face(i)%coord(3) < zr + tol .and. mesh%face(i)%coord(3) > zr - tol) nzr = nzr + 1
+    end do
+
+    if( nxl /= nxr .or. nyl /= nyr .or. nzl /= nzr ) then
+      print*,"Error periodic boundaries !"
+      error stop
+    end if
+
+    allocate(fxl(nxl), fxr(nxr))
+    allocate(fyl(nyl), fyr(nyr))
+    allocate(fzl(nzl), fzr(nzr))
+
+    nxl = 0; nxr = 0; nyl = 0; nyr = 0; nzl = 0; nzr = 0
+    do i=1, mesh%n_faces
+      if( mesh%face(i)%coord(1) < xl + tol .and. mesh%face(i)%coord(1) > xl - tol) then
+        nxl = nxl + 1; fxl(nxl) = i
+      end if
+      if( mesh%face(i)%coord(1) < xr + tol .and. mesh%face(i)%coord(1) > xr - tol) then
+        nxr = nxr + 1; fxr(nxr) = i
+      end if
+      if( mesh%face(i)%coord(2) < yl + tol .and. mesh%face(i)%coord(2) > yl - tol) then
+        nyl = nyl + 1; fyl(nyl) = i
+      end if
+      if( mesh%face(i)%coord(2) < yr + tol .and. mesh%face(i)%coord(2) > yr - tol) then
+        nyr = nyr + 1; fyr(nyr) = i
+      end if
+      if( mesh%face(i)%coord(3) < zl + tol .and. mesh%face(i)%coord(3) > zl - tol) then
+        nzl = nzl + 1; fzl(nzl) = i
+      end if
+      if( mesh%face(i)%coord(3) < zr + tol .and. mesh%face(i)%coord(3) > zr - tol) then
+        nzr = nzr + 1; fzr(nzr) = i
+      end if
+    end do
+
+    do i=1, nxl
+      do j=1, nxr
+        ii = fxl(i); jj = fxr(j)
+        if( sqrt((mesh%face(ii)%coord(2)-mesh%face(jj)%coord(2))**2 &
+          + (mesh%face(ii)%coord(3)-mesh%face(jj)%coord(3))**2) < tol ) then
+          mesh%face(ii)%right_neigh = mesh%face(jj)%left_neigh
+          mesh%face(jj)%right_neigh = mesh%face(ii)%left_neigh
+        end if
+      end do
+    end do
+
+    do i=1, nyl
+      do j=1, nyr
+        ii = fyl(i); jj = fyr(j)
+        if( sqrt((mesh%face(ii)%coord(1)-mesh%face(jj)%coord(1))**2 &
+          + (mesh%face(ii)%coord(3)-mesh%face(jj)%coord(3))**2) < tol ) then
+          mesh%face(ii)%right_neigh = mesh%face(jj)%left_neigh
+          mesh%face(jj)%right_neigh = mesh%face(ii)%left_neigh
+        end if
+      end do
+    end do
+
+    do i=1, nzl
+      do j=1, nzr
+        ii = fzl(i); jj = fzr(j)
+        if( sqrt((mesh%face(ii)%coord(1)-mesh%face(jj)%coord(1))**2 &
+          + (mesh%face(ii)%coord(2)-mesh%face(jj)%coord(2))**2) < tol ) then
+          mesh%face(ii)%right_neigh = mesh%face(jj)%left_neigh
+          mesh%face(jj)%right_neigh = mesh%face(ii)%left_neigh
+        end if
+      end do
+    end do
+
+    do i=1, mesh%n_sub_faces
+      mesh%sub_face(i)%left_elem_neigh  = mesh%face(mesh%sub_face(i)%mesh_face)%left_neigh
+      mesh%sub_face(i)%right_elem_neigh = mesh%face(mesh%sub_face(i)%mesh_face)%right_neigh
+    end do
+  end subroutine stitch_periodic_faces
+
+  subroutine build_periodic_stencil(mesh)
+    implicit none
+
+    type(mesh_type), intent(inout) :: mesh
+
+    integer(kind=ENTIER) :: i, j, ii, jj, k, ki, kii, p
+    integer(kind=ENTIER) :: nxl, nxr, nyl, nyr, nzl, nzr
+    integer(kind=ENTIER), dimension(:), allocatable :: vxl, vxr, vyl, vyr, vzl, vzr
+    integer(kind=ENTIER) :: sfki, sfkii, sfp, nm, st, id_se, re
+    integer(kind=ENTIER), dimension(:), allocatable :: tmp
+    logical :: found
+
+    real(kind=DOUBLE), parameter :: tol=1e-12_DOUBLE
+    real(kind=DOUBLE), parameter :: xl=-0.5_DOUBLE, xr=0.5_DOUBLE
+    real(kind=DOUBLE), parameter :: yl=-0.5_DOUBLE, yr=0.5_DOUBLE
+    real(kind=DOUBLE), parameter :: zl=-0.5_DOUBLE, zr=0.5_DOUBLE
+
+    nxl = 0; nxr = 0; nyl = 0; nyr = 0; nzl = 0; nzr = 0
+    do i=1, mesh%n_vert
+      if( mesh%vert(i)%coord(1) < xl + tol .and. mesh%vert(i)%coord(1) > xl - tol) nxl = nxl + 1
+      if( mesh%vert(i)%coord(1) < xr + tol .and. mesh%vert(i)%coord(1) > xr - tol) nxr = nxr + 1
+      if( mesh%vert(i)%coord(2) < yl + tol .and. mesh%vert(i)%coord(2) > yl - tol) nyl = nyl + 1
+      if( mesh%vert(i)%coord(2) < yr + tol .and. mesh%vert(i)%coord(2) > yr - tol) nyr = nyr + 1
+      if( mesh%vert(i)%coord(3) < zl + tol .and. mesh%vert(i)%coord(3) > zl - tol) nzl = nzl + 1
+      if( mesh%vert(i)%coord(3) < zr + tol .and. mesh%vert(i)%coord(3) > zr - tol) nzr = nzr + 1
+    end do
+
+    allocate(vxl(nxl), vxr(nxr), vyl(nyl), vyr(nyr), vzl(nzl), vzr(nzr))
+
+    nxl = 0; nxr = 0; nyl = 0; nyr = 0; nzl = 0; nzr = 0
+    do i=1, mesh%n_vert
+      if( mesh%vert(i)%coord(1) < xl + tol .and. mesh%vert(i)%coord(1) > xl - tol) then
+        nxl = nxl + 1; vxl(nxl) = i
+      end if
+      if( mesh%vert(i)%coord(1) < xr + tol .and. mesh%vert(i)%coord(1) > xr - tol) then
+        nxr = nxr + 1; vxr(nxr) = i
+      end if
+      if( mesh%vert(i)%coord(2) < yl + tol .and. mesh%vert(i)%coord(2) > yl - tol) then
+        nyl = nyl + 1; vyl(nyl) = i
+      end if
+      if( mesh%vert(i)%coord(2) < yr + tol .and. mesh%vert(i)%coord(2) > yr - tol) then
+        nyr = nyr + 1; vyr(nyr) = i
+      end if
+      if( mesh%vert(i)%coord(3) < zl + tol .and. mesh%vert(i)%coord(3) > zl - tol) then
+        nzl = nzl + 1; vzl(nzl) = i
+      end if
+      if( mesh%vert(i)%coord(3) < zr + tol .and. mesh%vert(i)%coord(3) > zr - tol) then
+        nzr = nzr + 1; vzr(nzr) = i
+      end if
+    end do
+
+    ! Process each direction: set right_sub_elem_neigh and extend sub_face_neigh
+    do i=1, nxl
+      do j=1, nxr
+        ii = vxl(i); jj = vxr(j)
+        if( sqrt((mesh%vert(ii)%coord(2)-mesh%vert(jj)%coord(2))**2 &
+          + (mesh%vert(ii)%coord(3)-mesh%vert(jj)%coord(3))**2) < tol ) then
+          call process_pair(mesh, ii, jj, tmp, found, sfki, sfkii, sfp, nm, st, ki, kii, k, p, id_se, re)
+          call process_pair(mesh, jj, ii, tmp, found, sfki, sfkii, sfp, nm, st, ki, kii, k, p, id_se, re)
+        end if
+      end do
+    end do
+    do i=1, nyl
+      do j=1, nyr
+        ii = vyl(i); jj = vyr(j)
+        if( sqrt((mesh%vert(ii)%coord(1)-mesh%vert(jj)%coord(1))**2 &
+          + (mesh%vert(ii)%coord(3)-mesh%vert(jj)%coord(3))**2) < tol ) then
+          call process_pair(mesh, ii, jj, tmp, found, sfki, sfkii, sfp, nm, st, ki, kii, k, p, id_se, re)
+          call process_pair(mesh, jj, ii, tmp, found, sfki, sfkii, sfp, nm, st, ki, kii, k, p, id_se, re)
+        end if
+      end do
+    end do
+    do i=1, nzl
+      do j=1, nzr
+        ii = vzl(i); jj = vzr(j)
+        if( sqrt((mesh%vert(ii)%coord(1)-mesh%vert(jj)%coord(1))**2 &
+          + (mesh%vert(ii)%coord(2)-mesh%vert(jj)%coord(2))**2) < tol ) then
+          call process_pair(mesh, ii, jj, tmp, found, sfki, sfkii, sfp, nm, st, ki, kii, k, p, id_se, re)
+          call process_pair(mesh, jj, ii, tmp, found, sfki, sfkii, sfp, nm, st, ki, kii, k, p, id_se, re)
+        end if
+      end do
+    end do
+
+    deallocate(vxl, vxr, vyl, vyr, vzl, vzr)
+
+  contains
+
+    subroutine process_pair(mesh, v1, v2, tmp, found, sfki, sfkii, sfp, nm, st, ki, kii, k, p, id_se, re)
+      ! For vertex v1 with periodic partner v2:
+      ! 1. Set right_sub_elem_neigh for v1's periodic sub-faces using v2's sub-elements
+      ! 2. Extend v1's sub_face_neigh with v2's sub-faces (deduplicated)
+      type(mesh_type), intent(inout) :: mesh
+      integer(kind=ENTIER), intent(in) :: v1, v2
+      integer(kind=ENTIER), intent(inout) :: sfki, sfkii, sfp, nm, st, ki, kii, k, p, id_se, re
+      integer(kind=ENTIER), dimension(:), allocatable, intent(inout) :: tmp
+      logical, intent(inout) :: found
+
+      ! Step 1: set right_sub_elem_neigh for v1's periodic sub-faces
+      do ki = 1, mesh%vert(v1)%n_sub_faces_neigh
+        sfki = mesh%vert(v1)%sub_face_neigh(ki)
+        re = mesh%sub_face(sfki)%right_elem_neigh
+        if (re > 0 .and. mesh%sub_face(sfki)%right_sub_elem_neigh == 0) then
+          do k = 1, mesh%vert(v2)%n_sub_elems_neigh
+            id_se = mesh%vert(v2)%sub_elem_neigh(k)
+            if (mesh%sub_elem(id_se)%mesh_elem == re) then
+              mesh%sub_face(sfki)%right_sub_elem_neigh = id_se
+              exit
+            end if
+          end do
+        end if
+      end do
+
+      ! Step 2: extend v1's sub_face_neigh with v2's sub-faces (deduplicated)
+      nm = 0
+      do ki = 1, mesh%vert(v1)%n_sub_faces_neigh
+        sfki = mesh%vert(v1)%sub_face_neigh(ki)
+        do kii = 1, mesh%vert(v2)%n_sub_faces_neigh
+          sfkii = mesh%vert(v2)%sub_face_neigh(kii)
+          if( (mesh%sub_face(sfki)%left_elem_neigh == mesh%sub_face(sfkii)%right_elem_neigh &
+            .and. mesh%sub_face(sfki)%right_elem_neigh == mesh%sub_face(sfkii)%left_elem_neigh) &
+            .or. (mesh%sub_face(sfki)%left_elem_neigh == mesh%sub_face(sfkii)%left_elem_neigh &
+            .and. mesh%sub_face(sfki)%right_elem_neigh == mesh%sub_face(sfkii)%right_elem_neigh) ) then
+            nm = nm + 1
+          end if
+        end do
+      end do
+
+      st = mesh%vert(v1)%n_sub_faces_neigh + mesh%vert(v2)%n_sub_faces_neigh - nm
+      allocate(tmp(st))
+      tmp(:mesh%vert(v1)%n_sub_faces_neigh) = mesh%vert(v1)%sub_face_neigh
+      tmp(mesh%vert(v1)%n_sub_faces_neigh+1:) = -1
+      deallocate(mesh%vert(v1)%sub_face_neigh)
+      allocate(mesh%vert(v1)%sub_face_neigh(st))
+      mesh%vert(v1)%sub_face_neigh = tmp
+      mesh%vert(v1)%n_sub_faces_neigh = st
+      deallocate(tmp)
+
+      do ki = 1, mesh%vert(v1)%n_sub_faces_neigh
+        sfki = mesh%vert(v1)%sub_face_neigh(ki)
+        if (sfki < 0) then
+          do kii = 1, mesh%vert(v2)%n_sub_faces_neigh
+            sfkii = mesh%vert(v2)%sub_face_neigh(kii)
+            found = .false.
+            do p = 1, ki-1
+              sfp = mesh%vert(v1)%sub_face_neigh(p)
+              if (sfp < 0) cycle
+              if( (mesh%sub_face(sfp)%left_elem_neigh == mesh%sub_face(sfkii)%right_elem_neigh &
+                .and. mesh%sub_face(sfp)%right_elem_neigh == mesh%sub_face(sfkii)%left_elem_neigh) &
+                .or. (mesh%sub_face(sfp)%left_elem_neigh == mesh%sub_face(sfkii)%left_elem_neigh &
+                .and. mesh%sub_face(sfp)%right_elem_neigh == mesh%sub_face(sfkii)%right_elem_neigh) ) then
+                found = .true.
+              end if
+            end do
+            if (.not. found) then
+              mesh%vert(v1)%sub_face_neigh(ki) = sfkii
+              exit
+            end if
+          end do
+        end if
+      end do
+
+    end subroutine process_pair
+
+  end subroutine build_periodic_stencil
+
+  subroutine hpsort(n, ra)
+    implicit none
+
+    integer(kind=ENTIER), intent(in) :: n
+    integer(kind=ENTIER), dimension(n), intent(inout) :: ra
+
+    integer(kind=ENTIER) :: i, ir, j, l
+    integer(kind=ENTIER) :: rra
+
+    if (n < 2) return
+
+    l = n/2 + 1
+    ir = n
+
+    do while (.TRUE.)
+      if (l > 1) then
+        l = l - 1
+        rra = ra(l)
+      else
+        rra = ra(ir)
+        ra(ir) = ra(1)
+        ir = ir - 1
+        if (ir == 1) then
+          ra(1) = rra
+          return
+        end if
+      end if
+
+      i = l
+      j = l + l
+      do while (j <= ir)
+        if (j < ir) then
+          if (ra(j) < ra(j + 1)) j = j + 1
+        end if
+        if (rra < ra(j)) then
+          ra(i) = ra(j)
+          i = j
+          j = j + j
+        else
+          j = ir + 1
+        end if
+      end do
+      ra(i) = rra
+    end do
+  end subroutine hpsort
+
 end module mesh_connectivity_module

@@ -19,6 +19,6 @@ if [ "$NPROC" -gt 1 ]; then
   subfv-gmsh -3 ${MESH}.msh -part $NPROC -part_split -part_ghosts
 fi
 
-mpirun ${MPIRUN_FLAGS} -np $NPROC ../../../../../../build/subfvshear > log.txt
+mpirun ${MPIRUN_FLAGS} -np $NPROC ../../../../../build/subfvshear > log.txt
 
 date > run.timestamp
