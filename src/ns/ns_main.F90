@@ -60,12 +60,12 @@ program main
   allocate(vp(3, mesh%n_vert))             ; vp        = 0.0_DOUBLE
   allocate(h_p(mesh%n_vert))               ; h_p       = 0.0_DOUBLE
   allocate(mat_h_p(3, 3, mesh%n_vert))     ; mat_h_p   = 0.0_DOUBLE
-  if (scheme_id == SCHEME_ZB) then
-    do i = 1, mesh%n_vert
-      h_p(i) = compute_length(mesh, i)
-      mat_h_p(:, :, i) = compute_ellip(mesh, i)
-    end do
-  end if
+  !if (scheme_id == SCHEME_ZB) then
+  !  do i = 1, mesh%n_vert
+  !    h_p(i) = compute_length(mesh, i)
+  !    mat_h_p(:, :, i) = compute_ellip(mesh, i)
+  !  end do
+  !end if
 
   call init_residual_file(me, fn_residual)
 
