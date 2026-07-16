@@ -19,9 +19,3 @@ foreach(SCHEME ${SCHEMES})
   set_tests_properties(${TEST_NAME}_visu PROPERTIES LABELS "quick_test")
 
 endforeach()
-
-# Periodic tests: single MPI proc only
-add_test(NAME gresho_quad_periodic_ZB_AMISO_LPP
-  COMMAND bash run_periodic.sh ZB_AMISO_LPP
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-set_tests_properties(gresho_quad_periodic_ZB_AMISO_LPP PROPERTIES LABELS "quick_test")

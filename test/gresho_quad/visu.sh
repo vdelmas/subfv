@@ -22,4 +22,7 @@ pvbatch "${ROOT}/visualize_fields.py"
 
 gnuplot -e "SCHEME='${SCHEME}'; ROOT='${ROOT}'" "${ROOT}/plot_gresho.gnu"
 
+mkdir -p images
+gnuplot -e "OUTDIR='.'" "${ROOT}/plot_residual.gnu"
+
 date > visu.timestamp

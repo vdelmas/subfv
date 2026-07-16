@@ -2,7 +2,7 @@
 pvbatch extract_velocity_profile.py
 Run from outputs/SCHEME/ — reads output_0.pvtu (initial) and output_-1.pvtu (final).
 Writes velocity_profile_initial.dat and velocity_profile_final.dat.
-Columns: Rxy  |V|   (radius from vortex center (0.5, 0.5), velocity norm)
+Columns: Rxy  |V|   (radius from vortex center (0.0, 0.0), velocity norm)
 """
 
 import os, sys
@@ -17,7 +17,7 @@ from paraview import servermanager
 
 pv._DisableFirstRenderCameraReset()
 
-CX, CY = 0.5, 0.5
+CX, CY = 0.0, 0.0
 
 def extract(pvtu_file, dat_file):
     if not os.path.isfile(pvtu_file):
