@@ -62,17 +62,19 @@ set_target_properties(lagrange PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINAR
 target_include_directories(lagrange PUBLIC ${CMAKE_BINARY_DIR}/mod/lagrange)
 
 # ── Exécutables ───────────────────────────────────────────────────────────────
-add_executable(subfvns      src/ns/ns_main.F90)
-add_executable(subfvshear   src/shear/shear_main.F90)
-add_executable(subfvacoustic src/acoustic/acoustic_main.F90)
-add_executable(subfvlagrange src/lagrange/lagrange_main.F90)
+add_executable(subfvns           src/ns/ns_main.F90)
+add_executable(subfvshear        src/shear/shear_main.F90)
+add_executable(subfvacoustic     src/acoustic/acoustic_main.F90)
+add_executable(subfvlagrange     src/lagrange/lagrange_main.F90)
+add_executable(subfvgreshoconv   src/ns/ns_gresho_convergence_main.F90)
 
-target_link_libraries(subfvns      ns)
-target_link_libraries(subfvshear   ns)
-target_link_libraries(subfvacoustic acoustic)
-target_link_libraries(subfvlagrange lagrange)
+target_link_libraries(subfvns          ns)
+target_link_libraries(subfvshear       ns)
+target_link_libraries(subfvacoustic    acoustic)
+target_link_libraries(subfvlagrange    lagrange)
+target_link_libraries(subfvgreshoconv  ns)
 
-install(TARGETS subfvns subfvshear subfvacoustic subfvlagrange
+install(TARGETS subfvns subfvshear subfvacoustic subfvlagrange subfvgreshoconv
   RUNTIME DESTINATION bin
 )
 

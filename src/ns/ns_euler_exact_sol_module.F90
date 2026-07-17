@@ -4,19 +4,19 @@ module ns_euler_exact_sol_module
   implicit none
 
 contains
-  pure subroutine sol_gresho(x, w)
+  pure subroutine sol_gresho_mach(x, w, mach)
     use ns_global_data_module, only: gamma
     implicit none
 
     real(kind=DOUBLE), dimension(3), intent(in) :: x
     real(kind=DOUBLE), dimension(5), intent(inout) :: w
+    real(kind=DOUBLE), intent(in) :: mach
 
-    real(kind=DOUBLE) :: w_gresho, m_gresho, p_gresho, r
+    real(kind=DOUBLE) :: w_gresho, p_gresho, r
     real(kind=DOUBLE), dimension(3) :: coord2
 
     w_gresho = 0.2_DOUBLE
-    m_gresho = 1e-5
-    p_gresho = 1.0_DOUBLE/(gamma*m_gresho**2)
+    p_gresho = 1.0_DOUBLE/(gamma*mach**2)
 
     coord2(:) = x - (/0._DOUBLE, 0._DOUBLE, 0._DOUBLE/)
     r = norm2(coord2(:2))
@@ -26,14 +26,14 @@ contains
       w(2) = -5.0_DOUBLE*coord2(2)
       w(3) = 5.0_DOUBLE*coord2(1)
       w(4) = 0.0_DOUBLE
-      w(5) = p_gresho + 12.5*r**2
+      w(5) = p_gresho + 12.5_DOUBLE*r**2
     else if (r > 1.0_DOUBLE*w_gresho .and. r < 2.0_DOUBLE*w_gresho) then
       w(1) = 1.0_DOUBLE
       w(2) = (5.0_DOUBLE - 2.0_DOUBLE/r)*coord2(2)
       w(3) = (-5.0_DOUBLE + 2.0_DOUBLE/r)*coord2(1)
       w(4) = 0.0_DOUBLE
       w(5) = p_gresho + 12.5_DOUBLE*r**2 + &
-        4 - 20.0_DOUBLE*r + 4.0_DOUBLE*log(5.0_DOUBLE*r)
+        4.0_DOUBLE - 20.0_DOUBLE*r + 4.0_DOUBLE*log(5.0_DOUBLE*r)
     else
       w(1) = 1.0_DOUBLE
       w(2) = 0.0_DOUBLE
@@ -41,7 +41,8 @@ contains
       w(4) = 0.0_DOUBLE
       w(5) = p_gresho - 2.0_DOUBLE + 4.0_DOUBLE*log(2.0_DOUBLE)
     end if
-  end subroutine sol_gresho
+  end subroutine sol_gresho_mach
+
 
   pure subroutine sol_isentropic_vortex(coord, w, t)
     use ns_global_data_module, only:gamma, pi

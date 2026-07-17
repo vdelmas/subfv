@@ -5,6 +5,10 @@ multi_point
 multi_point_iso
 multi_point_pressure
 ZB_AMISO_LVPPP
-ZB_AR1D_LS1D
+ZB_AR1D_LVPPP
+ZB_AMISO_LPP
 ZB_AR1D_LPP
+ZB_AMISO_LS1D
+ZB_AR1D_LS1D
+ZB_AMISO_LPF
 ZB_AR1D_LPF

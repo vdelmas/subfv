@@ -16,13 +16,14 @@ ROOT=$(cd "$(dirname "$0")"; pwd)
 mkdir -p "${ROOT}/${OUTDIR}"
 cd "${ROOT}/${OUTDIR}"
 
+mkdir -p images
+
 pvbatch "${ROOT}/extract_velocity_profile.py"
 
 pvbatch "${ROOT}/visualize_fields.py"
 
 gnuplot -e "SCHEME='${SCHEME}'; ROOT='${ROOT}'" "${ROOT}/plot_gresho.gnu"
 
-mkdir -p images
 gnuplot -e "OUTDIR='.'" "${ROOT}/plot_residual.gnu"
 
 date > visu.timestamp

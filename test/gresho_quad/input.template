@@ -57,7 +57,7 @@
   scheme='SCHEME_PLACEHOLDER',
 
   write_residual=.true.
-  n_iter_residual=10
+  n_iter_residual=500
 
   compute_coeffs = .true.,
   coeffs_surf = 3,

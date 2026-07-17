@@ -48,7 +48,7 @@ contains
       end do
     else if (init_gresho) then
       do i = 1, mesh%n_elems
-        call sol_gresho(mesh%elem(i)%coord, w)
+        call sol_gresho_mach(mesh%elem(i)%coord, w, 1.0e-5_DOUBLE)
         sol(:, i) = primit_to_conserv(w)
       end do
     else if (init_potential_flow_2d) then
@@ -520,6 +520,9 @@ contains
     omega = 1.0_DOUBLE
     do i = 1, mesh%n_elems
       if( .not. mesh%elem(i)%is_ghost ) then
+        do k=1, 5
+          res_vect(k) = res_vect(k) + rhs(k, i)**2
+        end do
         diag(:, :, i) = diag(:, :, i) &
           + a1*(mesh%elem(i)%volume/dt + sum_lambda(i))*eye5
         rhs(:, i) = rhs(:, i) &
@@ -529,9 +532,6 @@ contains
         delta_sol(:, i) = new_sol - sol(:, i)
         omega = min(omega, max_omega_for_positivity(sol(:, i), a2*delta_sol(:, i)))
         res = res + norm2(delta_sol(:, i))
-        do k=1, 5
-          res_vect(k) = res_vect(k) + mesh%elem(i)%volume*delta_sol(k, i)**2
-        end do
       end if
     end do
 

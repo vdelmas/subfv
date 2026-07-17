@@ -1091,7 +1091,7 @@ contains
     integer(kind=ENTIER) :: le, re, lse, rse, lse_loc, rse_loc
     real(kind=DOUBLE), dimension(3) :: norm
 
-    real(kind=DOUBLE) :: vnl, vnr, al, ar, lambda
+    real(kind=DOUBLE) :: vnl, vnr, al, ar, lambda, corr, corr_check, am, vm, machm
     real(kind=DOUBLE), dimension(5) :: sol_l, sol_r
     real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, fminus, fplus
 
@@ -1117,7 +1117,14 @@ contains
       al = sound_speed_w(sol_w_l)
       ar = sound_speed_w(sol_w_r)
 
+      am = 0.5_DOUBLE*(al+ar)
+      vm = 0.5_DOUBLE*(norm2(sol_w_l(2:4))+norm2(sol_w_r(2:4)))
+
+      machm = vm/am
+
       lambda = max(1e-8_DOUBLE, abs(vnl), abs(vnr))
+      !lambda = max(1e-8_DOUBLE, abs(vnl), abs(vnr)) + am
+      !lambda = max(1e-8_DOUBLE, abs(vnl), abs(vnr), abs(vm))
       sol_l = primit_to_conserv(sol_w_l)
       sol_r = primit_to_conserv(sol_w_r)
       fminus = 0.5_DOUBLE*(vnl * sol_l + vnr * sol_r) - 0.5*lambda*(sol_r - sol_l)
@@ -1608,6 +1615,7 @@ contains
         - 0.5_DOUBLE*(sol_r - sol_l)*max(abs(vnr), abs(vnl))
 
       if( re > 0 ) then
+        !wpcf = min_apf/mesh%sub_face(id_sub_face)%area * 1.0_DOUBLE/3.0_DOUBLE
         wpcf = min_apf/mesh%sub_face(id_sub_face)%area
         fminus = wpcf*(sol_l*vnl - lambda*(sol_p - sol_l)) &
           + (1.0_DOUBLE-wpcf)*ff
@@ -2602,6 +2610,11 @@ contains
     real(kind=DOUBLE), dimension(5) :: fminus, fplus
     real(kind=DOUBLE), dimension(5,3) :: fp
 
+    real(kind=DOUBLE) :: pl, pr, rhol, rhor, wpcf
+    real(kind=DOUBLE) :: vnl, vnr, al, ar
+    real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, ff
+    real(kind=DOUBLE) :: rhom, pm, um, up, am, vm, machm
+
     rse_loc = 0
     call compute_nodal_velocity_LVP(mesh, id_vert, sol, grad, vp(:,id_vert), second_order)
     call compute_nodal_pressure_LPP(mesh, id_vert, sol, grad, pp, second_order)
@@ -2626,7 +2639,38 @@ contains
       end if
       norm = mesh%sub_face(id_sub_face)%norm
 
-      fminus = matmul(fp, norm)
+      call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
+        second_order, sol_w_l, sol_w_r)
+
+      rhol = sol_w_l(1)
+      vnl = dot_product(sol_w_l(2:4), norm)
+      pl = sol_w_l(5)
+      al = sound_speed_w(sol_w_l)
+
+      rhor = sol_w_r(1)
+      vnr = dot_product(sol_w_r(2:4), norm)
+      pr = sol_w_r(5)
+      ar = sound_speed_w(sol_w_r)
+
+      rhom = 0.5_DOUBLE*(rhor+rhol)
+      pm = 0.5_DOUBLE*(pl+pr)
+      um = 0.5_DOUBLE*(vnl+vnr)
+      am = max(al, ar)
+
+      vm = 0.5_DOUBLE*(norm2(sol_w_l(2:4)) + norm2(sol_w_r(2:4)))
+      machm = vm/am
+
+      up = um - 0.5_DOUBLE/(rhom*am)*(pr-pl)
+      pp = pm - 0.5_DOUBLE*rhom*am*(vnr-vnl)
+
+      ff(1) = 0.0_DOUBLE
+      ff(2:4) = pp * norm
+      ff(5) = pp * up
+
+      !wpcf = 1.0_DOUBLE/3.0_DOUBLE
+      wpcf = 1.0_DOUBLE
+
+      fminus = wpcf*matmul(fp, norm)+(1.0_DOUBLE-wpcf)*ff
       fplus = fminus
 
       if( boundary_2d &
@@ -2670,7 +2714,7 @@ contains
     real(kind=DOUBLE) :: pp, rhol, rhor
     real(kind=DOUBLE), dimension(5) :: fminus, fplus
 
-    real(kind=DOUBLE) :: pl, pr
+    real(kind=DOUBLE) :: pl, pr, vm, machm
     real(kind=DOUBLE) :: vnl, vnr, al, ar
     real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, ff
 
@@ -2706,6 +2750,9 @@ contains
       pm = 0.5_DOUBLE*(pl+pr)
       um = 0.5_DOUBLE*(vnl+vnr)
       am = max(al, ar)
+
+      vm = 0.5_DOUBLE*(norm2(sol_w_l(2:4)) + norm2(sol_w_r(2:4)))
+      machm = vm/am
 
       up = um - 0.5_DOUBLE/(rhom*am)*(pr-pl)
       pp = pm - 0.5_DOUBLE*rhom*am*(vnr-vnl)
@@ -2848,10 +2895,10 @@ contains
     real(kind=DOUBLE) :: lambda_l, lambda_r, rhol, rhor
     real(kind=DOUBLE), dimension(5) :: fminus, fplus
     real(kind=DOUBLE), dimension(5) :: fmp_l, fmp_r
-    real(kind=DOUBLE), dimension(3) :: vp, vpc
+    real(kind=DOUBLE), dimension(3) :: vp
 
     real(kind=DOUBLE) :: rho_avg, a_avg, pbar, vbar, pl, pr
-    real(kind=DOUBLE) :: vnl, vnr, al, ar, wpcf, pp
+    real(kind=DOUBLE) :: vnl, vnr, al, ar, wpcf, pp, vpcf
     real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, ff, sol_w
 
     real(kind=DOUBLE), dimension(mesh%vert(id_vert)%n_sub_elems_neigh) :: p_elem
@@ -2873,38 +2920,38 @@ contains
     rse_loc = 0
     call compute_nodal_pressure_LPP(mesh, id_vert, sol, grad, pp, second_order)
 
-    do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
-      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
-      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
-      sol_w  = conserv_to_primit(sol(:, id_elem))
-      p_elem(j) = sol_w(5)
-    end do
+    !do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
+    !  id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
+    !  id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+    !  sol_w  = conserv_to_primit(sol(:, id_elem))
+    !  p_elem(j) = sol_w(5)
+    !end do
 
-    call build_grad_nodal_system(mesh, id_vert, N, S, S_tilde_T, B)
+    !call build_grad_nodal_system(mesh, id_vert, N, S, S_tilde_T, B)
 
-    call inv_lapack(mesh%vert(id_vert)%n_sub_faces_neigh, N)
-    p_face = matmul(N, matmul(S, p_elem) + B)
+    !call inv_lapack(mesh%vert(id_vert)%n_sub_faces_neigh, N)
+    !p_face = matmul(N, matmul(S, p_elem) + B)
 
-    grad_p_tilde = 0.0_DOUBLE
-    mat = 0.0_DOUBLE
-    do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
-      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
-      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
-      sol_w = conserv_to_primit(sol(:, id_elem))
-      aelem = sqrt(gamma*sol_w(5)/sol_w(1))
-      do k=1, mesh%sub_elem(id_sub_elem)%n_sub_faces
-        id_sub_face = mesh%sub_elem(id_sub_elem)%sub_face(k)
-        id_sub_face_loc = mesh%sub_face(id_sub_face)%id_loc_around_node
-        grad_p_tilde(:, j) = grad_p_tilde(:, j) &
-          + (p_face(id_sub_face_loc) - p_elem(j)) &
-          * mesh%sub_face(id_sub_face)%area * mesh%sub_face(id_sub_face)%norm
-        mat(: ,:, j) = mat(:, :, j) + mesh%sub_face(id_sub_face)%area &
-        * sol_w(1) * aelem &
-        * tensor_product(mesh%sub_face(id_sub_face)%norm, mesh%sub_face(id_sub_face)%norm)
-      end do
-      call inv_lapack(3, mat(:, :, j))
-      grad_p_tilde(:, j) = matmul(mat(: ,:, j), grad_p_tilde(:, j))
-    end do
+    !grad_p_tilde = 0.0_DOUBLE
+    !mat = 0.0_DOUBLE
+    !do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
+    !  id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
+    !  id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+    !  sol_w = conserv_to_primit(sol(:, id_elem))
+    !  aelem = sqrt(gamma*sol_w(5)/sol_w(1))
+    !  do k=1, mesh%sub_elem(id_sub_elem)%n_sub_faces
+    !    id_sub_face = mesh%sub_elem(id_sub_elem)%sub_face(k)
+    !    id_sub_face_loc = mesh%sub_face(id_sub_face)%id_loc_around_node
+    !    grad_p_tilde(:, j) = grad_p_tilde(:, j) &
+    !      + (p_face(id_sub_face_loc) - p_elem(j)) &
+    !      * mesh%sub_face(id_sub_face)%area * mesh%sub_face(id_sub_face)%norm
+    !    mat(: ,:, j) = mat(:, :, j) + mesh%sub_face(id_sub_face)%area &
+    !    * sol_w(1) * aelem &
+    !    * tensor_product(mesh%sub_face(id_sub_face)%norm, mesh%sub_face(id_sub_face)%norm)
+    !  end do
+    !  call inv_lapack(3, mat(:, :, j))
+    !  grad_p_tilde(:, j) = matmul(mat(: ,:, j), grad_p_tilde(:, j))
+    !end do
 
     vp = 0.0_DOUBLE
     do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
@@ -2930,12 +2977,25 @@ contains
       end if
       norm = mesh%sub_face(id_sub_face)%norm
 
-      vpc = vp - grad_p_tilde(:, lse_loc)
-      !vpc = vp
+      call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
+        second_order, sol_w_l, sol_w_r)
+
+      rhol = sol_w_l(1)
+      vnl = dot_product(sol_w_l(2:4), norm)
+      pl = sol_w_l(5)
+      al = sound_speed_w(sol_w_l)
+
+      rhor = sol_w_r(1)
+      vnr = dot_product(sol_w_r(2:4), norm)
+      pr = sol_w_r(5)
+      ar = sound_speed_w(sol_w_r)
+
+      vpcf = dot_product(vp, norm) - 0.5_DOUBLE*(pr/(rhor*ar) - pl/(rhol*al))
+      !vpcf = dot_product(vp, norm)
 
       ff(1) = 0.0_DOUBLE
       ff(2:4) = pp * norm
-      ff(5) = dot_product(vpc, norm) * pp
+      ff(5) = vpcf * pp
 
       fminus = ff
       fplus = fminus
