@@ -1,4 +1,4 @@
-ls = 0.04;
+ls = 0.03;
 Point(1) = {-0.5, -0.5, -0.5, 1.0};
 //+
 Extrude {1, 0, 0} {
@@ -18,3 +18,5 @@ Physical Volume("fluid", 28) = {1};
 MeshSize {3, 4, 10, 14, 1, 5, 2, 6} = ls;
 //+
 Physical Surface("all_surf", 29) = {22, 5, 26, 27, 14, 18};
+//+
+Mesh.Algorithm=2;
