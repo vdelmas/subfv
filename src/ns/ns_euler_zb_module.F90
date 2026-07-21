@@ -3094,6 +3094,8 @@ contains
     sol_p = sol_p / mesh%vert(id_vert)%volume
     vpm = vpm / mesh%vert(id_vert)%volume
 
+    !fmp_adv = tensor_product(sol_p, vp(:, id_vert)) &
+    !  - 0.5_DOUBLE*diag(abs(vp(:, id_vert)))*grad_sol_p
     fmp_adv = tensor_product(sol_p, vp(:, id_vert)) &
       - 0.5_DOUBLE*norm2(vp(:, id_vert))*grad_sol_p
 
@@ -3131,26 +3133,31 @@ contains
       machm = vm/am
       sol_m = 0.5_DOUBLE*(sol_r + sol_l)
 
-      !lambda_l = rhol*al
-      !lambda_r = rhor*ar
-      !vbar = (lambda_l*vnl + lambda_r*vnr - (pr-pl))/(lambda_l+lambda_r)
-      !pbar = (lambda_r * pl + lambda_l * pr - lambda_l*lambda_r*(vnr-vnl))/(lambda_l+lambda_r)
+      lambda_l = rhol*al
+      lambda_r = rhor*ar
+      vbar = (lambda_l*vnl + lambda_r*vnr - (pr-pl))/(lambda_l+lambda_r)
+      pbar = (lambda_r * pl + lambda_l * pr - lambda_l*lambda_r*(vnr-vnl))/(lambda_l+lambda_r)
 
-      vbar = 0.5_DOUBLE*(vnl+vnr) - 0.5_DOUBLE/(rhom*am) * (pr - pl)
-      pbar = 0.5_DOUBLE*(pl+pr) - 0.5_DOUBLE*rhom*am*(vnr-vnl)
+      !vbar = 0.5_DOUBLE*(vnl+vnr) - 0.5_DOUBLE/(rhom*am) * (pr - pl)
+      !pbar = 0.5_DOUBLE*(pl+pr) - 0.5_DOUBLE*rhom*am*(vnr-vnl)
       !ff_adv = vbar*sol_m - 0.5_DOUBLE*max(abs(vnl),abs(vnr))*(sol_r-sol_l)
-      ff_adv = vbar*sol_m - 0.5_DOUBLE*abs(vbar)*(sol_r-sol_l)
+      !ff_adv = 0.5_DOUBLE*(vnl*sol_l+vnr*sol_r) &
+      !  - 0.5_DOUBLE*max(abs(vnl),abs(vnr))*(sol_r-sol_l)
+
+      ff_adv = vbar*sol_m - 0.5_DOUBLE*(abs(vbar)+min(1.0_DOUBLE, machm)*am)*(sol_r-sol_l)
 
       ff_lag(1) = 0.0_DOUBLE
-      ff_lag(2:4) = pbar * norm
-      ff_lag(5) = pbar * vbar
+      !ff_lag(2:4) = pbar * norm
+      !ff_lag(5) = pbar * vbar
+      ff_lag(2:4) = pp * norm
+      ff_lag(5) = pp * vbar
 
       wpcf = 1.0_DOUBLE/3.0_DOUBLE
       !wpcf = 0.0_DOUBLE
       !fminus = wpcf*matmul(fmp_adv + fmp_lag, norm) &
       !  + (1.0_DOUBLE-wpcf)*(ff_adv+ff_lag)
       !fminus = wpcf*matmul(fmp_adv, norm) + (1.0_DOUBLE-wpcf)*ff_adv + ff_lag
-      fminus = wpcf*matmul(fmp_adv, norm) + (1.0_DOUBLE-wpcf)*ff_adv + matmul(fmp_lag, norm)
+      !fminus = wpcf*matmul(fmp_adv, norm) + (1.0_DOUBLE-wpcf)*ff_adv + matmul(fmp_lag, norm)
       !fminus = wpcf*matmul(fmp_lag, norm) + (1.0_DOUBLE-wpcf)*ff_lag + ff_adv
       !fminus = wpcf*matmul(fmp_lag, norm) + (1.0_DOUBLE-wpcf)*ff_lag + ff_adv
       !fminus = matmul(fmp_lag, norm) + ff_adv
@@ -3158,7 +3165,7 @@ contains
       !fminus = matmul(fmp_adv + fmp_lag, norm)
       !fminus = wpcf*matmul(fmp_lag, norm) + (1.0_DOUBLE-wpcf)*ff_lag + matmul(fmp_adv, norm)
       !fminus = wpcf*matmul(fmp_adv, norm) + (1.0_DOUBLE-wpcf)*ff_adv + matmul(fmp_lag, norm)
-      !fminus = ff_adv + ff_lag
+      fminus = ff_adv + ff_lag
       fplus = fminus
 
       if( boundary_2d &
