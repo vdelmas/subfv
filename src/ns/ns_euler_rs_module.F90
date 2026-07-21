@@ -615,6 +615,69 @@ contains
     lr_flux(:, 2) = -lr_flux(:, 1)
   end subroutine multi_point_pressure
 
+  subroutine multi_point_pressure_ph(sol_w_l, sol_w_r, n, lr_flux, p_nodal, &
+      lambda_l, lambda_r, sl, sr)
+    implicit none
+
+    real(kind=DOUBLE), intent(in) :: p_nodal
+    real(kind=DOUBLE), dimension(5), intent(in) :: sol_w_l, sol_w_r
+    real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), dimension(5) :: sol_l, sol_r
+    real(kind=DOUBLE), intent(inout) :: lambda_l, lambda_r
+    real(kind=DOUBLE), dimension(5, 2), intent(inout) :: lr_flux
+    real(kind=DOUBLE), intent(inout) :: sl, sr
+
+    real(kind=DOUBLE) :: rhol, rhor, vn_l, vn_r, pl, pr, el, er
+    real(kind=DOUBLE) :: vn_bar, vn_l_et, vn_r_et, rhol_et, rhor_et
+    real(kind=DOUBLE), dimension(3) :: vt_l, vt_r
+    real(kind=DOUBLE), dimension(5) :: fl, fr, sol_l_et, sol_r_et
+
+    rhol  = sol_w_l(1)
+    vn_l  = dot_product(sol_w_l(2:4), n)
+    pl    = sol_w_l(5)
+    vt_l  = sol_w_l(2:4) - vn_l*n
+    sol_l = primit_to_conserv(sol_w_l)
+    el    = sol_l(5)/rhol
+
+    rhor  = sol_w_r(1)
+    vn_r  = dot_product(sol_w_r(2:4), n)
+    pr    = sol_w_r(5)
+    vt_r  = sol_w_r(2:4) - vn_r*n
+    sol_r = primit_to_conserv(sol_w_r)
+    er    = sol_r(5)/rhor
+
+    fl(1)   = vn_l*sol_l(1)
+    fl(2:4) = vn_l*sol_l(2:4) + pl*n
+    fl(5)   = (sol_l(5) + pl)*vn_l
+
+    fr(1)   = vn_r*sol_r(1)
+    fr(2:4) = vn_r*sol_r(2:4) + pr*n
+    fr(5)   = (sol_r(5) + pr)*vn_r
+
+    vn_bar = (lambda_l*vn_l + lambda_r*vn_r - (pr - pl))/(lambda_r + lambda_l)
+
+    vn_l_et  = vn_l - (p_nodal - pl)/lambda_l
+    rhol_et  = 1.0_DOUBLE/(1.0_DOUBLE/rhol + (vn_bar - vn_l)/lambda_l)
+    sol_l_et(1)   = rhol_et
+    sol_l_et(2:4) = rhol_et*(vt_l + vn_l_et*n)
+    sol_l_et(5)   = rhol_et*(el + (pl*vn_l - p_nodal*vn_l_et)/lambda_l)
+
+    vn_r_et  = vn_r + (p_nodal - pr)/lambda_r
+    rhor_et  = 1.0_DOUBLE/(1.0_DOUBLE/rhor + (vn_r - vn_bar)/lambda_r)
+    sol_r_et(1)   = rhor_et
+    sol_r_et(2:4) = rhor_et*(vt_r + vn_r_et*n)
+    sol_r_et(5)   = rhor_et*(er + (p_nodal*vn_r_et - pr*vn_r)/lambda_r)
+
+    sl = vn_l - lambda_l/rhol
+    sr = vn_r + lambda_r/rhor
+
+    lr_flux(:, 1) = 0.5_DOUBLE*(fl + fr) - 0.5_DOUBLE* &
+      (abs(sl)*(sol_l_et - sol_l) + &
+      abs(vn_bar)*(sol_r_et - sol_l_et) + &
+      abs(sr)*(sol_r - sol_r_et))
+    lr_flux(:, 2) = -lr_flux(:, 1)
+  end subroutine multi_point_pressure_ph
+
   subroutine compute_lambdas_and_solve_nodal_pressure(mesh, id_vert, sol_w_lr, lambda, p_bars, p_node)
     use ns_global_data_module, only: bc_style
     implicit none

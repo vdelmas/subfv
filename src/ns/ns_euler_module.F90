@@ -327,6 +327,7 @@ contains
     use ns_global_data_module, only: bc_style, scheme, exclude_bound_vert, &
       scheme_id, &
       SCHEME_MULTI_POINT, SCHEME_MULTI_POINT_ISO, SCHEME_MULTI_POINT_PRESSURE, &
+      SCHEME_MULTI_POINT_PRESSURE_PH, &
       SCHEME_THREE_WAVE, SCHEME_TWO_WAVE, SCHEME_MODIFIED_THREE_WAVE
     use linear_solver_module
     use mpi
@@ -405,6 +406,11 @@ contains
       p_nodal = 0.0_DOUBLE
       call compute_lambdas_and_solve_nodal_pressure(mesh, id_vert, &
         sol_w_lr, lambda, p_bars, p_nodal)
+    case (SCHEME_MULTI_POINT_PRESSURE_PH)
+      lambda(:, :) = 0.0_DOUBLE
+      p_nodal = 0.0_DOUBLE
+      call compute_lambdas_and_solve_nodal_pressure(mesh, id_vert, &
+        sol_w_lr, lambda, p_bars, p_nodal)
     end select
 
     !!Compute flux across each sub_face
@@ -469,6 +475,10 @@ contains
           mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
       case (SCHEME_MULTI_POINT_PRESSURE)
         call multi_point_pressure(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+          mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), p_nodal, &
+          lambda(1, j), lambda(2, j), sl, sr)
+      case (SCHEME_MULTI_POINT_PRESSURE_PH)
+        call multi_point_pressure_ph(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
           mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), p_nodal, &
           lambda(1, j), lambda(2, j), sl, sr)
       case default

@@ -3048,7 +3048,7 @@ contains
     real(kind=DOUBLE), dimension(5) :: sol_l, sol_r, sol_m
     real(kind=DOUBLE), dimension(5,3) :: grad_sol_p
     real(kind=DOUBLE), dimension(3) :: vpm
-    real(kind=DOUBLE) :: rhom, pm, um, up, am, vm, machm, pbar
+    real(kind=DOUBLE) :: rhom, pm, um, up, am, vm, machm, pbar, corr
 
     !MULTI POINT LAG
     rse_loc = 0
@@ -3099,6 +3099,8 @@ contains
     fmp_adv = tensor_product(sol_p, vp(:, id_vert)) &
       - 0.5_DOUBLE*norm2(vp(:, id_vert))*grad_sol_p
 
+    call compute_corr2(mesh, id_vert, sol, grad, corr, second_order)
+
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
       le = mesh%sub_face(id_sub_face)%left_elem_neigh
@@ -3144,7 +3146,8 @@ contains
       !ff_adv = 0.5_DOUBLE*(vnl*sol_l+vnr*sol_r) &
       !  - 0.5_DOUBLE*max(abs(vnl),abs(vnr))*(sol_r-sol_l)
 
-      ff_adv = vbar*sol_m - 0.5_DOUBLE*(abs(vbar)+min(1.0_DOUBLE, machm)*am)*(sol_r-sol_l)
+      !ff_adv = vbar*sol_m - 0.5_DOUBLE*(abs(vbar)+min(1.0_DOUBLE, machm)*am)*(sol_r-sol_l)
+      ff_adv = vbar*sol_m - 0.5_DOUBLE*(abs(vbar)+corr)*(sol_r-sol_l)
 
       ff_lag(1) = 0.0_DOUBLE
       !ff_lag(2:4) = pbar * norm
