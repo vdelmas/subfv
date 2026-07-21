@@ -1155,6 +1155,70 @@ contains
       end do
     end do
 
+    ! xy-diagonal: (xl,yl,z) <-> (xr,yr,z), matched by coord(3)
+    do i=1, nxl
+      ii = vxl(i)
+      if( mesh%vert(ii)%coord(2) < yl + tol .and. mesh%vert(ii)%coord(2) > yl - tol ) then
+        do j=1, nxr
+          jj = vxr(j)
+          if( mesh%vert(jj)%coord(2) < yr + tol .and. mesh%vert(jj)%coord(2) > yr - tol ) then
+            if( abs(mesh%vert(ii)%coord(3) - mesh%vert(jj)%coord(3)) < tol ) then
+              call process_pair(mesh, ii, jj, tmp, found, sfki, sfkii, sfp, nm, st, ki, kii, k, p, id_se, re)
+              call process_pair(mesh, jj, ii, tmp, found, sfki, sfkii, sfp, nm, st, ki, kii, k, p, id_se, re)
+            end if
+          end if
+        end do
+      end if
+    end do
+
+    ! xz-diagonal: (xl,y,zl) <-> (xr,y,zr), matched by coord(2)
+    do i=1, nxl
+      ii = vxl(i)
+      if( mesh%vert(ii)%coord(3) < zl + tol .and. mesh%vert(ii)%coord(3) > zl - tol ) then
+        do j=1, nxr
+          jj = vxr(j)
+          if( mesh%vert(jj)%coord(3) < zr + tol .and. mesh%vert(jj)%coord(3) > zr - tol ) then
+            if( abs(mesh%vert(ii)%coord(2) - mesh%vert(jj)%coord(2)) < tol ) then
+              call process_pair(mesh, ii, jj, tmp, found, sfki, sfkii, sfp, nm, st, ki, kii, k, p, id_se, re)
+              call process_pair(mesh, jj, ii, tmp, found, sfki, sfkii, sfp, nm, st, ki, kii, k, p, id_se, re)
+            end if
+          end if
+        end do
+      end if
+    end do
+
+    ! yz-diagonal: (x,yl,zl) <-> (x,yr,zr), matched by coord(1)
+    do i=1, nyl
+      ii = vyl(i)
+      if( mesh%vert(ii)%coord(3) < zl + tol .and. mesh%vert(ii)%coord(3) > zl - tol ) then
+        do j=1, nyr
+          jj = vyr(j)
+          if( mesh%vert(jj)%coord(3) < zr + tol .and. mesh%vert(jj)%coord(3) > zr - tol ) then
+            if( abs(mesh%vert(ii)%coord(1) - mesh%vert(jj)%coord(1)) < tol ) then
+              call process_pair(mesh, ii, jj, tmp, found, sfki, sfkii, sfp, nm, st, ki, kii, k, p, id_se, re)
+              call process_pair(mesh, jj, ii, tmp, found, sfki, sfkii, sfp, nm, st, ki, kii, k, p, id_se, re)
+            end if
+          end if
+        end do
+      end if
+    end do
+
+    ! xyz-corner: (xl,yl,zl) <-> (xr,yr,zr)
+    do i=1, nxl
+      ii = vxl(i)
+      if( mesh%vert(ii)%coord(2) < yl + tol .and. mesh%vert(ii)%coord(2) > yl - tol .and. &
+          mesh%vert(ii)%coord(3) < zl + tol .and. mesh%vert(ii)%coord(3) > zl - tol ) then
+        do j=1, nxr
+          jj = vxr(j)
+          if( mesh%vert(jj)%coord(2) < yr + tol .and. mesh%vert(jj)%coord(2) > yr - tol .and. &
+              mesh%vert(jj)%coord(3) < zr + tol .and. mesh%vert(jj)%coord(3) > zr - tol ) then
+            call process_pair(mesh, ii, jj, tmp, found, sfki, sfkii, sfp, nm, st, ki, kii, k, p, id_se, re)
+            call process_pair(mesh, jj, ii, tmp, found, sfki, sfkii, sfp, nm, st, ki, kii, k, p, id_se, re)
+          end if
+        end do
+      end if
+    end do
+
     deallocate(vxl, vxr, vyl, vyr, vzl, vzr)
 
   contains
@@ -1163,6 +1227,8 @@ contains
       ! For vertex v1 with periodic partner v2:
       ! 1. Set right_sub_elem_neigh for v1's periodic sub-faces using v2's sub-elements
       ! 2. Extend v1's sub_face_neigh with v2's sub-faces (deduplicated)
+      ! 3. Extend v1's sub_elem_neigh with v2's original sub-elements (mesh_vert==v2 filter
+      !    avoids duplicates when multiple periodic directions share edge/corner vertices)
       type(mesh_type), intent(inout) :: mesh
       integer(kind=ENTIER), intent(in) :: v1, v2
       integer(kind=ENTIER), intent(inout) :: sfki, sfkii, sfp, nm, st, ki, kii, k, p, id_se, re
@@ -1232,6 +1298,30 @@ contains
           end do
         end if
       end do
+
+      ! Step 3: extend v1's sub_elem_neigh with v2's original sub-elements
+      nm = 0
+      do k = 1, mesh%vert(v2)%n_sub_elems_neigh
+        id_se = mesh%vert(v2)%sub_elem_neigh(k)
+        if (mesh%sub_elem(id_se)%mesh_vert == v2) nm = nm + 1
+      end do
+
+      st = mesh%vert(v1)%n_sub_elems_neigh + nm
+      allocate(tmp(st))
+      tmp(:mesh%vert(v1)%n_sub_elems_neigh) = mesh%vert(v1)%sub_elem_neigh
+      nm = 0
+      do k = 1, mesh%vert(v2)%n_sub_elems_neigh
+        id_se = mesh%vert(v2)%sub_elem_neigh(k)
+        if (mesh%sub_elem(id_se)%mesh_vert == v2) then
+          nm = nm + 1
+          tmp(mesh%vert(v1)%n_sub_elems_neigh + nm) = id_se
+        end if
+      end do
+      deallocate(mesh%vert(v1)%sub_elem_neigh)
+      allocate(mesh%vert(v1)%sub_elem_neigh(st))
+      mesh%vert(v1)%sub_elem_neigh = tmp
+      mesh%vert(v1)%n_sub_elems_neigh = st
+      deallocate(tmp)
 
     end subroutine process_pair
 

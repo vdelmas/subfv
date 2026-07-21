@@ -3150,10 +3150,10 @@ contains
       !fminus = wpcf*matmul(fmp_adv + fmp_lag, norm) &
       !  + (1.0_DOUBLE-wpcf)*(ff_adv+ff_lag)
       !fminus = wpcf*matmul(fmp_adv, norm) + (1.0_DOUBLE-wpcf)*ff_adv + ff_lag
-      !fminus = wpcf*matmul(fmp_adv, norm) + (1.0_DOUBLE-wpcf)*ff_adv + matmul(fmp_lag, norm)
+      fminus = wpcf*matmul(fmp_adv, norm) + (1.0_DOUBLE-wpcf)*ff_adv + matmul(fmp_lag, norm)
       !fminus = wpcf*matmul(fmp_lag, norm) + (1.0_DOUBLE-wpcf)*ff_lag + ff_adv
       !fminus = wpcf*matmul(fmp_lag, norm) + (1.0_DOUBLE-wpcf)*ff_lag + ff_adv
-      fminus = matmul(fmp_lag, norm) + ff_adv
+      !fminus = matmul(fmp_lag, norm) + ff_adv
       !fminus = matmul(fmp_adv, norm) + ff_lag
       !fminus = matmul(fmp_adv + fmp_lag, norm)
       !fminus = wpcf*matmul(fmp_lag, norm) + (1.0_DOUBLE-wpcf)*ff_lag + matmul(fmp_adv, norm)
