@@ -3010,4 +3010,176 @@ contains
     end do
   end subroutine compute_rhs_around_vert_LPF
 
+  subroutine compute_rhs_around_vert_WIP(mesh, sol, grad, &
+      nsen, flux_sum_vert, sum_lambda_vert, &
+      id_vert, vp, h_p, second_order)
+    use ns_global_data_module, only: bc_style, scheme, &
+      exclude_bound_vert, boundary_2d
+    use linear_solver_module
+    use mpi
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(inout) :: vp
+    real(kind=DOUBLE), dimension(mesh%n_vert), intent(in) :: h_p
+    real(kind=DOUBLE), dimension(:, :, :), intent(in) :: grad
+    integer(kind=ENTIER), intent(in) :: nsen
+    real(kind=DOUBLE), dimension(nsen), intent(inout) :: &
+      sum_lambda_vert
+    real(kind=DOUBLE), dimension(5, nsen), intent(inout) :: &
+      flux_sum_vert
+    integer(kind=ENTIER), intent(in) :: id_vert
+    logical, intent(in) :: second_order
+
+    integer(kind=ENTIER) :: j, id_sub_face, id_face
+    integer(kind=ENTIER) :: le, re, lse, rse, lse_loc, rse_loc
+    real(kind=DOUBLE), dimension(3) :: norm
+
+    real(kind=DOUBLE) :: pp
+    real(kind=DOUBLE), dimension(5) :: fminus, fplus
+    real(kind=DOUBLE), dimension(5,3) :: fmp_lag, fmp_adv
+
+    integer(kind=ENTIER) :: id_sub_elem, id_elem, k
+    real(kind=DOUBLE) :: pl, pr, rhol, rhor, wpcf, vbar
+    real(kind=DOUBLE) :: vnl, vnr, al, ar, lambda_lts, lambda_adv
+    real(kind=DOUBLE) :: lambda_l, lambda_r, sum_area
+    real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, ff_lag, ff_adv, sol_p
+    real(kind=DOUBLE), dimension(5) :: sol_l, sol_r, sol_m
+    real(kind=DOUBLE), dimension(5,3) :: grad_sol_p
+    real(kind=DOUBLE), dimension(3) :: vpm
+    real(kind=DOUBLE) :: rhom, pm, um, up, am, vm, machm, pbar
+
+    !MULTI POINT LAG
+    rse_loc = 0
+    call compute_nodal_velocity_LVP(mesh, id_vert, sol, grad, vp(:,id_vert), second_order)
+    call compute_nodal_pressure_LPP(mesh, id_vert, sol, grad, pp, second_order)
+
+    fmp_lag(1, :) = 0.0_DOUBLE
+    fmp_lag(2:4, :) = pp*eye3
+    fmp_lag(5, :) = pp*vp(:, id_vert)
+
+    !MULTI POINT ADV
+    grad_sol_p = 0.0_DOUBLE
+    sum_area = 0.0_DOUBLE
+    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
+      lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
+      lse_loc = mesh%sub_elem(lse)%id_loc_around_node
+      rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
+      if( rse > 0 ) then
+        rse_loc = mesh%sub_elem(rse)%id_loc_around_node
+      end if
+      norm = mesh%sub_face(id_sub_face)%norm
+      call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
+        second_order, sol_w_l, sol_w_r)
+      sol_l = primit_to_conserv(sol_w_l)
+      sol_r = primit_to_conserv(sol_w_r)
+      grad_sol_p = grad_sol_p + mesh%sub_face(id_sub_face)%area&
+        *tensor_product(sol_r - sol_l, mesh%sub_face(id_sub_face)%norm)
+      sum_area = sum_area + mesh%sub_face(id_sub_face)%area
+    end do
+    grad_sol_p = grad_sol_p / (0.5_DOUBLE*sum_area)
+
+    sol_p = 0.0_DOUBLE
+    vpm = 0.0_DOUBLE
+    do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
+      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
+      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+      sol_p = sol_p + mesh%sub_elem(id_sub_elem)%volume * sol(:, id_elem)
+      vpm = vpm + mesh%sub_elem(id_sub_elem)%volume * sol(2:4, id_elem)/sol(1, id_elem)
+    end do
+    sol_p = sol_p / mesh%vert(id_vert)%volume
+    vpm = vpm / mesh%vert(id_vert)%volume
+
+    fmp_adv = tensor_product(sol_p, vp(:, id_vert)) &
+      - 0.5_DOUBLE*norm2(vp(:, id_vert))*grad_sol_p
+
+    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
+      lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
+      lse_loc = mesh%sub_elem(lse)%id_loc_around_node
+      rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
+      if( rse > 0 ) then
+        rse_loc = mesh%sub_elem(rse)%id_loc_around_node
+      end if
+      norm = mesh%sub_face(id_sub_face)%norm
+
+      call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
+        second_order, sol_w_l, sol_w_r)
+
+      sol_l = primit_to_conserv(sol_w_l)
+      rhol = sol_w_l(1)
+      vnl = dot_product(sol_w_l(2:4), norm)
+      pl = sol_w_l(5)
+      al = sound_speed_w(sol_w_l)
+
+      sol_r = primit_to_conserv(sol_w_r)
+      rhor = sol_w_r(1)
+      vnr = dot_product(sol_w_r(2:4), norm)
+      pr = sol_w_r(5)
+      ar = sound_speed_w(sol_w_r)
+
+      rhom = 0.5_DOUBLE*(rhol+rhor)
+      am = 0.5_DOUBLE*(al+ar)
+      !am = max(al, ar)
+      vm = 0.5_DOUBLE*(norm2(sol_w_l(2:4)) + norm2(sol_w_r(2:4)))
+      machm = vm/am
+      sol_m = 0.5_DOUBLE*(sol_r + sol_l)
+
+      !lambda_l = rhol*al
+      !lambda_r = rhor*ar
+      !vbar = (lambda_l*vnl + lambda_r*vnr - (pr-pl))/(lambda_l+lambda_r)
+      !pbar = (lambda_r * pl + lambda_l * pr - lambda_l*lambda_r*(vnr-vnl))/(lambda_l+lambda_r)
+
+      vbar = 0.5_DOUBLE*(vnl+vnr) - 0.5_DOUBLE/(rhom*am) * (pr - pl)
+      pbar = 0.5_DOUBLE*(pl+pr) - 0.5_DOUBLE*rhom*am*(vnr-vnl)
+      !ff_adv = vbar*sol_m - 0.5_DOUBLE*max(abs(vnl),abs(vnr))*(sol_r-sol_l)
+      ff_adv = vbar*sol_m - 0.5_DOUBLE*abs(vbar)*(sol_r-sol_l)
+
+      ff_lag(1) = 0.0_DOUBLE
+      ff_lag(2:4) = pbar * norm
+      ff_lag(5) = pbar * vbar
+
+      wpcf = 1.0_DOUBLE/3.0_DOUBLE
+      !wpcf = 0.0_DOUBLE
+      !fminus = wpcf*matmul(fmp_adv + fmp_lag, norm) &
+      !  + (1.0_DOUBLE-wpcf)*(ff_adv+ff_lag)
+      !fminus = wpcf*matmul(fmp_adv, norm) + (1.0_DOUBLE-wpcf)*ff_adv + ff_lag
+      !fminus = wpcf*matmul(fmp_adv, norm) + (1.0_DOUBLE-wpcf)*ff_adv + matmul(fmp_lag, norm)
+      !fminus = wpcf*matmul(fmp_lag, norm) + (1.0_DOUBLE-wpcf)*ff_lag + ff_adv
+      !fminus = wpcf*matmul(fmp_lag, norm) + (1.0_DOUBLE-wpcf)*ff_lag + ff_adv
+      fminus = matmul(fmp_lag, norm) + ff_adv
+      !fminus = matmul(fmp_adv, norm) + ff_lag
+      !fminus = matmul(fmp_adv + fmp_lag, norm)
+      !fminus = wpcf*matmul(fmp_lag, norm) + (1.0_DOUBLE-wpcf)*ff_lag + matmul(fmp_adv, norm)
+      !fminus = wpcf*matmul(fmp_adv, norm) + (1.0_DOUBLE-wpcf)*ff_adv + matmul(fmp_lag, norm)
+      !fminus = ff_adv + ff_lag
+      fplus = fminus
+
+      if( boundary_2d &
+        .and. abs(mesh%sub_face(id_sub_face)%norm(3)) > 1e-3 ) then
+        fminus = 0.0_DOUBLE
+        fplus = 0.0_DOUBLE
+      end if
+
+      lambda_lts = max(abs(vnl), abs(vnr)) + max(al, ar)
+
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
+          + mesh%sub_face(id_sub_face)%area*lambda_lts
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+
+        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+            + mesh%sub_face(id_sub_face)%area*lambda_lts
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
+      end if
+    end do
+  end subroutine compute_rhs_around_vert_WIP
 end module ns_euler_zb_module
