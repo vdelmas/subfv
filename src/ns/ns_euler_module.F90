@@ -153,7 +153,7 @@ contains
     use mpi
     use ns_global_data_module, only: bc_style, scheme, exclude_bound_vert, &
       scheme_id, scheme_adv_id, scheme_lag_id, &
-      SCHEME_ZB, SCHEME_WIP, &
+      SCHEME_ZB, SCHEME_WIP, SCHEME_USI3D, &
       SCHEME_ADV_AR1D, SCHEME_ADV_AM, SCHEME_ADV_AMISO, &
       SCHEME_ADV_ARMD, SCHEME_ADV_ARMDU, SCHEME_ADV_ARMDM, &
       SCHEME_ADV_ARMDMAT, SCHEME_ADV_ARMDUMAT, SCHEME_ADV_ARMDMMAT, &
@@ -290,6 +290,23 @@ contains
         sum_lambda_vert(1:nsen) = 0.0_DOUBLE
         flux_sum_vert(:, 1:nsen) = 0.0_DOUBLE
         call compute_rhs_around_vert_WIP(mesh, sol, grad, &
+          nsen, flux_sum_vert, sum_lambda_vert, &
+          id_vert, vp, h_p, second_order)
+
+        do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
+          idse = mesh%vert(id_vert)%sub_elem_neigh(j)
+          ide = mesh%sub_elem(idse)%mesh_elem
+          rhs(:, ide) = rhs(:, ide) - flux_sum_vert(:, j)
+          sum_lambda(ide) = sum_lambda(ide) + sum_lambda_vert(j)
+        end do
+      end do
+    else if (scheme_id == SCHEME_USI3D) then
+      do id_vert = 1, mesh%n_vert
+        nsfn = mesh%vert(id_vert)%n_sub_faces_neigh
+        nsen = mesh%vert(id_vert)%n_sub_elems_neigh
+        sum_lambda_vert(1:nsen) = 0.0_DOUBLE
+        flux_sum_vert(:, 1:nsen) = 0.0_DOUBLE
+        call compute_rhs_around_vert_usi3d(mesh, sol, grad, &
           nsen, flux_sum_vert, sum_lambda_vert, &
           id_vert, vp, h_p, second_order)
 
