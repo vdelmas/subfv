@@ -2591,7 +2591,7 @@ contains
     div_v = div_v/(denomsum*a_p*rho_p)
 
     corr_div_v = max(0.0_DOUBLE, min(1.0_DOUBLE, abs(div_v)/a_p))*a_p
-    corr_grad_p = max(0.0_DOUBLE, min(1.0_DOUBLE, norm2(grad_p)/a_p**2))*a_p
+    corr_grad_p = max(0.0_DOUBLE, min(1.0_DOUBLE, norm2(grad_p)/a_p))*a_p
     corr = max(corr_div_v, corr_grad_p)
   end subroutine compute_corr2
 
