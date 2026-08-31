@@ -92,7 +92,7 @@ contains
         sol(2, i) = 0.0_DOUBLE
         sol(3, i) = 0.0_DOUBLE
         sol(4, i) = 0.0_DOUBLE
-        sol(5, i) = 1e-16_DOUBLE/(gamma - 1.0_DOUBLE)
+        sol(5, i) = 1e-12_DOUBLE/(gamma - 1.0_DOUBLE)
       end do
 
       if( imin > 0 ) then

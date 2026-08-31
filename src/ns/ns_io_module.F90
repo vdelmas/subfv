@@ -408,7 +408,8 @@ contains
     use ns_euler_primitives_module, only: conserv_to_primit, sound_speed_w, &
       mach_u, temp_u
     use ns_euler_recon_module, only: compute_nodal_grad
-    use ns_euler_zb_module, only: compute_nodal_pressure_LS, compute_nodal_velocity_LS
+    use ns_euler_zb_module, only: compute_nodal_pressure_LS, compute_nodal_velocity_LS, &
+      compute_corr2, compute_corr_ducros, compute_corr_pressure, compute_corr_pressure_div
     use ns_euler_recon_module, only: omega_ducros
     use ns_vectorial_diffusion_module, only: mu_sutherland
     use linear_solver_module
@@ -676,6 +677,42 @@ contains
     end do
     write(fn, *) "</DataArray>"
 
+    write(fn, *) "<DataArray type='Float64' Name='Corr2' format='ascii' NumberOfComponents='1'>"
+    do i=1, mesh%n_vert
+      if( .not. mesh%vert(i)%is_ghost ) then
+        call compute_corr2(mesh, i, sol, grad, pp, second_order)
+        write (fn, *) pp
+      end if
+    end do
+    write(fn, *) "</DataArray>"
+
+    write(fn, *) "<DataArray type='Float64' Name='Corr_Ducros' format='ascii' NumberOfComponents='1'>"
+    do i=1, mesh%n_vert
+      if( .not. mesh%vert(i)%is_ghost ) then
+        call compute_corr_ducros(mesh, i, sol, grad, pp, second_order)
+        write (fn, *) pp
+      end if
+    end do
+    write(fn, *) "</DataArray>"
+
+    write(fn, *) "<DataArray type='Float64' Name='Corr_Pressure' format='ascii' NumberOfComponents='1'>"
+    do i=1, mesh%n_vert
+      if( .not. mesh%vert(i)%is_ghost ) then
+        call compute_corr_pressure(mesh, i, sol, grad, pp, second_order)
+        write (fn, *) pp
+      end if
+    end do
+    write(fn, *) "</DataArray>"
+
+    write(fn, *) "<DataArray type='Float64' Name='Corr_Pressure_Div' format='ascii' NumberOfComponents='1'>"
+    do i=1, mesh%n_vert
+      if( .not. mesh%vert(i)%is_ghost ) then
+        call compute_corr_pressure_div(mesh, i, sol, grad, pp, second_order)
+        write (fn, *) pp
+      end if
+    end do
+    write(fn, *) "</DataArray>"
+
     write(fn, *) "</PointData>"
 
     !Cell data
@@ -921,6 +958,10 @@ contains
       write(fn, *) "<PDataArray type='Float64' Name='Nodal_Grad_Pressure' NumberOfComponents='3'/>"
       write(fn, *) "<PDataArray type='Float64' Name='Hessian Mach' NumberOfComponents='9'/>"
       write(fn, *) "<PDataArray type='Float64' Name='Hessian Temp' NumberOfComponents='9'/>"
+      write(fn, *) "<PDataArray type='Float64' Name='Corr2' format='ascii' NumberOfComponents='1'/>"
+      write(fn, *) "<PDataArray type='Float64' Name='Corr_Ducros' format='ascii' NumberOfComponents='1'/>"
+      write(fn, *) "<PDataArray type='Float64' Name='Corr_Pressure' format='ascii' NumberOfComponents='1'/>"
+      write(fn, *) "<PDataArray type='Float64' Name='Corr_Pressure_Div' format='ascii' NumberOfComponents='1'/>"
       write(fn, *) "</PPointData>"
       write(fn, *) "<PCellData>"
       write(fn, *) "<PDataArray type='Float64' Name='Centroid' NumberOfComponents='3'/>"

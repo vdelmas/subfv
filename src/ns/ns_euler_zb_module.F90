@@ -2574,13 +2574,13 @@ contains
       !Grad(p)
       mat = mat + mesh%sub_face(id_sub_face)%area&
       *(lambda_l + lambda_r)*tensor_product(norm, norm)
-      vbar = (- (pr -pl))/(lambda_l+lambda_r)
+      vbar = (- (pr - pl))/(lambda_l+lambda_r)
       rhs = rhs + mesh%sub_face(id_sub_face)%area&
       *(lambda_l + lambda_r)*vbar*norm
 
       !Div(v)
       invlamb = (1.0_DOUBLE/lambda_l + 1.0_DOUBLE/lambda_r)
-      pbar = (- (vnr - vnl))/invlamb
+      pbar = ( (vnr - vnl))/invlamb
       div_v = div_v + mesh%sub_face(id_sub_face)%area*invlamb*pbar
       denomsum = denomsum + mesh%sub_face(id_sub_face)%area*invlamb
     end do
@@ -2590,10 +2590,198 @@ contains
 
     div_v = div_v/(denomsum*a_p*rho_p)
 
-    corr_div_v = max(0.0_DOUBLE, min(1.0_DOUBLE, abs(div_v)/a_p))*a_p
-    corr_grad_p = max(0.0_DOUBLE, min(1.0_DOUBLE, norm2(grad_p)/a_p))*a_p
-    corr = max(corr_div_v, corr_grad_p)
+    corr_div_v = min(1.0_DOUBLE, max(0.0_DOUBLE, -div_v/a_p))*a_p
+    corr_grad_p = min(1.0_DOUBLE, max(0.0_DOUBLE, norm2(grad_p)/a_p))*a_p
+    !corr = max(corr_div_v, corr_grad_p)
+    corr = corr_div_v
   end subroutine compute_corr2
+
+  subroutine compute_corr_ducros(mesh, id_vert, sol, grad, corr, second_order)
+    use ns_global_data_module, only : boundary_2d
+    use linear_solver_module, only: cross_product
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: id_vert
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(:, :, :), intent(in) :: grad
+    real(kind=DOUBLE), intent(inout) :: corr
+    logical, intent(in) :: second_order
+
+    integer(kind=ENTIER) :: j, id_sub_elem, id_elem, id_sub_face, le, re
+    real(kind=DOUBLE) :: a_p, div_v, f_ducros, ma_node
+    real(kind=DOUBLE), dimension(3) :: norm, curl_v, vl, vr, v_p
+    real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, sol_w
+
+    ! nodal sound speed and velocity (volume-weighted)
+    a_p = 0.0_DOUBLE
+    v_p = 0.0_DOUBLE
+    do j = 1, mesh%vert(id_vert)%n_sub_elems_neigh
+      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
+      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+      sol_w = conserv_to_primit(sol(:, id_elem))
+      a_p = a_p + mesh%sub_elem(id_sub_elem)%volume * sound_speed_w(sol_w)
+      v_p = v_p + mesh%sub_elem(id_sub_elem)%volume * sol_w(2:4)
+    end do
+    a_p = a_p / mesh%vert(id_vert)%volume
+    v_p = v_p / mesh%vert(id_vert)%volume
+    ma_node = norm2(v_p) / a_p
+
+    ! div(v) and curl(v) via Gauss theorem on sub-faces around node
+    ! using cell-centered values (no reconstruction) as is standard for shock sensors
+    div_v  = 0.0_DOUBLE
+    curl_v = 0.0_DOUBLE
+    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
+      if (re <= 0) cycle
+      norm = mesh%sub_face(id_sub_face)%norm
+      sol_w_l = conserv_to_primit(sol(:, le))
+      sol_w_r = conserv_to_primit(sol(:, re))
+      vl = sol_w_l(2:4)
+      vr = sol_w_r(2:4)
+      div_v  = div_v  + mesh%sub_face(id_sub_face)%area * dot_product(norm, vr - vl)
+      curl_v = curl_v + mesh%sub_face(id_sub_face)%area * cross_product(norm, vr - vl)
+    end do
+    div_v  = div_v  / mesh%vert(id_vert)%volume
+    curl_v = curl_v / mesh%vert(id_vert)%volume
+
+    ! Ducros filter: ~1 at shocks (irrotational compression), ~0 in BL (shear-dominated)
+    f_ducros = div_v**2 / (div_v**2 + norm2(curl_v)**2 + 1.0e-10_DOUBLE * a_p**2)
+
+    ! activate only for compression; suppress near stagnation via Mach filter
+    corr = f_ducros * min(1.0_DOUBLE, ma_node) &
+         * min(1.0_DOUBLE, max(0.0_DOUBLE, -div_v / a_p)) * 4 * a_p
+
+    if (boundary_2d .and. mesh%vert(id_vert)%is_bound) corr = 0.0_DOUBLE
+
+  end subroutine compute_corr_ducros
+
+  subroutine compute_corr_pressure(mesh, id_vert, sol, grad, corr, second_order)
+    use ns_global_data_module, only : boundary_2d
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: id_vert
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(:, :, :), intent(in) :: grad
+    real(kind=DOUBLE), intent(inout) :: corr
+    logical, intent(in) :: second_order
+
+    integer(kind=ENTIER) :: j, id_sub_elem, id_elem, id_sub_face, le, re
+    real(kind=DOUBLE) :: a_p, rho_p, dp_avg, sum_area, pl, pr
+    real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, sol_w
+
+    ! nodal sound speed and density (volume-weighted)
+    a_p   = 0.0_DOUBLE
+    rho_p = 0.0_DOUBLE
+    do j = 1, mesh%vert(id_vert)%n_sub_elems_neigh
+      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
+      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+      sol_w = conserv_to_primit(sol(:, id_elem))
+      a_p   = a_p   + mesh%sub_elem(id_sub_elem)%volume * sound_speed_w(sol_w)
+      rho_p = rho_p + mesh%sub_elem(id_sub_elem)%volume * sol_w(1)
+    end do
+    a_p   = a_p   / mesh%vert(id_vert)%volume
+    rho_p = rho_p / mesh%vert(id_vert)%volume
+
+    ! area-averaged pressure jump across sub-faces
+    dp_avg   = 0.0_DOUBLE
+    sum_area = 0.0_DOUBLE
+    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
+      if (re <= 0) cycle
+      sol_w_l = conserv_to_primit(sol(:, le))
+      sol_w_r = conserv_to_primit(sol(:, re))
+      pl = sol_w_l(5)
+      pr = sol_w_r(5)
+      dp_avg   = dp_avg   + mesh%sub_face(id_sub_face)%area * abs(pr - pl)
+      sum_area = sum_area + mesh%sub_face(id_sub_face)%area
+    end do
+    dp_avg = dp_avg / (sum_area + 1.0e-30_DOUBLE)
+
+    ! normalize by rho*a^2 (acoustic pressure scale ~ gamma*p); clip to [0, a_p]
+    corr = min(1.0_DOUBLE, dp_avg / (rho_p * a_p**2)) * 2 * a_p
+
+    if (boundary_2d .and. mesh%vert(id_vert)%is_bound) corr = 0.0_DOUBLE
+
+  end subroutine compute_corr_pressure
+
+  subroutine compute_corr_pressure_div(mesh, id_vert, sol, grad, corr, second_order)
+    use ns_global_data_module, only : boundary_2d
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: id_vert
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(:, :, :), intent(in) :: grad
+    real(kind=DOUBLE), intent(inout) :: corr
+    logical, intent(in) :: second_order
+
+    integer(kind=ENTIER) :: j, id_sub_elem, id_elem, id_sub_face, le, re
+    real(kind=DOUBLE) :: a_p, rho_p, p_p, dp_max, div_v, sum_area, pl, pr, h_p, ma_node
+    real(kind=DOUBLE) :: corr_pressure, corr_div
+    real(kind=DOUBLE), dimension(3) :: norm, v_p
+    real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, sol_w
+
+    ! nodal sound speed, density, pressure and velocity (volume-weighted)
+    a_p   = 0.0_DOUBLE
+    rho_p = 0.0_DOUBLE
+    p_p   = 0.0_DOUBLE
+    v_p   = 0.0_DOUBLE
+    do j = 1, mesh%vert(id_vert)%n_sub_elems_neigh
+      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
+      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+      sol_w = conserv_to_primit(sol(:, id_elem))
+      a_p   = a_p   + mesh%sub_elem(id_sub_elem)%volume * sound_speed_w(sol_w)
+      rho_p = rho_p + mesh%sub_elem(id_sub_elem)%volume * sol_w(1)
+      p_p   = p_p   + mesh%sub_elem(id_sub_elem)%volume * sol_w(5)
+      v_p   = v_p   + mesh%sub_elem(id_sub_elem)%volume * sol_w(2:4)
+    end do
+    a_p   = a_p   / mesh%vert(id_vert)%volume
+    rho_p = rho_p / mesh%vert(id_vert)%volume
+    p_p   = p_p   / mesh%vert(id_vert)%volume
+    v_p   = v_p   / mesh%vert(id_vert)%volume
+    ma_node = norm2(v_p) / a_p
+
+    ! max pressure jump and div(v) via sub-face loop
+    ! dp_max (not averaged) avoids dilution when the shock crosses only a few faces
+    dp_max   = 0.0_DOUBLE
+    div_v    = 0.0_DOUBLE
+    sum_area = 0.0_DOUBLE
+    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
+      if (re <= 0) cycle
+      norm    = mesh%sub_face(id_sub_face)%norm
+      sol_w_l = conserv_to_primit(sol(:, le))
+      sol_w_r = conserv_to_primit(sol(:, re))
+      pl = sol_w_l(5)
+      pr = sol_w_r(5)
+      dp_max   = max(dp_max, abs(pr - pl))
+      div_v    = div_v    + mesh%sub_face(id_sub_face)%area &
+                          * dot_product(norm, sol_w_r(2:4) - sol_w_l(2:4))
+      sum_area = sum_area + mesh%sub_face(id_sub_face)%area
+    end do
+    div_v = div_v / mesh%vert(id_vert)%volume
+
+    ! h_p ~ volume/surface as local length scale (makes div_v*h_p/a_p dimensionless)
+    h_p = mesh%vert(id_vert)%volume / (sum_area + 1.0e-30_DOUBLE)
+
+    ! Blazek-style relative pressure jump: dp/p (large at shocks, small elsewhere)
+    ! Mach filter min(1,Ma) suppresses stagnation-line false positives
+    !corr_pressure = min(1.0_DOUBLE, ma_node**2) * min(1.0_DOUBLE, dp_max / p_p) * a_p
+    corr_pressure = min(1.0_DOUBLE, ma_node**2) * min(1.0_DOUBLE, dp_max / (rho_p * a_p**2) ) * a_p
+    corr_div      = min(1.0_DOUBLE, ma_node**2) * min(1.0_DOUBLE, max(0.0_DOUBLE, -div_v * h_p / a_p)) * a_p
+    corr = 4*max(corr_pressure, corr_div)
+
+    if (boundary_2d .and. mesh%vert(id_vert)%is_bound) corr = 0.0_DOUBLE
+
+  end subroutine compute_corr_pressure_div
 
   subroutine compute_rhs_around_vert_LVPPP(mesh, sol, grad, &
       nsen, flux_sum_vert, &
@@ -3019,7 +3207,7 @@ contains
     real(kind=DOUBLE), dimension(5,3) :: grad_sol_p
     real(kind=DOUBLE), dimension(3) :: vpm
     real(kind=DOUBLE) :: rhom, pm, um, up, am, vm, machm, pbar, corr
-    real(kind=DOUBLE) :: divv_p, sum_area_lambda
+    real(kind=DOUBLE) :: divv_p, sum_area_lambda, pbar2
 
     !MULTI POINT LAG
     rse_loc = 0
@@ -3059,13 +3247,26 @@ contains
       pr = sol_w_r(5)
       ar = sound_speed_w(sol_w_r)
 
+      lambda_l = max(al*rhol, sqrt(rhol*max(0.0_DOUBLE, pr - pl)), -rhol*(vnr - vnl))
+      lambda_r = max(ar*rhor, sqrt(rhor*max(0.0_DOUBLE, pl - pr)), -rhor*(vnr - vnl))
+
       grad_sol_p = grad_sol_p + mesh%sub_face(id_sub_face)%area &
         *tensor_product(sol_r - sol_l, mesh%sub_face(id_sub_face)%norm)
-      divv_p = divv_p &
-        + mesh%sub_face(id_sub_face)%area*(vnr - vnl)
       sum_area = sum_area + mesh%sub_face(id_sub_face)%area
-      sum_area_lambda = sum_area_lambda &
-        + mesh%sub_face(id_sub_face)%area*(rhol*al + rhor*ar)
+
+      if( re > 0 ) then
+        divv_p = divv_p &
+          + mesh%sub_face(id_sub_face)%area*(vnr - vnl)
+        sum_area_lambda = sum_area_lambda &
+          + mesh%sub_face(id_sub_face)%area &
+          *(1.0_DOUBLE/lambda_l + 1.0_DOUBLE/lambda_r)
+      else
+        divv_p = divv_p &
+          + 0.5_DOUBLE*mesh%sub_face(id_sub_face)%area*(vnr - vnl)
+        sum_area_lambda = sum_area_lambda &
+          + 0.5_DOUBLE*mesh%sub_face(id_sub_face)%area&
+          *(1.0_DOUBLE/lambda_l + 1.0_DOUBLE/lambda_r)
+      end if
     end do
     grad_sol_p = grad_sol_p / sum_area
     divv_p = divv_p / sum_area_lambda
@@ -3086,7 +3287,10 @@ contains
     fmp_adv = tensor_product(sol_p, vp(:, id_vert)) &
       - 0.5_DOUBLE*norm2(vp(:, id_vert))*grad_sol_p
 
-    call compute_corr2(mesh, id_vert, sol, grad, corr, second_order)
+    !call compute_corr2(mesh, id_vert, sol, grad, corr, second_order)
+    call compute_corr_ducros(mesh, id_vert, sol, grad, corr, second_order)
+    !call compute_corr_pressure(mesh, id_vert, sol, grad, corr, second_order)
+    !call compute_corr_pressure_div(mesh, id_vert, sol, grad, corr, second_order)
 
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
@@ -3122,11 +3326,18 @@ contains
       machm = vm/am
       sol_m = 0.5_DOUBLE*(sol_r + sol_l)
 
-      lambda_l = rhol*al
-      lambda_r = rhor*ar
+      !lambda_l = rhol*al
+      !lambda_r = rhor*ar
+      lambda_l = max(al*rhol, sqrt(rhol*max(0.0_DOUBLE, pr - pl)), -rhol*(vnr - vnl))
+      lambda_r = max(ar*rhor, sqrt(rhor*max(0.0_DOUBLE, pl - pr)), -rhor*(vnr - vnl))
       vbar = (lambda_l*vnl + lambda_r*vnr - (pr-pl))/(lambda_l+lambda_r)
       !pbar = (lambda_r * pl + lambda_l * pr - lambda_l*lambda_r*(vnr-vnl))/(lambda_l+lambda_r)
+      !pbar = (lambda_r * pl + lambda_l * pr - lambda_l*lambda_r*(vnr-vnl))/(lambda_l+lambda_r)
+      !pbar = (lambda_r*pl+lambda_l*pr)/(lambda_l+lambda_r) - divv_p
       pbar = (lambda_r*pl+lambda_l*pr)/(lambda_l+lambda_r) - divv_p
+      !if( abs(pbar - pbar2)/pbar > 0.1_DOUBLE) then
+      !  print*, pbar, pbar2
+      !end if
 
       !vbar = 0.5_DOUBLE*(vnl+vnr) - 0.5_DOUBLE/(rhom*am) * (pr - pl)
       !pbar = 0.5_DOUBLE*(pl+pr) - 0.5_DOUBLE*rhom*am*(vnr-vnl)
@@ -3135,7 +3346,17 @@ contains
       !  - 0.5_DOUBLE*max(abs(vnl),abs(vnr))*(sol_r-sol_l)
 
       !ff_adv = vbar*sol_m - 0.5_DOUBLE*(abs(vbar)+min(1.0_DOUBLE, machm)*am)*(sol_r-sol_l)
+      !print*, corr
+
+      !Not ok start carbuncle
       ff_adv = vbar*sol_m - 0.5_DOUBLE*(abs(vbar)+corr)*(sol_r-sol_l)
+
+      !ff_adv = vbar*sol_m - 0.5_DOUBLE*(abs(vbar)+corr)*(sol_r-sol_l)
+      !ff_adv = vbar*sol_m - 0.5_DOUBLE*abs(vbar)*(sol_r-sol_l)
+
+      !OK ish no carbuncle
+      !ff_adv = 0.5_DOUBLE*(vnl*sol_l + vnr*sol_r) &
+        !- 0.5_DOUBLE*(max(abs(vnl),abs(vnr))+0.01_DOUBLE*corr)*(sol_r-sol_l)
 
       ff_lag(1) = 0.0_DOUBLE
       ff_lag(2:4) = pbar * norm
