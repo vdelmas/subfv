@@ -3422,74 +3422,92 @@ contains
     integer(kind=ENTIER), intent(in) :: id_vert
     logical, intent(in) :: second_order
 
-    integer(kind=ENTIER) :: j, d, id_sub_face
+    integer(kind=ENTIER) :: j, d, id_sub_face, n_neigh
     integer(kind=ENTIER) :: le, re, lse, rse, lse_loc, rse_loc, id_sub_elem, id_elem
-    real(kind=DOUBLE), dimension(3) :: norm
-    real(kind=DOUBLE) :: pp_node, corrp, cp_node, lambda_lts
+    real(kind=DOUBLE), dimension(3) :: norm, vp_node, vface, gradp_h
+    real(kind=DOUBLE) :: pp_node, corrp, cp_node, lambda_lts, hp_vert, rho_p
+    real(kind=DOUBLE) :: pp_avg, div_v_h, area_f, vol
     real(kind=DOUBLE) :: rhol, rhor, vnl, vnr, pl, pr, cL, cR
     real(kind=DOUBLE) :: rhom, am, up, pp_face, smax
-    real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, sol_l, sol_r, sol_m
+    real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, sol_l, sol_r, sol_m, sol_w, Qface
     real(kind=DOUBLE), dimension(5) :: ff_1d, fminus, fplus, Qp, Fp_n
-    real(kind=DOUBLE), dimension(3) :: vp_avg, vp_node
     real(kind=DOUBLE), dimension(5, 3) :: Fp, gradQ
     real(kind=DOUBLE) :: cfweight, sum_area
 
     cfweight = 1.0_DOUBLE / 3.0_DOUBLE
     !cfweight = 0.0_DOUBLE
+    !cfweight = 1e-3_DOUBLE
     rse_loc  = 0
+    hp_vert  = h_p(id_vert)
+    vol      = mesh%vert(id_vert)%volume
+    n_neigh  = mesh%vert(id_vert)%n_sub_elems_neigh
 
-    call compute_nodal_velocity_LVP(mesh, id_vert, sol, grad, vp_node, second_order)
-    call compute_nodal_pressure_LPP(mesh, id_vert, sol, grad, pp_node, second_order)
-    call compute_corr2(mesh, id_vert, sol, grad, corrp, second_order)
-
-    vp(:, id_vert) = vp_node
-
-    ! --- volume-weighted averages over sub-elements ---
+    ! --- volume-weighted averages over neighbouring sub-elements ---
     Qp      = 0.0_DOUBLE
-    vp_avg  = 0.0_DOUBLE
-    do j = 1, mesh%vert(id_vert)%n_sub_elems_neigh
+    pp_avg  = 0.0_DOUBLE
+    vp_node = 0.0_DOUBLE
+    do j = 1, n_neigh
       id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
-      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
-      Qp = Qp + mesh%sub_elem(id_sub_elem)%volume * sol(:, id_elem)
-      vp_avg = vp_avg &
-        + mesh%sub_elem(id_sub_elem)%volume * sol(2:4, id_elem) / sol(1, id_elem)
+      id_elem     = mesh%sub_elem(id_sub_elem)%mesh_elem
+      sol_w       = conserv_to_primit(sol(:, id_elem))
+      Qp          = Qp      + mesh%sub_elem(id_sub_elem)%volume * sol(:, id_elem)
+      pp_avg      = pp_avg  + mesh%sub_elem(id_sub_elem)%volume * sol_w(5)
+      vp_node     = vp_node + mesh%sub_elem(id_sub_elem)%volume * sol_w(2:4)
     end do
-    Qp = Qp / mesh%vert(id_vert)%volume
-    vp_avg = vp_avg / mesh%vert(id_vert)%volume
-    cp_node = sound_speed_w(conserv_to_primit(Qp))
+    Qp      = Qp      / vol
+    pp_avg  = pp_avg  / vol
+    vp_node = vp_node / vol
+    sol_w   = conserv_to_primit(Qp)
+    cp_node = sound_speed_w(sol_w)
+    rho_p   = sol_w(1)
 
-    ! --- gradient of Q via jump across sub-faces ---
+    ! --- Gauss-based div(v), grad(p), grad(Q) using face-average values ---
+    ! All faces included (boundary faces handled via reconstruct_lr_w) so that
+    ! sum(area*norm) = 0 over the closed dual cell and gradQ = 0 for uniform flow.
+    div_v_h  = 0.0_DOUBLE
+    gradp_h  = 0.0_DOUBLE
     gradQ    = 0.0_DOUBLE
     sum_area = 0.0_DOUBLE
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      le   = mesh%sub_face(id_sub_face)%left_elem_neigh
-      re   = mesh%sub_face(id_sub_face)%right_elem_neigh
-      norm = mesh%sub_face(id_sub_face)%norm
+      le     = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re     = mesh%sub_face(id_sub_face)%right_elem_neigh
+      norm   = mesh%sub_face(id_sub_face)%norm
+      area_f = mesh%sub_face(id_sub_face)%area
+      if (boundary_2d .and. abs(norm(3)) > 1e-8_DOUBLE) cycle
 
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
         second_order, sol_w_l, sol_w_r)
 
-      sol_l = primit_to_conserv(sol_w_l)
-      sol_r = primit_to_conserv(sol_w_r)
-
-      if( .not. (boundary_2d .and. abs(norm(3)) > 1e-8_DOUBLE) ) then
-        gradQ    = gradQ &
-          + mesh%sub_face(id_sub_face)%area * tensor_product(sol_r - sol_l, norm)
-        sum_area = sum_area + mesh%sub_face(id_sub_face)%area
-      end if
+      div_v_h  = div_v_h + area_f * dot_product(sol_w_r(2:4)-sol_w_l(2:4), norm)
+      gradp_h  = gradp_h + area_f * (sol_w_r(5) - sol_w_l(5)) * norm
+      gradQ    = gradQ   + area_f * tensor_product(primit_to_conserv(sol_w_r)- primit_to_conserv(sol_w_l), norm)
+      sum_area = sum_area + area_f
     end do
-    gradQ = gradQ / (sum_area + 1e-12_DOUBLE)
 
-    ! --- build nodal flux tensor Fp(5,3) ---
-    ! advection: vp_node(d)*Qp - 1/(nDim+1)*(|vp_avg(d)| + corrp)*gradQ(:,d)
-    ! Lagrangian: pp_node on momentum diagonal and energy column
-    !Fp = tensor_product(Qp, vp_node) &
-    !    - 0.5_DOUBLE * matmul(diag(abs(vp_node)) + corrp*eye3, gradQ)
-    Fp = tensor_product(Qp, vp_node) &
-        - 0.5_DOUBLE * (norm2(vp_node) + corrp)*gradQ
+    ! Green-Gauss: divide by dual cell volume; multiply by h_p to get dimensionless quantities
+    div_v_h = div_v_h / vol * hp_vert
+    gradp_h = gradp_h / vol * hp_vert
+    gradQ   = gradQ   / sum_area
+
+    ! --- acoustic nodal pressure and velocity (original Sidilkover formulas) ---
+    pp_node = pp_avg  - 0.5_DOUBLE * rho_p * cp_node * div_v_h
+
+
+    ! --- dimensionless shock sensor (original corrp, in [0,1]) ---
+    corrp = max(0.0_DOUBLE, min(1.0_DOUBLE, &
+      abs(div_v_h) / cp_node + norm2(gradp_h) / (rho_p * cp_node**2)))
+    !call compute_corr2(mesh, id_vert, sol, grad, corrp, second_order)
+
+    vp(:, id_vert) = vp_node
+
+    ! --- nodal flux tensor: coefficient 1/(nDim+1)=1/3, per direction d ---
+    do d = 1, 3
+      Fp(:, d) = vp_node(d) * Qp(:) &
+        - 0.5_DOUBLE * (abs(vp_node(d)) + corrp * cp_node) * gradQ(:, d)
+    end do
     Fp(2:4, :) = Fp(2:4, :) + pp_node * eye3
-    Fp(5, :) = Fp(5, :) + vp_node * pp_node
+    Fp(5, :)   = Fp(5, :)   + vp_node * pp_node
 
     ! --- flux loop ---
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
@@ -3509,18 +3527,19 @@ contains
       sol_r = primit_to_conserv(sol_w_r)
       sol_m = 0.5_DOUBLE * (sol_l + sol_r)
 
-      rhol = sol_w_l(1);  rhoR = sol_w_r(1)
+      rhol = sol_w_l(1);  rhor = sol_w_r(1)
       vnl  = dot_product(sol_w_l(2:4), norm)
       vnr  = dot_product(sol_w_r(2:4), norm)
-      pl   = sol_w_l(5);  pr  = sol_w_r(5)
+      pl   = sol_w_l(5);  pr   = sol_w_r(5)
       cL   = sound_speed_w(sol_w_l)
       cR   = sound_speed_w(sol_w_r)
 
-      rhom   = 0.5_DOUBLE * (rhol + rhoR)
-      am     = max(cL, cR)
-      up     = 0.5_DOUBLE * (vnl + vnr) - 0.5_DOUBLE / (rhom * am) * (pr - pl)
-      pp_face= 0.5_DOUBLE * (pl  + pr ) - 0.5_DOUBLE * rhom * am * (vnr - vnl)
-      smax   = abs(up) + corrp * am
+      rhom    = 0.5_DOUBLE * (rhol + rhor)
+      am      = max(cL, cR)
+      up      = 0.5_DOUBLE * (vnl + vnr) - 0.5_DOUBLE / (rhom * am) * (pr - pl)
+      pp_face = 0.5_DOUBLE * (pl  + pr ) - 0.5_DOUBLE * rhom * am * (vnr - vnl)
+      ! corrp is dimensionless, am is [m/s]: consistent with original smax = |up| + cmax*am
+      smax    = abs(up) + corrp * am
 
       ! 1D Sidilkover flux
       ff_1d      = up * sol_m - 0.5_DOUBLE * smax * (sol_r - sol_l)
