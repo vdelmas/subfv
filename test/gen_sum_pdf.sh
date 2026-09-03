@@ -34,13 +34,13 @@ FIG
 if [ $# -eq 0 ]; then
     _all=$(find "$TEST_DIR" -mindepth 1 -maxdepth 1 -type d | xargs -n1 basename | sort)
     mapfile -t TESTS < <(
-        echo "$_all" | grep '^toro'        ;
-        echo "$_all" | grep '^test_shear'  ;
-        echo "$_all" | grep '^gresho'      ;
-        echo "$_all" | grep '^sedov'       ;
-        echo "$_all" | grep '_euler$'      ;
-        echo "$_all" | grep '_ns$'         ;
-        echo "$_all" | grep -vE '^toro|^test_shear|^gresho|^sedov|_euler$|_ns$'
+        echo "$_all" | grep '^toro'        || true;
+        echo "$_all" | grep '^test_shear'  || true;
+        echo "$_all" | grep '^gresho'      || true;
+        echo "$_all" | grep '^sedov'       || true;
+        echo "$_all" | grep '_euler$'      || true;
+        echo "$_all" | grep '_ns$'         || true;
+        echo "$_all" | grep -vE '^toro|^test_shear|^gresho|^sedov|_euler$|_ns$' || true
     )
 else
     TESTS=("$@")
@@ -167,29 +167,44 @@ for test in "${TESTS[@]}"; do
         continue
     fi
 
-    # --- gresho: velocity image + radial velocity profile side by side ---
+    # --- gresho: summary PDF (wide) or velocity image + profile side by side ---
     if [ "$cur_group" = "gresho" ]; then
+        summary_pdf=$([ -f "$outdir/summary.pdf" ] && echo "$outdir/summary.pdf" || true)
         velocity_img=$(find "$outdir/images" -maxdepth 1 -name "*velocity*.png" -size +0c 2>/dev/null | head -1 || true)
+        profile_pdf=$([ -f "$outdir/images/velocity_profile.pdf" ] && echo "$outdir/images/velocity_profile.pdf" || true)
         if [ -f "$outdir/velocity_profile.png" ]; then profile_file="$outdir/velocity_profile.png"
         else profile_file=""; fi
-        [ -n "$velocity_img" ] || [ -n "$profile_file" ] || continue
+        [ -n "$summary_pdf" ] || [ -n "$velocity_img" ] || [ -n "$profile_file" ] || [ -n "$profile_pdf" ] || continue
 
         [ -n "$prev_group" ] && [ "$cur_group" != "$prev_group" ] && printf '\\clearpage\n' >> "$TEX"
         found=1; prev_group="$cur_group"
 
         printf '\n\\section*{%s}\n' "$(ltx "$test")" >> "$TEX"
-        printf '\\begin{figure}[H]\\centering\n' >> "$TEX"
-        if [ -n "$velocity_img" ]; then
-            local="$test-$(basename "$velocity_img")"
-            cp "$velocity_img" "$WORK/$local"
-            minipage "0.48" "$local" "velocity field"
+        if [ -n "$summary_pdf" ]; then
+            local="$test-summary.pdf"
+            cp "$summary_pdf" "$WORK/$local"
+            printf '\\begin{figure}[H]\\centering\n' >> "$TEX"
+            minipage "0.90" "$local" ""
+            printf '\\end{figure}\n' >> "$TEX"
         fi
-        if [ -n "$profile_file" ]; then
-            local="$test-velocity_profile.${profile_file##*.}"
-            cp "$profile_file" "$WORK/$local"
-            minipage "0.48" "$local" "radial velocity profile"
+        if [ -n "$velocity_img" ] || [ -n "$profile_file" ] || [ -n "$profile_pdf" ]; then
+            printf '\\begin{figure}[H]\\centering\n' >> "$TEX"
+            if [ -n "$velocity_img" ]; then
+                local="$test-$(basename "$velocity_img")"
+                cp "$velocity_img" "$WORK/$local"
+                minipage "0.48" "$local" "velocity field"
+            fi
+            if [ -n "$profile_pdf" ]; then
+                local="$test-velocity_profile.pdf"
+                cp "$profile_pdf" "$WORK/$local"
+                minipage "0.48" "$local" "radial velocity profile"
+            elif [ -n "$profile_file" ]; then
+                local="$test-velocity_profile.${profile_file##*.}"
+                cp "$profile_file" "$WORK/$local"
+                minipage "0.48" "$local" "radial velocity profile"
+            fi
+            printf '\\end{figure}\n' >> "$TEX"
         fi
-        printf '\\end{figure}\n' >> "$TEX"
         continue
     fi
 
