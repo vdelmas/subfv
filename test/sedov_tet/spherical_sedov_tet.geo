@@ -1,4 +1,4 @@
-nl = 31;
+nl = 61;
 ls = 2.4/nl;
 dl = 2.4;
 MeshSize {1} = ls;

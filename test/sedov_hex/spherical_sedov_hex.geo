@@ -1,4 +1,4 @@
-nl = 31;
+nl = 101;
 dl = 2.4;
 Point(1) = {-1.2, -1.2, -1.2, 1.0};
 Extrude {0, dl, 0} { Point{1}; Layers {nl}; Recombine; }

@@ -29,7 +29,7 @@
   init_gresho=.false.,
 
   init_sedov=.true.,
-  r_sedov=0.02,
+  r_sedov=0.01,
 
   n_bc=0,
 
