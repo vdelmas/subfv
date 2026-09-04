@@ -263,6 +263,8 @@ contains
     open (newunit=funit, file=trim(adjustl(meshfile_path))//trim(adjustl(meshfile)), &
       status="old")
 
+
+    bc_tag = 0
     if (n_bc /= 0) then
       read (funit, '(a)') text
       do while ("$PhysicalNames" /= text(1:14))
@@ -1020,6 +1022,8 @@ contains
     open (newunit=funit, file=trim(adjustl(meshfile_path))//trim(adjustl(meshfile)), &
       status="old")
 
+
+    bc_tag = 0
     if (n_bc /= 0) then
       read (funit, '(a)') text
       do while ("$PhysicalNames" /= text(1:14))

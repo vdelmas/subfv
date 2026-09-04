@@ -11,7 +11,8 @@ module lagrange_module
 
   real(kind=DOUBLE), parameter :: gamma = 7.0_DOUBLE/5.0_DOUBLE
 contains
-  subroutine compute_rhs_lagrange(mesh, sol, vp, dt, rhs, n_bc, bc_type, bc_val, b2d, mass)
+  subroutine compute_rhs_lagrange(mesh, sol, vp, dt, rhs, n_bc, bc_type, bc_val, b2d, mass, &
+      gamma_arr, vp_is_imposed)
     use linear_solver_module, only: lu_solve, print_mat, inverse_3_by_3
     implicit none
 
@@ -21,6 +22,8 @@ contains
     real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(inout) :: vp
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(inout) :: rhs
     real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: mass
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
+    logical, dimension(mesh%n_vert), intent(in) :: vp_is_imposed
     integer(kind=ENTIER), intent(in) :: n_bc
     character(len=255), dimension(n_bc) :: bc_type
     real(kind=DOUBLE), dimension(5, n_bc) :: bc_val
@@ -34,10 +37,16 @@ contains
     real(kind=DOUBLE), dimension(3, 3) :: Mp, Mp_inv
     real(kind=DOUBLE), dimension(3) :: Rp, Bp
     real(kind=DOUBLE) :: vl, vr, pl, pr, v_bar, pl_et, pr_et, v_et, Pp
-    logical :: corner
+    real(kind=DOUBLE) :: gl, gr
+    logical :: corner, is_corner, have_first_wall_norm
+    real(kind=DOUBLE), dimension(3) :: first_wall_norm
+    real(kind=DOUBLE) :: cross_z
 
     rhs = 0.0_DOUBLE
-    vp = 0.0_DOUBLE
+    do i=1, mesh%n_vert
+      if (.not. vp_is_imposed(i)) vp(:, i) = 0.0_DOUBLE
+    end do
+
     do i=1, mesh%n_vert
       nsfn = mesh%vert(i)%n_sub_faces_neigh
       allocate(lambda(2, nsfn))
@@ -45,78 +54,106 @@ contains
       allocate(sol_lr(5, 2, nsfn))
       sol_lr = 0.0_DOUBLE
 
-      !bluid nodal system
       Bp = 0.0_DOUBLE
       Mp = 0.0_DOUBLE
       Rp = 0.0_DOUBLE
       lambda(:, :) = 0.0_DOUBLE
+      is_corner = .false.
+      have_first_wall_norm = .false.
+      first_wall_norm = 0.0_DOUBLE
       do j=1, nsfn
         id_sub_face = mesh%vert(i)%sub_face_neigh(j)
         id_face = mesh%sub_face(id_sub_face)%mesh_face
         idl = mesh%face(id_face)%left_neigh
         idr = mesh%face(id_face)%right_neigh
+        gl = gamma_arr(idl)
         sol_lr(:, 1, j) = sol(:, idl)
-        pl = pressure(sol_lr(:, 1, j))
+        pl = pressure(sol_lr(:, 1, j), gl)
         vl = dot_product(sol_lr(2:4, 1, j), mesh%face(id_face)%norm)
 
-
         if( idr > 0 ) then
+          gr = gamma_arr(idr)
           sol_lr(:, 2, j) = sol(:, idr)
-          pr = pressure(sol_lr(:, 2, j))
+          pr = pressure(sol_lr(:, 2, j), gr)
           vr = dot_product(sol_lr(2:4, 2, j), mesh%face(id_face)%norm)
 
-          lambda(1, j) = max(sqrt(gamma*pl*sol_lr(1, 1, j))/sol_lr(1, 1, j), &
+          lambda(1, j) = max(sqrt(gl*pl*sol_lr(1, 1, j))/sol_lr(1, 1, j), &
             sqrt(max(0.0_DOUBLE, pr-pl)/sol_lr(1, 1, j)), &
             -(vr-vl)/sol_lr(1, 1, j))
-          lambda(2, j) = max(sqrt(gamma*pr*sol_lr(1, 2, j))/sol_lr(1, 2, j), &
+          lambda(2, j) = max(sqrt(gr*pr*sol_lr(1, 2, j))/sol_lr(1, 2, j), &
             sqrt(max(0.0_DOUBLE, pl-pr)/sol_lr(1, 2, j)), &
             -(vr-vl)/sol_lr(1, 2, j))
 
-          v_bar = (lambda(1, j)*vl + lambda(2, j)*vr - (pr - pl))&
-            /(lambda(2, j) + lambda(1, j))
-          Mp = Mp + mesh%sub_face(id_sub_face)%area*(lambda(1,j)+lambda(2,j)) &
-            * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
-          Rp = Rp + mesh%sub_face(id_sub_face)%area*(lambda(1,j)+lambda(2,j)) &
-            *mesh%face(id_face)%norm*v_bar
+          if (.not. vp_is_imposed(i)) then
+            v_bar = (lambda(1, j)*vl + lambda(2, j)*vr - (pr - pl)) &
+              /(lambda(2, j) + lambda(1, j))
+            Mp = Mp + mesh%sub_face(id_sub_face)%area*(lambda(1,j)+lambda(2,j)) &
+              * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
+            Rp = Rp + mesh%sub_face(id_sub_face)%area*(lambda(1,j)+lambda(2,j)) &
+              *mesh%face(id_face)%norm*v_bar
+          end if
 
         else
           if( b2d .and. abs(mesh%face(id_face)%norm(3)) > 1e-8_DOUBLE ) then
-            lambda(1, j) = sqrt(gamma*pl*sol_lr(1, 1, j))/sol_lr(1, 1, j)
-            Mp = Mp + mesh%sub_face(id_sub_face)%area*2*lambda(1,j) &
-              * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
+            lambda(1, j) = sqrt(gl*pl*sol_lr(1, 1, j))/sol_lr(1, 1, j)
+            if (.not. vp_is_imposed(i)) then
+              Mp = Mp + mesh%sub_face(id_sub_face)%area*2*lambda(1,j) &
+                * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
+            end if
+          else if (idr < 0 .and. trim(bc_type(-idr)) == 'pressure') then
+            ! Imposed pressure BC: p* = bc_val(1, -idr); no normal-velocity constraint
+            lambda(1, j) = sqrt(gl*pl*sol_lr(1, 1, j))/sol_lr(1, 1, j)
+            if (.not. vp_is_imposed(i)) then
+              Mp = Mp + mesh%sub_face(id_sub_face)%area*lambda(1,j) &
+                * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
+              Rp = Rp + mesh%sub_face(id_sub_face)%area &
+                *(bc_val(1, -idr) + lambda(1,j)*vl) &
+                *mesh%face(id_face)%norm
+            end if
           else
-            lambda(1, j) = sqrt(gamma*pl*sol_lr(1, 1, j))/sol_lr(1, 1, j)
-            Bp = Bp + mesh%sub_face(id_sub_face)%area*mesh%face(id_face)%norm
-            Mp = Mp + mesh%sub_face(id_sub_face)%area*lambda(1,j) &
-              * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
-            Rp = Rp + mesh%sub_face(id_sub_face)%area*(pl + lambda(1,j)*vl)&
-              *mesh%face(id_face)%norm
+            lambda(1, j) = sqrt(gl*pl*sol_lr(1, 1, j))/sol_lr(1, 1, j)
+            if (.not. vp_is_imposed(i)) then
+              if (.not. have_first_wall_norm) then
+                first_wall_norm = mesh%face(id_face)%norm
+                have_first_wall_norm = .true.
+              else
+                cross_z = first_wall_norm(1)*mesh%face(id_face)%norm(2) &
+                        - first_wall_norm(2)*mesh%face(id_face)%norm(1)
+                if (abs(cross_z) > 1.0e-8_DOUBLE) is_corner = .true.
+              end if
+              Bp = Bp + mesh%sub_face(id_sub_face)%area*mesh%face(id_face)%norm
+              Mp = Mp + mesh%sub_face(id_sub_face)%area*lambda(1,j) &
+                * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
+              Rp = Rp + mesh%sub_face(id_sub_face)%area*(pl + lambda(1,j)*vl) &
+                *mesh%face(id_face)%norm
+            end if
           end if
         end if
       end do
 
-      if( maxval(abs(Bp)) > 1e-8_DOUBLE ) then
-        call inverse_3_by_3(Mp, Mp_inv)
-        Pp = dot_product(Rp, matmul(Mp_inv,Bp))/dot_product(Bp, matmul(Mp_inv, Bp))
-        vp(:, i) = matmul(Mp_inv, Rp-Pp*BP)
-      else
-        !call lu_solve(3, Mp, vp(:, i), Rp)
-        call inverse_3_by_3(Mp, Mp_inv)
-        vp(:, i) = matmul(Mp_inv, Rp)
+      if (.not. vp_is_imposed(i)) then
+        if (is_corner) then
+          vp(:, i) = 0.0_DOUBLE
+        else if( maxval(abs(Bp)) > 1e-8_DOUBLE ) then
+          call inverse_3_by_3(Mp, Mp_inv)
+          Pp = dot_product(Rp, matmul(Mp_inv,Bp))/dot_product(Bp, matmul(Mp_inv, Bp))
+          vp(:, i) = matmul(Mp_inv, Rp-Pp*BP)
+        else
+          call inverse_3_by_3(Mp, Mp_inv)
+          vp(:, i) = matmul(Mp_inv, Rp)
+        end if
       end if
-
-      !if( b2d ) vp(3, i) = 0.0_DOUBLE
-      !call lu_solve(3, Mp, vp(:, i), Rp)
 
       do j=1, nsfn
         id_sub_face = mesh%vert(i)%sub_face_neigh(j)
         id_face = mesh%sub_face(id_sub_face)%mesh_face
         idl = mesh%face(id_face)%left_neigh
         idr = mesh%face(id_face)%right_neigh
+        gl = gamma_arr(idl)
 
         v_et = dot_product(vp(:, i), mesh%face(id_face)%norm)
         vl = dot_product(sol_lr(2:4, 1, j), mesh%face(id_face)%norm)
-        pl = pressure(sol_lr(:, 1, j))
+        pl = pressure(sol_lr(:, 1, j), gl)
         pl_et = pl - lambda(1, j)*(v_et - vl)
 
         flux(1)   = -v_et
@@ -129,8 +166,9 @@ contains
         end do
 
         if( idr > 0 ) then
+          gr = gamma_arr(idr)
           vr = dot_product(sol_lr(2:4, 2, j), mesh%face(id_face)%norm)
-          pr = pressure(sol_lr(:, 2, j))
+          pr = pressure(sol_lr(:, 2, j), gr)
           pr_et = pr + lambda(2, j)*(v_et - vr)
           flux(1)   = -v_et
           flux(2:4) = pr_et*mesh%face(id_face)%norm
@@ -147,7 +185,7 @@ contains
   end subroutine compute_rhs_lagrange
 
   subroutine compute_rhs_lagrange_sidil(mesh, sol, vp, dt, rhs, &
-      n_bc, bc_type, bc_val, b2d, mass, method, b2d_h)
+      n_bc, bc_type, bc_val, b2d, mass, method, b2d_h, gamma_arr, vp_is_imposed)
     use linear_solver_module, only: lu_solve, print_mat, inverse_3_by_3
     implicit none
 
@@ -157,6 +195,8 @@ contains
     real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(inout) :: vp
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(inout) :: rhs
     real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: mass
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
+    logical, dimension(mesh%n_vert), intent(in) :: vp_is_imposed
     integer(kind=ENTIER), intent(in) :: n_bc, method
     character(len=255), dimension(n_bc) :: bc_type
     real(kind=DOUBLE), dimension(5, n_bc) :: bc_val
@@ -175,19 +215,24 @@ contains
     logical :: corner
 
     rhs = 0.0_DOUBLE
-    vp = 0.0_DOUBLE
+    do i=1, mesh%n_vert
+      if (.not. vp_is_imposed(i)) vp(:, i) = 0.0_DOUBLE
+    end do
+
     do i=1, mesh%n_vert
 
-      call compute_nodal_velocity_sidil(mesh, i, sol, vp(:, i), method, b2d, b2d_h)
-      call compute_nodal_pressure_sidil(mesh, i, sol, pp, method, b2d, b2d_h)
+      if (.not. vp_is_imposed(i)) then
+        call compute_nodal_velocity_sidil(mesh, i, sol, vp(:, i), method, b2d, b2d_h, gamma_arr)
+      end if
+      call compute_nodal_pressure_sidil(mesh, i, sol, pp, method, b2d, b2d_h, gamma_arr)
 
       a_p = 0.0_DOUBLE
       do j=1, mesh%vert(i)%n_sub_elems_neigh
         id_sub_elem = mesh%vert(i)%sub_elem_neigh(j)
         id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
-        sol_w = lag_to_primit(sol(:, id_elem))
+        sol_w = lag_to_primit(sol(:, id_elem), gamma_arr(id_elem))
         a_p = a_p + mesh%sub_elem(id_sub_elem)%volume &
-          * sqrt(gamma*sol_w(5)/sol_w(1))
+          * sqrt(gamma_arr(id_elem)*sol_w(5)/sol_w(1))
       end do
       a_p = a_p / mesh%vert(i)%volume
 
@@ -237,7 +282,7 @@ contains
     end do
   end function tensor_product
 
-  subroutine compute_dt(mesh, sol, dt, cfl, vp, me, num_procs)
+  subroutine compute_dt(mesh, sol, dt, cfl, vp, me, num_procs, gamma_arr)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -246,18 +291,23 @@ contains
     real(kind=DOUBLE), intent(in) :: cfl
     real(kind=DOUBLE), intent(inout) :: dt
     integer(kind=ENTIER) :: me, num_procs
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
 
     real(kind=DOUBLE), parameter :: CV = 0.8_DOUBLE
     integer(kind=ENTIER) :: i, j, k, mpi_ierr
     integer(kind=ENTIER) :: id_sub_face, id_face
     integer(kind=ENTIER) :: id_vert, id_sub_elem
-    real(kind=DOUBLE) :: dx, c
+    real(kind=DOUBLE) :: dx, c, avg_sub_vol
     real(kind=DOUBLE), dimension(5) :: w
     real(kind=DOUBLE), dimension(3) :: norm
 
     dt = 1e6
     do i=1, mesh%n_elems
-      c = sqrt(gamma*pressure(sol(:, i))*sol(1, i))
+      c = sqrt(max(0.0_DOUBLE, gamma_arr(i)*pressure(sol(:, i), gamma_arr(i))*sol(1, i)))
+      c = max(c, 1.0e-10_DOUBLE)
+      ! Use average sub-element volume: this prevents dt→0 when individual sub-elems
+      ! shrink due to cell distortion, while matching the reference scheme's dt scale.
+      avg_sub_vol = abs(mesh%elem(i)%volume) / real(mesh%elem(i)%n_sub_elems, DOUBLE)
       do j=1, mesh%elem(i)%n_sub_elems
         id_sub_elem = mesh%elem(i)%sub_elem(j)
         do k=1, mesh%sub_elem(id_sub_elem)%n_sub_faces
@@ -269,8 +319,8 @@ contains
           else
             norm = -mesh%face(id_face)%norm
           end if
-          dt = min(dt, mesh%sub_elem(i)%volume/(mesh%sub_face(id_sub_face)%area*c))
-          dt = min(dt, CV*mesh%sub_elem(id_sub_elem)%volume&
+          dt = min(dt, avg_sub_vol/(mesh%sub_face(id_sub_face)%area*c))
+          dt = min(dt, CV*avg_sub_vol &
             /(1e-8_DOUBLE + abs(dot_product(vp(:, id_vert), norm))&
             *mesh%face(id_face)%area))
         end do
@@ -282,7 +332,7 @@ contains
       dt, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
   end subroutine compute_dt
 
-  subroutine init_sol(mesh, sol, sol_uniform, init, me, num_procs)
+  subroutine init_sol(mesh, sol, sol_uniform, init, me, num_procs, gamma_arr)
     use mpi
     use mpi_module
     implicit none
@@ -292,9 +342,10 @@ contains
     real(kind=DOUBLE), dimension(5), intent(in) :: sol_uniform
     integer(kind=ENTIER), intent(in) :: init
     integer(kind=ENTIER), intent(in) :: me, num_procs
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(inout) :: gamma_arr
 
     integer(kind=ENTIER) :: i, mpi_ierr
-    real(kind=DOUBLE) :: tot_vol
+    real(kind=DOUBLE) :: tot_vol, r
     !real(kind=DOUBLE), parameter :: r_sedov = 2.4_DOUBLE/20.0_DOUBLE
     real(kind=DOUBLE), parameter :: r_sedov = 0.06_DOUBLE
     real(kind=DOUBLE), parameter :: r_sedov_3d = 0.12_DOUBLE
@@ -312,7 +363,7 @@ contains
         end if
         !sol(:, i) = sol_uniform
         sol(1, i) = 1.0_DOUBLE/sol(1, i)
-        sol(5, i) = sol(5, i)/((gamma - 1.0_DOUBLE)/sol(1, i)) &
+        sol(5, i) = sol(5, i)/((gamma_arr(i) - 1.0_DOUBLE)/sol(1, i)) &
           + 0.5_DOUBLE*norm2(sol(2:4, i))**2
       end do
     else if( init == 1) then
@@ -351,7 +402,7 @@ contains
           sol(2, i) = 0.0_DOUBLE
           sol(3, i) = 0.0_DOUBLE
           sol(4, i) = 0.0_DOUBLE
-          sol(5, i) = 1e-8_DOUBLE/(gamma - 1.0_DOUBLE)
+          sol(5, i) = 1e-8_DOUBLE/(gamma_arr(i) - 1.0_DOUBLE)
         end if
       end do
     else if( init == 13) then
@@ -388,13 +439,13 @@ contains
           sol(2, i) = 0.0_DOUBLE
           sol(3, i) = 0.0_DOUBLE
           sol(4, i) = 0.0_DOUBLE
-          sol(5, i) = 1e-8_DOUBLE/(gamma - 1.0_DOUBLE)
+          sol(5, i) = 1e-8_DOUBLE/(gamma_arr(i) - 1.0_DOUBLE)
         end if
       end do
     else if( init == 2) then
       do i=1, mesh%n_elems
         call sol_isentropic_vortex(mesh%elem(i)%coord, sol(:, i), 0.0_DOUBLE)
-        sol(5, i) = sol(5, i)/(sol(1, i)*(gamma-1.0_DOUBLE)) &
+        sol(5, i) = sol(5, i)/(sol(1, i)*(gamma_arr(i)-1.0_DOUBLE)) &
           + 0.5_DOUBLE*norm2(sol(2:4, i))**2
         sol(1, i) = 1.0_DOUBLE/sol(1, i)
       end do
@@ -405,7 +456,7 @@ contains
         sol(2:4, i) = 0.0_DOUBLE
         sol(2, i) = mesh%elem(i)%coord(1)
         !sol(5, i) = (10+mesh%elem(i)%coord(1))/(gamma-1.0_DOUBLE)
-        sol(5, i) = 10/(gamma-1.0_DOUBLE)
+        sol(5, i) = 10/(gamma_arr(i)-1.0_DOUBLE)
       end do
     else if( init == 4 ) then
       do i=1, mesh%n_elems
@@ -419,20 +470,89 @@ contains
           sol(5, i) = 0.1_DOUBLE
         end if
         sol(1, i) = 1.0_DOUBLE/sol(1, i)
-        sol(5, i) = sol(5, i)/((gamma - 1.0_DOUBLE)/sol(1, i)) &
+        sol(5, i) = sol(5, i)/((gamma_arr(i) - 1.0_DOUBLE)/sol(1, i)) &
           + 0.5_DOUBLE*norm2(sol(2:4, i))**2
+      end do
+    else if( init == 3 ) then
+      ! Noh 2D cylindrical: uniform density rho=1, radial inward unit velocity, p~0
+      do i=1, mesh%n_elems
+        sol(1, i) = 1.0_DOUBLE
+        r = sqrt(mesh%elem(i)%coord(1)**2 + mesh%elem(i)%coord(2)**2)
+        if (r < 1.0e-10_DOUBLE) then
+          sol(2, i) = 0.0_DOUBLE
+          sol(3, i) = 0.0_DOUBLE
+        else
+          sol(2, i) = -mesh%elem(i)%coord(1) / r
+          sol(3, i) = -mesh%elem(i)%coord(2) / r
+        end if
+        sol(4, i) = 0.0_DOUBLE
+        ! E = p/((gamma-1)*rho) + 0.5*|v|^2, with p=1e-6 and |v|=1 away from center
+        sol(5, i) = 1.0e-6_DOUBLE / (gamma_arr(i) - 1.0_DOUBLE) &
+          + 0.5_DOUBLE * (sol(2, i)**2 + sol(3, i)**2)
+      end do
+    else if( init == 5 ) then
+      ! Saltzman piston: uniform gas at rest (rho=1, p~0); piston BC at left wall sets v=(1,0,0)
+      do i=1, mesh%n_elems
+        sol(1, i) = 1.0_DOUBLE
+        sol(2:4, i) = 0.0_DOUBLE
+        sol(5, i) = 1.0e-6_DOUBLE / (gamma_arr(i) - 1.0_DOUBLE)
+      end do
+    else if( init == 6 ) then
+      ! Sod bi-materiaux: left (x<0.5) gamma=1.4, right (x>=0.5) gamma=1.5
+      do i=1, mesh%n_elems
+        if( mesh%elem(i)%coord(1) < 0.5_DOUBLE ) then
+          gamma_arr(i) = 1.4_DOUBLE
+          sol(1, i) = 1.0_DOUBLE
+          sol(2:4, i) = 0.0_DOUBLE
+          sol(5, i) = 1.0_DOUBLE
+        else
+          gamma_arr(i) = 1.5_DOUBLE
+          sol(1, i) = 0.125_DOUBLE
+          sol(2:4, i) = 0.0_DOUBLE
+          sol(5, i) = 0.1_DOUBLE
+        end if
+        sol(1, i) = 1.0_DOUBLE/sol(1, i)
+        sol(5, i) = sol(5, i)/((gamma_arr(i) - 1.0_DOUBLE)/sol(1, i)) &
+          + 0.5_DOUBLE*norm2(sol(2:4, i))**2
+      end do
+    else if( init == 7 ) then
+      ! Triple point 3D (LLNL version): three states, two materials
+      ! Left  (x<1):                     rho=1,   p=1,   gamma=1.5
+      ! Right, outside cyl (r_yz>1.5):  rho=0.1, p=0.1, gamma=1.5
+      ! Right, inside  cyl (r_yz<=1.5): rho=1,   p=0.1, gamma=1.4
+      ! where r_yz = sqrt(y^2 + z^2) is the radius from the x-axis
+      do i=1, mesh%n_elems
+        r = sqrt(mesh%elem(i)%coord(2)**2 + mesh%elem(i)%coord(3)**2)
+        if (mesh%elem(i)%coord(1) < 1.0_DOUBLE) then
+          gamma_arr(i) = 1.5_DOUBLE
+          sol(1, i)    = 1.0_DOUBLE
+          sol(5, i)    = 1.0_DOUBLE
+        else if (r > 1.5_DOUBLE) then
+          gamma_arr(i) = 1.5_DOUBLE
+          sol(1, i)    = 0.1_DOUBLE
+          sol(5, i)    = 0.1_DOUBLE
+        else
+          gamma_arr(i) = 1.4_DOUBLE
+          sol(1, i)    = 1.0_DOUBLE
+          sol(5, i)    = 0.1_DOUBLE
+        end if
+        sol(2:4, i) = 0.0_DOUBLE
+        sol(1, i) = 1.0_DOUBLE / sol(1, i)
+        sol(5, i) = sol(5, i) / ((gamma_arr(i) - 1.0_DOUBLE) / sol(1, i)) &
+          + 0.5_DOUBLE * norm2(sol(2:4, i))**2
       end do
     end if
 
   end subroutine init_sol
 
-  function pressure(u)
+  function pressure(u, g)
     implicit none
 
     real(kind=DOUBLE), dimension(5), intent(in) :: u
+    real(kind=DOUBLE), intent(in) :: g
     real(kind=DOUBLE) :: pressure
 
-    pressure = (gamma-1.0_DOUBLE)/u(1)*(u(5) - 0.5_DOUBLE*norm2(u(2:4))**2)
+    pressure = (g-1.0_DOUBLE)/u(1)*(u(5) - 0.5_DOUBLE*norm2(u(2:4))**2)
   end function pressure
 
   subroutine mpi_memory_exchange_vert(mesh, mpi_send_recv)
@@ -535,8 +655,8 @@ contains
     w(5) = w(1)**gamma
   end subroutine sol_isentropic_vortex
 
-  subroutine compute_nodal_velocity_sidil(mesh, id_vert, sol, vp, method, b2d, b2d_h)
-    use lagrange_global_data_module, only : gamma, boundary_2d
+  subroutine compute_nodal_velocity_sidil(mesh, id_vert, sol, vp, method, b2d, b2d_h, gamma_arr)
+    use lagrange_global_data_module, only : boundary_2d
     use linear_solver_module
     implicit none
 
@@ -546,6 +666,7 @@ contains
     real(kind=DOUBLE), dimension(3), intent(inout) :: vp
     real(kind=DOUBLE), intent(in) :: b2d_h
     logical, intent(in) :: b2d
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
 
     integer(kind=ENTIER) :: j, k, le, re
     integer(kind=ENTIER) :: id_sub_elem, id_elem
@@ -562,7 +683,7 @@ contains
     do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
       id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
       id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
-      sol_w = lag_to_primit(sol(:, id_elem))
+      sol_w = lag_to_primit(sol(:, id_elem), gamma_arr(id_elem))
       if( sol_w(5) < 0.0_DOUBLE ) then
         print*,"Error pos", id_elem, mesh%elem(id_elem)%coord
       end if
@@ -572,7 +693,7 @@ contains
         + mesh%sub_elem(id_sub_elem)%volume * sol_w(1)
       a_p = a_p &
         + mesh%sub_elem(id_sub_elem)%volume &
-        * sqrt(gamma*sol_w(5)/sol_w(1))
+        * sqrt(gamma_arr(id_elem)*sol_w(5)/sol_w(1))
     end do
     rho_p = rho_p / mesh%vert(id_vert)%volume
     a_p = a_p / mesh%vert(id_vert)%volume
@@ -593,8 +714,8 @@ contains
         sol_r(2:4) = sol_r(2:4) - 2.0_DOUBLE*dot_product(sol_r(2:4), &
           mesh%face(id_face)%norm)*mesh%face(id_face)%norm
       end if
-      sol_w_l = lag_to_primit(sol_l)
-      sol_w_r = lag_to_primit(sol_r)
+      sol_w_l = lag_to_primit(sol_l, gamma_arr(le))
+      sol_w_r = lag_to_primit(sol_r, gamma_arr(le))
       grad_p = grad_p + (sol_w_r(5) - sol_w_l(5)) &
         * mesh%sub_face(id_sub_face)%area&
         * mesh%face(id_face)%norm
@@ -611,8 +732,7 @@ contains
     vp = vp - 0.5_DOUBLE*h_p/(rho_p*a_p)*grad_p
   end subroutine compute_nodal_velocity_sidil
 
-  subroutine compute_nodal_pressure_sidil(mesh, id_vert, sol, pp, method, b2d, b2d_h)
-    use lagrange_global_data_module, only : gamma
+  subroutine compute_nodal_pressure_sidil(mesh, id_vert, sol, pp, method, b2d, b2d_h, gamma_arr)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -621,6 +741,7 @@ contains
     real(kind=DOUBLE), intent(inout) :: pp
     real(kind=DOUBLE), intent(in) :: b2d_h
     logical :: b2d
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
 
     integer(kind=ENTIER) :: j, id_elem, id_sub_elem, le, re
     integer(kind=ENTIER) :: id_face, id_sub_face
@@ -634,14 +755,14 @@ contains
     do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
       id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
       id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
-      sol_w = lag_to_primit(sol(:, id_elem))
+      sol_w = lag_to_primit(sol(:, id_elem), gamma_arr(id_elem))
       pp = pp &
         + mesh%sub_elem(id_sub_elem)%volume * sol_w(5)
       rho_p = rho_p &
         + mesh%sub_elem(id_sub_elem)%volume * sol_w(1)
       a_p = a_p &
         + mesh%sub_elem(id_sub_elem)%volume &
-        * sqrt(gamma*sol_w(5)/sol_w(1))
+        * sqrt(gamma_arr(id_elem)*sol_w(5)/sol_w(1))
     end do
     pp = pp / mesh%vert(id_vert)%volume
     rho_p = rho_p / mesh%vert(id_vert)%volume
@@ -661,8 +782,8 @@ contains
         sol_r(2:4) = sol_r(2:4) - 2.0_DOUBLE*dot_product(sol_r(2:4), &
           mesh%face(id_face)%norm)*mesh%face(id_face)%norm
       end if
-      sol_w_l = lag_to_primit(sol_l)
-      sol_w_r = lag_to_primit(sol_r)
+      sol_w_l = lag_to_primit(sol_l, gamma_arr(le))
+      sol_w_r = lag_to_primit(sol_r, gamma_arr(le))
       div_v = div_v &
         + dot_product(sol_w_r(2:4) - sol_w_l(2:4), &
         mesh%sub_face(id_sub_face)%area&
@@ -758,15 +879,16 @@ contains
     end do
   end function corner_normal
 
-  function lag_to_primit(u) result(w)
+  function lag_to_primit(u, g) result(w)
     implicit none
 
     real(kind=DOUBLE), dimension(5), intent(in) :: u
+    real(kind=DOUBLE), intent(in) :: g
     real(kind=DOUBLE), dimension(5) :: w
 
     w(1) = 1.0_DOUBLE/u(1)
     w(2:4) = u(2:4)
-    w(5) = pressure(u)
+    w(5) = pressure(u, g)
   end function lag_to_primit
 
   subroutine move_mesh(mesh, vp, dt)

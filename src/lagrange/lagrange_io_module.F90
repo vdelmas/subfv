@@ -9,21 +9,22 @@ module lagrange_io_module
   use lagrange_module
   implicit none
 contains
-  subroutine write_sol_lag(mesh, filename, sol, vp, pp)
+  subroutine write_sol_lag(mesh, filename, sol, vp, pp, gamma_arr)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
     real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(in) :: vp
     real(kind=DOUBLE), dimension(mesh%n_vert), intent(in) :: pp
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
     character(len=*), intent(in) :: filename
 
     call write_sol_meta_pvtu_lag(filename)
-    call write_sol_vtu_lag(mesh, filename, sol, vp, pp)
+    call write_sol_vtu_lag(mesh, filename, sol, vp, pp, gamma_arr)
 
   end subroutine write_sol_lag
 
-  subroutine write_sol_vtu_lag(mesh, basename, sol, vp, pp)
+  subroutine write_sol_vtu_lag(mesh, basename, sol, vp, pp, gamma_arr)
     use mpi
     implicit none
 
@@ -31,6 +32,7 @@ contains
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
     real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(in) :: vp
     real(kind=DOUBLE), dimension(mesh%n_vert), intent(in) :: pp
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
     character(len=*), intent(in) :: basename
 
     integer(kind=ENTIER) :: me, num_procs, mpi_ierr
@@ -266,7 +268,7 @@ contains
     write(fn, *) "<DataArray type='Float64' Name='Pressure' format='ascii' NumberOfComponents='1'>"
     do i=1, mesh%n_elems
       if( .not. mesh%elem(i)%is_ghost ) then
-        write(fn, *) pressure(sol(:, i))
+        write(fn, *) pressure(sol(:, i), gamma_arr(i))
       end if
     end do
     write(fn, *) "</DataArray>"
@@ -274,7 +276,15 @@ contains
     write(fn, *) "<DataArray type='Float64' Name='Internal_energy' format='ascii' NumberOfComponents='1'>"
     do i=1, mesh%n_elems
       if( .not. mesh%elem(i)%is_ghost ) then
-        write(fn, *) pressure(sol(:, i))*sol(1, i)/(gamma-1.0_DOUBLE)
+        write(fn, *) pressure(sol(:, i), gamma_arr(i))*sol(1, i)/(gamma_arr(i)-1.0_DOUBLE)
+      end if
+    end do
+    write(fn, *) "</DataArray>"
+
+    write(fn, *) "<DataArray type='Float64' Name='gamma' format='ascii' NumberOfComponents='1'>"
+    do i=1, mesh%n_elems
+      if( .not. mesh%elem(i)%is_ghost ) then
+        write(fn, *) gamma_arr(i)
       end if
     end do
     write(fn, *) "</DataArray>"
@@ -330,6 +340,7 @@ contains
       write(fn, *) "<PDataArray type='Float64' Name='Velocity' NumberOfComponents='3'/>"
       write(fn, *) "<PDataArray type='Float64' Name='Pressure' NumberOfComponents='1'/>"
       write(fn, *) "<PDataArray type='Float64' Name='Internal_energy' NumberOfComponents='1'/>"
+      write(fn, *) "<PDataArray type='Float64' Name='gamma' NumberOfComponents='1'/>"
       write(fn, *) "</PCellData>"
 
       do i=0, num_procs-1
@@ -345,4 +356,37 @@ contains
 
     call mpi_barrier(mpi_comm_world, mpi_ierr)
   end subroutine write_sol_meta_pvtu_lag
+
+  subroutine write_sol_dat_lag(mesh, basename, sol, gamma_arr)
+    use mpi
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
+    character(len=*), intent(in) :: basename
+
+    integer(kind=ENTIER) :: me, num_procs, mpi_ierr, fn, i
+    character(len=255) :: filename, me_char
+    real(kind=DOUBLE) :: rho, p, e
+
+    call MPI_COMM_SIZE(MPI_COMM_WORLD, num_procs, mpi_ierr)
+    call MPI_COMM_RANK(MPI_COMM_WORLD, me, mpi_ierr)
+
+    write(me_char, *) me
+    write(filename, *) trim(adjustl(me_char))//"_"//trim(adjustl(basename))//".dat"
+    open(newunit=fn, file=trim(adjustl(filename)))
+    write(fn, *) "# x y z rho vx vy vz p e"
+    do i = 1, mesh%n_elems
+      if (.not. mesh%elem(i)%is_ghost) then
+        rho = 1.0_DOUBLE / sol(1, i)
+        p   = pressure(sol(:, i), gamma_arr(i))
+        e   = p * sol(1, i) / (gamma_arr(i) - 1.0_DOUBLE)
+        write(fn, *) mesh%elem(i)%coord(1), mesh%elem(i)%coord(2), mesh%elem(i)%coord(3), &
+                     rho, sol(2, i), sol(3, i), sol(4, i), p, e
+      end if
+    end do
+    close(fn)
+  end subroutine write_sol_dat_lag
+
 end module lagrange_io_module

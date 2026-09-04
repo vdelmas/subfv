@@ -13,14 +13,19 @@ module mesh_geometry_module
   public :: project_sol_box
   public :: mpi_project_sol_box
 contains
-  subroutine compute_geometry_mesh(mesh, use_sub_entities, b2d, me, num_procs)
+  subroutine compute_geometry_mesh(mesh, use_sub_entities, b2d, me, num_procs, do_check)
     implicit none
 
     type(mesh_type), intent(inout) :: mesh
     logical, intent(in) :: use_sub_entities, b2d
     integer(kind=ENTIER), optional, intent(in) :: me, num_procs
+    logical, optional, intent(in) :: do_check
 
     integer(kind=ENTIER) :: i, id_sub_elem
+    logical :: do_check_
+
+    do_check_ = .true.
+    if (present(do_check)) do_check_ = do_check
 
     do i=1, mesh%n_faces
       mesh%face(i)%coord = compute_face_centroid(mesh, i)
@@ -50,7 +55,7 @@ contains
       mesh%elem(i)%volume = compute_elem_volume(mesh, i)
     end do
 
-    call check_mesh(mesh, me, num_procs)
+    if (do_check_) call check_mesh(mesh, me, num_procs)
 
     call find_if_vert_is_bound(mesh, b2d)
     call compute_vert_volume(mesh)
@@ -406,7 +411,6 @@ contains
         WITH ANY KIND OF HOPE THAT THE CODE WILL WORK !"
       error stop
     else
-      if (me_ == 0) print*, "MESH GEOMETRY IS OK"
     end if
   end subroutine check_mesh
 
