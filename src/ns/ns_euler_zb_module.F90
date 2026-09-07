@@ -3474,7 +3474,7 @@ contains
       re     = mesh%sub_face(id_sub_face)%right_elem_neigh
       norm   = mesh%sub_face(id_sub_face)%norm
       area_f = mesh%sub_face(id_sub_face)%area
-      if (boundary_2d .and. abs(norm(3)) > 1e-8_DOUBLE) cycle
+      if (boundary_2d .and. abs(norm(3)) > 1e-3_DOUBLE) cycle
 
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
         second_order, sol_w_l, sol_w_r)
@@ -3500,6 +3500,14 @@ contains
     !call compute_corr2(mesh, id_vert, sol, grad, corrp, second_order)
 
     vp(:, id_vert) = vp_node
+    if( mesh%vert(id_vert)%is_bound ) then
+      vface = wall_normal(mesh, id_vert)
+      if( norm2(vface) > 1e-12_DOUBLE ) then
+        vface   = vface / norm2(vface)
+        vp_node = vp_node - dot_product(vp_node, vface)*vface
+        vp(:, id_vert) = vp_node
+      end if
+    end if
 
     ! --- nodal flux tensor: coefficient 1/(nDim+1)=1/3, per direction d ---
     do d = 1, 3
