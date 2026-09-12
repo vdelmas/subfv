@@ -61,20 +61,30 @@ target_link_libraries(lagrange PUBLIC core)
 set_target_properties(lagrange PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mod/lagrange)
 target_include_directories(lagrange PUBLIC ${CMAKE_BINARY_DIR}/mod/lagrange)
 
+# ── RBF library ────────────────────────────────────────────────────────────────
+add_library(rbf STATIC
+  src/rbf/rbf_module.F90
+)
+target_link_libraries(rbf PUBLIC core)
+set_target_properties(rbf PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mod/rbf)
+target_include_directories(rbf PUBLIC ${CMAKE_BINARY_DIR}/mod/rbf)
+
 # ── Exécutables ───────────────────────────────────────────────────────────────
 add_executable(subfvns           src/ns/ns_main.F90)
 add_executable(subfvshear        src/shear/shear_main.F90)
 add_executable(subfvacoustic     src/acoustic/acoustic_main.F90)
 add_executable(subfvlagrange     src/lagrange/lagrange_main.F90)
 add_executable(subfvgreshoconv   src/ns/ns_gresho_convergence_main.F90)
+add_executable(subfvrbf          src/rbf/rbf_main.F90)
 
 target_link_libraries(subfvns          ns)
 target_link_libraries(subfvshear       ns)
 target_link_libraries(subfvacoustic    acoustic)
 target_link_libraries(subfvlagrange    lagrange)
 target_link_libraries(subfvgreshoconv  ns)
+target_link_libraries(subfvrbf         rbf)
 
-install(TARGETS subfvns subfvshear subfvacoustic subfvlagrange subfvgreshoconv
+install(TARGETS subfvns subfvshear subfvacoustic subfvlagrange subfvgreshoconv subfvrbf
   RUNTIME DESTINATION bin
 )
 
