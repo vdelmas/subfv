@@ -21,6 +21,7 @@ program main
   integer(kind=ENTIER) :: n_bc, iter, i, j, method_length = 0
   integer(kind=ENTIER) :: id_sub_face, id_face, piston_bc_idx
   real(kind=DOUBLE) :: cfl, cfl_max = 0.8, b2d_h = 1.0
+  real(kind=DOUBLE) :: h_extrude = 1.0
   integer(kind=ENTIER) :: init = 0
   character(len=255) :: scheme = ""
   character(len=255), dimension(n_max_bc) :: bc_name
@@ -39,9 +40,17 @@ program main
   real(kind=DOUBLE), dimension(:,:), allocatable :: rhs
   real(kind=DOUBLE), dimension(:,:), allocatable :: new_sol
   logical, dimension(:), allocatable :: vp_is_imposed
+  ! Second-order reconstruction: per-cell grad_v (3x3), grad_p (3), div_v (1)
+  logical :: second_order = .false.
+  real(kind=DOUBLE), dimension(:,:,:), allocatable :: grad_v
+  real(kind=DOUBLE), dimension(:,:), allocatable :: grad_p
+  real(kind=DOUBLE), dimension(:), allocatable :: div_v
+  real(kind=DOUBLE), dimension(:), allocatable :: alpha_p_arr
+  integer(kind=ENTIER), dimension(:), allocatable :: p_limited
 
   integer(kind=ENTIER) :: n_sol_vtu=2
   integer(kind=ENTIER) :: i_sol_vtu
+  integer(kind=ENTIER) :: iso_weight_mode = 2   ! w_pcf recipe for classic_iso_vol
 
   namelist /INPUT_PARAM/ &
     meshfile_path, meshfile, &
@@ -50,7 +59,7 @@ program main
     scheme, method_length, b2d_h, &
     n_bc, bc_name, bc_type, bc_val, &
     sol_uniform, boundary_2d, &
-    n_sol_vtu
+    n_sol_vtu, second_order, iso_weight_mode
 
   call MPI_INIT(mpi_ierr)
   call MPI_COMM_SIZE(MPI_COMM_WORLD, num_procs, mpi_ierr)
@@ -81,6 +90,17 @@ program main
 
   call compute_geometry_mesh(mesh, .true., boundary_2d)
 
+  ! Extrusion height of a boundary_2d mesh (single z-layer): used by the
+  ! classic_iso_vol weight to turn a prism sub-element volume back into an
+  ! in-plane area scale.  The nodal solver keeps vp_z = 0 in b2d, so this is
+  ! constant in time.
+  h_extrude = 1.0_DOUBLE
+  if (boundary_2d .and. mesh%n_vert > 0) then
+    h_extrude = maxval(mesh%vert(1:mesh%n_vert)%coord(3)) &
+              - minval(mesh%vert(1:mesh%n_vert)%coord(3))
+    if (h_extrude <= 0.0_DOUBLE) h_extrude = 1.0_DOUBLE
+  end if
+
   allocate(vp(3, mesh%n_vert))
   allocate(pp(mesh%n_vert))
   allocate(sol(5, mesh%n_elems))
@@ -95,7 +115,7 @@ program main
     gamma_arr = 1.4_DOUBLE
   end if
   vp = 0.0_DOUBLE
-  call init_sol(mesh, sol, sol_uniform, init, me, num_procs, gamma_arr)
+  call init_sol(mesh, sol, sol_uniform, init, me, num_procs, gamma_arr, boundary_2d)
   call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)
 
   ! Identify piston nodes from bc_type='piston'
@@ -122,10 +142,21 @@ program main
     end do
   end if
 
+  allocate(grad_v(3, 3, mesh%n_elems))
+  allocate(grad_p(3, mesh%n_elems))
+  allocate(div_v(mesh%n_elems))
+  allocate(alpha_p_arr(mesh%n_vert))
+  allocate(p_limited(mesh%n_elems))
+  grad_v = 0.0_DOUBLE
+  grad_p = 0.0_DOUBLE
+  div_v  = 0.0_DOUBLE
+  alpha_p_arr = 1.0_DOUBLE
+  p_limited   = 0
+
   i_sol_vtu = 0
   write(fln, *) i_sol_vtu
   write(fln, *) "output_"//trim(adjustl(fln))
-  call write_sol_lag(mesh, fln, sol, vp, pp, gamma_arr)
+  call write_sol_lag(mesh, fln, sol, vp, pp, gamma_arr, grad_v, grad_p, div_v, alpha_p_arr, p_limited)
   call write_sol_dat_lag(mesh, fln, sol, gamma_arr)
   i_sol_vtu = i_sol_vtu + 1
 
@@ -146,9 +177,27 @@ program main
       end do
     end if
 
+    if (second_order) then
+      call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)
+      call compute_gradients(mesh, sol, gamma_arr, dt, grad_v, grad_p, div_v, p_limited)
+      ! Exchange ghost cell gradients so second-order RHS can reconstruct across MPI boundaries
+      call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 3, grad_p)
+      call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 9, grad_v)
+      call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 1, div_v)
+    end if
+
     if( scheme == "classic" ) then
       call compute_rhs_lagrange(mesh, sol, vp, &
-        dt, rhs, n_bc, bc_type, bc_val, boundary_2d, mass, gamma_arr, vp_is_imposed)
+        dt, rhs, n_bc, bc_type, bc_val, boundary_2d, mass, gamma_arr, vp_is_imposed, &
+        second_order, grad_v, grad_p, div_v, alpha_p_arr)
+    else if( scheme == "classic_iso" ) then
+      call compute_rhs_lagrange_classic_iso(mesh, sol, vp, &
+        dt, rhs, n_bc, bc_type, bc_val, boundary_2d, mass, gamma_arr, vp_is_imposed, &
+        1, h_extrude)
+    else if( scheme == "classic_iso_vol" ) then
+      call compute_rhs_lagrange_classic_iso(mesh, sol, vp, &
+        dt, rhs, n_bc, bc_type, bc_val, boundary_2d, mass, gamma_arr, vp_is_imposed, &
+        iso_weight_mode, h_extrude)
     else  if( scheme == "sidil" ) then
       call compute_rhs_lagrange_sidil(mesh, sol, vp, &
         dt, rhs, n_bc, bc_type, bc_val, boundary_2d, mass, method_length, b2d_h, &
@@ -180,7 +229,7 @@ program main
     if( t >= i_sol_vtu * t_max / real(n_sol_vtu - 1) ) then
       write(fln, *) i_sol_vtu
       write(fln, *) "output_"//trim(adjustl(fln))
-      call write_sol_lag(mesh, fln, new_sol, vp, pp, gamma_arr)
+      call write_sol_lag(mesh, fln, new_sol, vp, pp, gamma_arr, grad_v, grad_p, div_v, alpha_p_arr, p_limited)
       call write_sol_dat_lag(mesh, fln, new_sol, gamma_arr)
       i_sol_vtu = i_sol_vtu + 1
     end if
@@ -191,7 +240,7 @@ program main
   i_sol_vtu = -1
   write(fln, *) i_sol_vtu
   write(fln, *) "output_"//trim(adjustl(fln))
-  call write_sol_lag(mesh, fln, new_sol, vp, pp, gamma_arr)
+  call write_sol_lag(mesh, fln, new_sol, vp, pp, gamma_arr, grad_v, grad_p, div_v, alpha_p_arr, p_limited)
   call write_sol_dat_lag(mesh, fln, new_sol, gamma_arr)
   call MPI_FINALIZE(mpi_ierr)
 end program main

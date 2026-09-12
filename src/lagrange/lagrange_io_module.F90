@@ -9,7 +9,7 @@ module lagrange_io_module
   use lagrange_module
   implicit none
 contains
-  subroutine write_sol_lag(mesh, filename, sol, vp, pp, gamma_arr)
+  subroutine write_sol_lag(mesh, filename, sol, vp, pp, gamma_arr, grad_v, grad_p, div_v, alpha_p_arr, p_limited)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -17,14 +17,19 @@ contains
     real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(in) :: vp
     real(kind=DOUBLE), dimension(mesh%n_vert), intent(in) :: pp
     real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
+    real(kind=DOUBLE), dimension(3, 3, mesh%n_elems), intent(in) :: grad_v
+    real(kind=DOUBLE), dimension(3, mesh%n_elems), intent(in) :: grad_p
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: div_v
+    real(kind=DOUBLE), dimension(mesh%n_vert), intent(in), optional :: alpha_p_arr
+    integer(kind=ENTIER), dimension(mesh%n_elems), intent(in), optional :: p_limited
     character(len=*), intent(in) :: filename
 
     call write_sol_meta_pvtu_lag(filename)
-    call write_sol_vtu_lag(mesh, filename, sol, vp, pp, gamma_arr)
+    call write_sol_vtu_lag(mesh, filename, sol, vp, pp, gamma_arr, grad_v, grad_p, div_v, alpha_p_arr, p_limited)
 
   end subroutine write_sol_lag
 
-  subroutine write_sol_vtu_lag(mesh, basename, sol, vp, pp, gamma_arr)
+  subroutine write_sol_vtu_lag(mesh, basename, sol, vp, pp, gamma_arr, grad_v, grad_p, div_v, alpha_p_arr, p_limited)
     use mpi
     implicit none
 
@@ -33,6 +38,11 @@ contains
     real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(in) :: vp
     real(kind=DOUBLE), dimension(mesh%n_vert), intent(in) :: pp
     real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
+    real(kind=DOUBLE), dimension(3, 3, mesh%n_elems), intent(in) :: grad_v
+    real(kind=DOUBLE), dimension(3, mesh%n_elems), intent(in) :: grad_p
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: div_v
+    real(kind=DOUBLE), dimension(mesh%n_vert), intent(in), optional :: alpha_p_arr
+    integer(kind=ENTIER), dimension(mesh%n_elems), intent(in), optional :: p_limited
     character(len=*), intent(in) :: basename
 
     integer(kind=ENTIER) :: me, num_procs, mpi_ierr
@@ -204,6 +214,16 @@ contains
     end do
     write(fn, *) "</DataArray>"
 
+    if (present(alpha_p_arr)) then
+      write(fn, *) "<DataArray type='Float64' Name='alpha_p' format='ascii' NumberOfComponents='1'>"
+      do i=1, mesh%n_vert
+        if( .not. mesh%vert(i)%is_ghost ) then
+          write (fn, *) alpha_p_arr(i)
+        end if
+      end do
+      write(fn, *) "</DataArray>"
+    end if
+
     write(fn, *) "</PointData>"
 
     !Cell data
@@ -289,6 +309,56 @@ contains
     end do
     write(fn, *) "</DataArray>"
 
+    write(fn, *) "<DataArray type='Float64' Name='grad_p' format='ascii' NumberOfComponents='3'>"
+    do i=1, mesh%n_elems
+      if( .not. mesh%elem(i)%is_ghost ) then
+        write(fn, *) grad_p(:, i)
+      end if
+    end do
+    write(fn, *) "</DataArray>"
+
+    write(fn, *) "<DataArray type='Float64' Name='grad_vx' format='ascii' NumberOfComponents='3'>"
+    do i=1, mesh%n_elems
+      if( .not. mesh%elem(i)%is_ghost ) then
+        write(fn, *) grad_v(1, :, i)
+      end if
+    end do
+    write(fn, *) "</DataArray>"
+
+    write(fn, *) "<DataArray type='Float64' Name='grad_vy' format='ascii' NumberOfComponents='3'>"
+    do i=1, mesh%n_elems
+      if( .not. mesh%elem(i)%is_ghost ) then
+        write(fn, *) grad_v(2, :, i)
+      end if
+    end do
+    write(fn, *) "</DataArray>"
+
+    write(fn, *) "<DataArray type='Float64' Name='grad_vz' format='ascii' NumberOfComponents='3'>"
+    do i=1, mesh%n_elems
+      if( .not. mesh%elem(i)%is_ghost ) then
+        write(fn, *) grad_v(3, :, i)
+      end if
+    end do
+    write(fn, *) "</DataArray>"
+
+    write(fn, *) "<DataArray type='Float64' Name='div_v' format='ascii' NumberOfComponents='1'>"
+    do i=1, mesh%n_elems
+      if( .not. mesh%elem(i)%is_ghost ) then
+        write(fn, *) div_v(i)
+      end if
+    end do
+    write(fn, *) "</DataArray>"
+
+    if (present(p_limited)) then
+      write(fn, *) "<DataArray type='Int32' Name='p_limited' format='ascii' NumberOfComponents='1'>"
+      do i=1, mesh%n_elems
+        if( .not. mesh%elem(i)%is_ghost ) then
+          write(fn, *) p_limited(i)
+        end if
+      end do
+      write(fn, *) "</DataArray>"
+    end if
+
     write(fn, *) "</CellData>"
 
     write(fn, *) "</Piece>"
@@ -329,6 +399,7 @@ contains
       write(fn, *) "<PPointData>"
       write(fn, *) "<DataArray type='Float64' Name='Vp' format='ascii' NumberOfComponents='3'/>"
       write(fn, *) "<DataArray type='Float64' Name='Pp' format='ascii' NumberOfComponents='1'/>"
+      write(fn, *) "<DataArray type='Float64' Name='alpha_p' format='ascii' NumberOfComponents='1'/>"
       write(fn, *) "</PPointData>"
       write(fn, *) "<PCellData>"
       write(fn, *) "<PDataArray type='Float64' Name='Centroid' NumberOfComponents='3'/>"
@@ -341,6 +412,12 @@ contains
       write(fn, *) "<PDataArray type='Float64' Name='Pressure' NumberOfComponents='1'/>"
       write(fn, *) "<PDataArray type='Float64' Name='Internal_energy' NumberOfComponents='1'/>"
       write(fn, *) "<PDataArray type='Float64' Name='gamma' NumberOfComponents='1'/>"
+      write(fn, *) "<PDataArray type='Float64' Name='grad_p' NumberOfComponents='3'/>"
+      write(fn, *) "<PDataArray type='Float64' Name='grad_vx' NumberOfComponents='3'/>"
+      write(fn, *) "<PDataArray type='Float64' Name='grad_vy' NumberOfComponents='3'/>"
+      write(fn, *) "<PDataArray type='Float64' Name='grad_vz' NumberOfComponents='3'/>"
+      write(fn, *) "<PDataArray type='Float64' Name='div_v' NumberOfComponents='1'/>"
+      write(fn, *) "<PDataArray type='Int32' Name='p_limited' NumberOfComponents='1'/>"
       write(fn, *) "</PCellData>"
 
       do i=0, num_procs-1
