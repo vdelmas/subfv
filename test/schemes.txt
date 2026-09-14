@@ -15,3 +15,4 @@ ZB_AMISO_LPF
 ZB_AR1D_LPF
 WIP
 USI3D
+multi_point_vilar
