@@ -70,6 +70,27 @@ target_link_libraries(rbf PUBLIC core)
 set_target_properties(rbf PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mod/rbf)
 target_include_directories(rbf PUBLIC ${CMAKE_BINARY_DIR}/mod/rbf)
 
+# ── High-order Euler library ──────────────────────────────────────────────────
+add_library(euler_ho STATIC
+  src/euler_ho/euler_ho_module.F90
+)
+target_link_libraries(euler_ho PUBLIC core)
+set_target_properties(euler_ho PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mod/euler_ho)
+target_include_directories(euler_ho PUBLIC ${CMAKE_BINARY_DIR}/mod/euler_ho)
+
+# ── Arbitrary high-order derivative library ───────────────────────────────────
+add_library(arbitrary_high_order STATIC
+  src/arbitrary_high_order/arbitrary_high_order_module.F90
+)
+target_link_libraries(arbitrary_high_order PUBLIC core)
+set_target_properties(arbitrary_high_order PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mod/arbitrary_high_order)
+target_include_directories(arbitrary_high_order PUBLIC ${CMAKE_BINARY_DIR}/mod/arbitrary_high_order)
+
+# euler_ho can optionally source its order>=2 reconstruction from
+# arbitrary_high_order_module (use_aho_reconstruction), for a like-for-like
+# comparison against its own ls_reconstruction.
+target_link_libraries(euler_ho PUBLIC arbitrary_high_order)
+
 # ── Exécutables ───────────────────────────────────────────────────────────────
 add_executable(subfvns           src/ns/ns_main.F90)
 add_executable(subfvshear        src/shear/shear_main.F90)
@@ -77,6 +98,8 @@ add_executable(subfvacoustic     src/acoustic/acoustic_main.F90)
 add_executable(subfvlagrange     src/lagrange/lagrange_main.F90)
 add_executable(subfvgreshoconv   src/ns/ns_gresho_convergence_main.F90)
 add_executable(subfvrbf          src/rbf/rbf_main.F90)
+add_executable(subfveulerho      src/euler_ho/euler_ho_main.F90)
+add_executable(subfvahotest      src/arbitrary_high_order/arbitrary_high_order_main.F90)
 
 target_link_libraries(subfvns          ns)
 target_link_libraries(subfvshear       ns)
@@ -84,6 +107,8 @@ target_link_libraries(subfvacoustic    acoustic)
 target_link_libraries(subfvlagrange    lagrange)
 target_link_libraries(subfvgreshoconv  ns)
 target_link_libraries(subfvrbf         rbf)
+target_link_libraries(subfveulerho     euler_ho)
+target_link_libraries(subfvahotest     arbitrary_high_order)
 
 install(TARGETS subfvns subfvshear subfvacoustic subfvlagrange subfvgreshoconv subfvrbf
   RUNTIME DESTINATION bin
