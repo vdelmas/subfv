@@ -10,6 +10,7 @@ find_package(LAPACK REQUIRED)
 add_library(core STATIC
   src/utils/precision_module.F90
   src/utils/sort_module.F90
+  src/utils/quadrature_module.F90
   src/mpi/mpi_module.F90
   src/mesh/mesh_module.F90
   src/mesh/mesh_reading_module.F90
