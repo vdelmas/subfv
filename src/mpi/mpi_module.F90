@@ -73,6 +73,81 @@ contains
     end do
   end subroutine mpi_memory_exchange
 
+  ! Non-blocking split of mpi_memory_exchange: post packs the send buffers
+  ! from sol's current values and posts Isend/Irecv without waiting; wait
+  ! completes both, unpacks the received values into sol, and frees the
+  ! buffers. sol's send-side cells must not change between post and wait
+  ! (they are packed once, at post time); its ghost/recv-side cells only
+  ! become valid after wait returns. Meant to let a caller overlap the
+  ! exchange with unrelated local work computed between the two calls.
+  subroutine mpi_memory_exchange_post(mpi_send_recv, n_elems, n_var, sol)
+    use mpi
+    implicit none
+
+    integer(kind=ENTIER) :: n_elems, n_var
+    real(kind=DOUBLE), dimension(n_var, n_elems), intent(in) :: sol
+    type(mpi_send_recv_type), intent(inout) :: mpi_send_recv
+
+    integer :: mpi_ierr
+    integer(kind=ENTIER) :: i, k
+    integer(kind=ENTIER) :: id_elem
+
+    do i = 1, mpi_send_recv%n_mpi_send_neigh
+      allocate(mpi_send_recv%mpi_send_neigh(i)%sol(n_var, &
+        mpi_send_recv%mpi_send_neigh(i)%n_elems))
+      do k = 1, mpi_send_recv%mpi_send_neigh(i)%n_elems
+        id_elem = mpi_send_recv%mpi_send_neigh(i)%elem_id(k)
+        mpi_send_recv%mpi_send_neigh(i)%sol(:, k) = sol(:, id_elem)
+      end do
+
+      call mpi_isend(mpi_send_recv%mpi_send_neigh(i)%sol(1, 1), &
+        n_var*mpi_send_recv%mpi_send_neigh(i)%n_elems, MPI_DOUBLE, &
+        mpi_send_recv%mpi_send_neigh(i)%partition_id, &
+        0, MPI_COMM_WORLD, mpi_send_recv%mpi_reqsend(i), mpi_ierr)
+    end do
+
+    do i = 1, mpi_send_recv%n_mpi_recv_neigh
+      allocate(mpi_send_recv%mpi_recv_neigh(i)%sol(n_var, &
+        mpi_send_recv%mpi_recv_neigh(i)%n_elems))
+      call mpi_irecv(mpi_send_recv%mpi_recv_neigh(i)%sol(1, 1), &
+        n_var*mpi_send_recv%mpi_recv_neigh(i)%n_elems, MPI_DOUBLE, &
+        mpi_send_recv%mpi_recv_neigh(i)%partition_id, &
+        MPI_ANY_TAG, MPI_COMM_WORLD, mpi_send_recv%mpi_reqrecv(i), mpi_ierr)
+    end do
+  end subroutine mpi_memory_exchange_post
+
+  subroutine mpi_memory_exchange_wait(mpi_send_recv, n_elems, n_var, sol)
+    use mpi
+    implicit none
+
+    integer(kind=ENTIER) :: n_elems, n_var
+    real(kind=DOUBLE), dimension(n_var, n_elems), intent(inout) :: sol
+    type(mpi_send_recv_type), intent(inout) :: mpi_send_recv
+
+    integer :: mpi_ierr
+    integer(kind=ENTIER) :: i, k
+    integer(kind=ENTIER) :: id_elem
+
+    call mpi_waitall(mpi_send_recv%n_mpi_send_neigh, &
+      mpi_send_recv%mpi_reqsend, mpi_send_recv%mpi_sendstat, mpi_ierr)
+    call mpi_waitall(mpi_send_recv%n_mpi_recv_neigh, &
+      mpi_send_recv%mpi_reqrecv, mpi_send_recv%mpi_recvstat, mpi_ierr)
+
+    do i = 1, mpi_send_recv%n_mpi_recv_neigh
+      do k = 1, mpi_send_recv%mpi_recv_neigh(i)%n_elems
+        id_elem = mpi_send_recv%mpi_recv_neigh(i)%elem_id(k)
+        sol(:, id_elem) = mpi_send_recv%mpi_recv_neigh(i)%sol(:, k)
+      end do
+    end do
+
+    do i = 1, mpi_send_recv%n_mpi_send_neigh
+      deallocate(mpi_send_recv%mpi_send_neigh(i)%sol)
+    end do
+    do i = 1, mpi_send_recv%n_mpi_recv_neigh
+      deallocate(mpi_send_recv%mpi_recv_neigh(i)%sol)
+    end do
+  end subroutine mpi_memory_exchange_wait
+
   subroutine mpi_memory_exchange_partial_int(mpi_send_recv, n_elems, n_var, sol, id)
     use mpi
     implicit none
