@@ -139,6 +139,9 @@ module ns_global_data_module
   logical :: init_kelvin = .FALSE.
   logical :: init_double_mach = .FALSE.
 
+  ! Triple-point shock interaction (single material, gamma = 1.4)
+  logical :: init_triple_point = .FALSE.
+
   !Writes a file containing for each vertex &
   !the cell size associated (for salome adaptation)
   logical :: write_cell_size = .FALSE.
@@ -198,6 +201,7 @@ contains
       init_potential_flow_3d, &
       init_kelvin, &
       init_double_mach, &
+      init_triple_point, &
       init_1drp, sol_w_1drp_l, sol_w_1drp_r, x1drp, &
       error_2d, error_2d_h, &
       init_restart, restart_file, id_vtk_restart, &

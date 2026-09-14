@@ -137,6 +137,26 @@ contains
           sol(:, i) = primit_to_conserv(sol_right)
         end if
       end do
+    else if (init_triple_point) then
+      ! Triple-point shock interaction (single material, gamma = 1.4).
+      ! Domain [0,7] x [0,3], fluid at rest, reflecting walls everywhere.
+      !   x <= 1            : rho = 1,     p = 1
+      !   x >  1, y <= 1.5  : rho = 1,     p = 0.1
+      !   x >  1, y >  1.5  : rho = 0.125, p = 0.1
+      w(2:4) = 0.0_DOUBLE
+      do i = 1, mesh%n_elems
+        if (mesh%elem(i)%coord(1) <= 1.0_DOUBLE) then
+          w(1) = 1.0_DOUBLE
+          w(5) = 1.0_DOUBLE
+        else if (mesh%elem(i)%coord(2) <= 1.5_DOUBLE) then
+          w(1) = 1.0_DOUBLE
+          w(5) = 0.1_DOUBLE
+        else
+          w(1) = 0.125_DOUBLE
+          w(5) = 0.1_DOUBLE
+        end if
+        sol(:, i) = primit_to_conserv(w)
+      end do
     else if (init_restart) then
       call restart_from_vtu_file(mesh, sol, restart_file, &
         me, num_procs)
