@@ -853,4 +853,108 @@ contains
 
     end do
   end subroutine compute_lambdas_and_solve_nodal_velocity_new
+  ! ---------------------------------------------------------------------------
+  ! VILAR degenerate case: single nodal intermediate state U_p^*
+  ! U_p^* = sum_pf A_pf*(sr*U_r - sl*U_l + fl - fr) / sum_pf A_pf*(sr - sl)
+  ! ---------------------------------------------------------------------------
+  subroutine compute_nodal_state_VILAR(mesh, id_vert, sol_w_lr, sol_p)
+    use ns_global_data_module
+    implicit none
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: id_vert
+    real(kind=DOUBLE), dimension(5, 2, *), intent(in) :: sol_w_lr
+    real(kind=DOUBLE), dimension(5), intent(inout) :: sol_p
+
+    integer(kind=ENTIER) :: j, id_sub_face, re
+    real(kind=DOUBLE), dimension(3) :: norm
+    real(kind=DOUBLE) :: rhol, rhor, vnl, vnr, pl, pr, al, ar
+    real(kind=DOUBLE) :: lambda_l, lambda_r, sl, sr, ab_denom
+    real(kind=DOUBLE), dimension(5) :: sol_l, sol_r, fl, fr, b_num
+
+    b_num    = 0.0_DOUBLE
+    ab_denom = 0.0_DOUBLE
+
+    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+      re   = mesh%sub_face(id_sub_face)%right_elem_neigh
+
+      norm = mesh%sub_face(id_sub_face)%norm
+
+      !if( boundary_2d .and. abs(norm(3)) > 1e-8_DOUBLE ) cycle
+
+      rhol = sol_w_lr(1, 1, j);  al = sound_speed_w(sol_w_lr(:, 1, j))
+      vnl  = dot_product(sol_w_lr(2:4, 1, j), norm);  pl = sol_w_lr(5, 1, j)
+      rhor = sol_w_lr(1, 2, j);  ar = sound_speed_w(sol_w_lr(:, 2, j))
+      vnr  = dot_product(sol_w_lr(2:4, 2, j), norm);  pr = sol_w_lr(5, 2, j)
+
+      lambda_l = max(al*rhol, sqrt(rhol*max(0.0_DOUBLE, pr - pl)), -rhol*(vnr - vnl))
+      lambda_r = max(ar*rhor, sqrt(rhor*max(0.0_DOUBLE, pl - pr)), -rhor*(vnr - vnl))
+      sl = vnl - lambda_l/rhol
+      sr = vnr + lambda_r/rhor
+
+      sol_l = primit_to_conserv(sol_w_lr(:, 1, j))
+      sol_r = primit_to_conserv(sol_w_lr(:, 2, j))
+
+
+      fl(1)   = vnl*sol_l(1)
+      fl(2:4) = vnl*sol_l(2:4) + pl*norm
+      fl(5)   = (sol_l(5) + pl)*vnl
+
+      fr(1)   = vnr*sol_r(1)
+      fr(2:4) = vnr*sol_r(2:4) + pr*norm
+      fr(5)   = (sol_r(5) + pr)*vnr
+
+      b_num    = b_num    + mesh%sub_face(id_sub_face)%area*(sr*sol_r - sl*sol_l + fl - fr)
+      ab_denom = ab_denom + mesh%sub_face(id_sub_face)%area*(sr - sl)
+    end do
+
+    if (ab_denom > 0.0_DOUBLE) sol_p = b_num / ab_denom
+  end subroutine compute_nodal_state_VILAR
+
+  ! Compute sub-face fluxes for VILAR given nodal intermediate state sol_p.
+  ! F_pf^-  = lr_flux(:,1),  F_pf^+  = -lr_flux(:,2)
+  subroutine multi_point_vilar(sol_w_l, sol_w_r, n, lr_flux, sol_p, sl, sr)
+    implicit none
+    real(kind=DOUBLE), dimension(5), intent(in)    :: sol_w_l, sol_w_r, sol_p
+    real(kind=DOUBLE), dimension(3), intent(in)    :: n
+    real(kind=DOUBLE), dimension(5, 2), intent(inout) :: lr_flux
+    real(kind=DOUBLE), intent(inout) :: sl, sr
+
+    real(kind=DOUBLE) :: rhol, rhor, vnl, vnr, pl, pr, al, ar
+    real(kind=DOUBLE) :: lambda_l, lambda_r
+    real(kind=DOUBLE) :: sl_m, sl_p, sr_m, sr_p
+    real(kind=DOUBLE), dimension(5) :: sol_l, sol_r, fl, fr
+
+    rhol = sol_w_l(1);  al = sound_speed_w(sol_w_l)
+    vnl  = dot_product(sol_w_l(2:4), n);  pl = sol_w_l(5)
+    rhor = sol_w_r(1);  ar = sound_speed_w(sol_w_r)
+    vnr  = dot_product(sol_w_r(2:4), n);  pr = sol_w_r(5)
+
+    lambda_l = max(al*rhol, sqrt(rhol*max(0.0_DOUBLE, pr - pl)), -rhol*(vnr - vnl))
+    lambda_r = max(ar*rhor, sqrt(rhor*max(0.0_DOUBLE, pl - pr)), -rhor*(vnr - vnl))
+    sl = vnl - lambda_l/rhol
+    sr = vnr + lambda_r/rhor
+
+    sol_l = primit_to_conserv(sol_w_l)
+    sol_r = primit_to_conserv(sol_w_r)
+
+    fl(1)   = vnl*sol_l(1)
+    fl(2:4) = vnl*sol_l(2:4) + pl*n
+    fl(5)   = (sol_l(5) + pl)*vnl
+
+    fr(1)   = vnr*sol_r(1)
+    fr(2:4) = vnr*sol_r(2:4) + pr*n
+    fr(5)   = (sol_r(5) + pr)*vnr
+
+    sl_m = max(-sl, 0.0_DOUBLE)
+    sl_p = max( sl, 0.0_DOUBLE)
+    sr_m = max(-sr, 0.0_DOUBLE)
+    sr_p = max( sr, 0.0_DOUBLE)
+
+    !lr_flux(:, 1) = 0.5_DOUBLE*(fl+fr) - max(abs(sl), abs(sr))*(sol_r-sol_l)
+    !lr_flux(:, 2) = -lr_flux(:, 1)
+    lr_flux(:, 1) = fl - sl_m*(sol_p - sol_l) - sr_m*(sol_r - sol_p)
+    lr_flux(:, 2) = -(fr - sl_p*(sol_p - sol_l) - sr_p*(sol_r - sol_p))
+  end subroutine multi_point_vilar
+
 end module ns_euler_rs_module

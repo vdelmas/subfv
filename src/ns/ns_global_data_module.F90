@@ -73,6 +73,7 @@ module ns_global_data_module
   integer, parameter :: SCHEME_MULTI_POINT_PRESSURE_PH = 8  ! "multi_point_pressure_ph"
   integer, parameter :: SCHEME_WIP                     = 7  ! "WIP"
   integer, parameter :: SCHEME_USI3D                   = 9  ! "USI3D"
+  integer, parameter :: SCHEME_MULTI_POINT_VILAR       = 10 ! "multi_point_vilar"
   integer, parameter :: SCHEME_ZB                   = 42 ! "ZB_*_*"
   ! ZB advection sub-scheme IDs
   integer, parameter :: SCHEME_ADV_AR1D     = 1  ! "AR1D"
@@ -284,6 +285,8 @@ contains
       scheme_id = SCHEME_MULTI_POINT_PRESSURE
     else if (t == "multi_point_pressure_ph") then
       scheme_id = SCHEME_MULTI_POINT_PRESSURE_PH
+    else if (t == "multi_point_vilar") then
+      scheme_id = SCHEME_MULTI_POINT_VILAR
     else if (t == "WIP") then
       scheme_id = SCHEME_WIP
     else if (t == "USI3D") then

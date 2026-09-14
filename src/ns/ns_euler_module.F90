@@ -345,7 +345,8 @@ contains
       scheme_id, &
       SCHEME_MULTI_POINT, SCHEME_MULTI_POINT_ISO, SCHEME_MULTI_POINT_PRESSURE, &
       SCHEME_MULTI_POINT_PRESSURE_PH, &
-      SCHEME_THREE_WAVE, SCHEME_TWO_WAVE, SCHEME_MODIFIED_THREE_WAVE
+      SCHEME_THREE_WAVE, SCHEME_TWO_WAVE, SCHEME_MODIFIED_THREE_WAVE, &
+      SCHEME_MULTI_POINT_VILAR
     use linear_solver_module
     use mpi
     implicit none
@@ -371,6 +372,7 @@ contains
     real(kind=DOUBLE), dimension(2, nsfn) :: lambda
     real(kind=DOUBLE), dimension(nsfn) :: v_bars, p_bars, warea
     real(kind=DOUBLE), dimension(5, 2, nsfn) :: lr_flux_3w
+    real(kind=DOUBLE), dimension(5) :: sol_p_vilar
     rse_loc = 0
     flux_sum_vert = 0.0_DOUBLE
     v_vert = 0.0_DOUBLE
@@ -418,6 +420,9 @@ contains
           sol_w_lr, lambda, v_bars, v_vert, p_bound)
         vp(:, id_vert) = v_vert
       end if
+    case (SCHEME_MULTI_POINT_VILAR)
+      sol_p_vilar = 0.0_DOUBLE
+      call compute_nodal_state_VILAR(mesh, id_vert, sol_w_lr, sol_p_vilar)
     case (SCHEME_MULTI_POINT_PRESSURE)
       lambda(:, :) = 0.0_DOUBLE
       p_nodal = 0.0_DOUBLE
@@ -490,6 +495,9 @@ contains
       case (SCHEME_MODIFIED_THREE_WAVE)
         call modified_three_wave(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
           mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
+      case (SCHEME_MULTI_POINT_VILAR)
+        call multi_point_vilar(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+          mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sol_p_vilar, sl, sr)
       case (SCHEME_MULTI_POINT_PRESSURE)
         call multi_point_pressure(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
           mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), p_nodal, &
