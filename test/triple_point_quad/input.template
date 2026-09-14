@@ -1,0 +1,34 @@
+&INPUT_PARAM
+
+  meshfile_path='',
+  meshfile='triple_point_quad.msh'
+
+  use_cylinder_map = .false.
+  dim_cylinder_map = 2
+
+  n_iter_print=1000
+  n_iter_write_sol=0
+  n_max_iter=100000000
+  final_res=1e-20
+  tmax=5.0
+
+  second_order = SECOND_ORDER_PLACEHOLDER
+  method = METHOD_PLACEHOLDER,
+  activate_diffusion = .false.
+
+  local_time_step=.false.
+  cfl=0.8
+
+  init_triple_point=.true.,
+
+  n_bc=0,
+
+  bc_style = 2,
+  boundary_2d=.true.
+  exclude_bound_vert=.false.
+
+  scheme='SCHEME_PLACEHOLDER',
+
+  write_residual=.false.
+  n_iter_residual=1000
+  /
