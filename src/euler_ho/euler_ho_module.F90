@@ -3,15 +3,22 @@
 ! Conservative variables: sol(1:5,i) = [rho, rho*u, rho*v, rho*w, rho*E]
 ! Primitive  variables:   prim(1:5,i) = [rho, u, v, w, p]
 !
-! Spatial reconstruction up to order 3 using cell-centred least-squares
-! polynomial fit over vertex-neighbours, with face quadrature.
+! Spatial reconstruction up to order 4 (aho reconstruction source only --
+! ls_reconstruction still tops out at order 3, see its own header) using
+! cell-centred least-squares polynomial fit over vertex-neighbours, with
+! face quadrature.
 ! boundary_2d=T → 2D polynomial (x,y only); boundary_2d=F → full 3D.
 ! Numerical flux: Rusanov (local Lax-Friedrichs).
 module euler_ho_module
   use precision_module
   use mesh_module
   use quadrature_module
-  use arbitrary_high_order_module, only: compute_next_order_derivative
+  use arbitrary_high_order_module, only: compute_next_order_derivative, &
+    compute_next_order_derivative_cweno, &
+    aho_module_use_weno_blend => use_weno_blend, &
+    aho_module_use_cweno_center => use_cweno_center, &
+    aho_module_cweno_center_weight => cweno_center_weight
+  use mpi_module, only: mpi_send_recv_type, mpi_memory_exchange
   implicit none
   private
 
@@ -26,7 +33,7 @@ module euler_ho_module
   real(kind=DOUBLE),  public :: gamma_gas     = 1.4_DOUBLE
   real(kind=DOUBLE),  public :: cfl           = 0.4_DOUBLE
   real(kind=DOUBLE),  public :: tmax          = 1.0_DOUBLE
-  integer(kind=ENTIER), public :: order       = 1     ! 1, 2, or 3
+  integer(kind=ENTIER), public :: order       = 1     ! 1, 2, 3, or 4 (aho only; see ls_reconstruction)
   logical, public :: boundary_2d              = .false.
   integer(kind=ENTIER), public :: n_sol_vtu  = 10
   logical, public :: compute_error            = .false.
@@ -37,6 +44,27 @@ module euler_ho_module
   ! downstream, so this isolates the reconstruction source for a like-for-like
   ! comparison (e.g. on a shock case).
   logical, public :: use_aho_reconstruction   = .false.
+  ! At use_aho_reconstruction=.true. only: .false. disables the nonlinear
+  ! WENO blend (arbitrary_high_order_module's own use_weno_blend flag,
+  ! set from this one in aho_reconstruction), leaving a plain
+  ! volume-weighted linear combination of nodal derivatives -- a baseline
+  ! comparison point analogous to ls_reconstruction's raw, unlimited fit,
+  ! but built from aho's nodal-derivative machinery instead of a
+  ! cell-centered polynomial fit.
+  logical, public :: use_weno_blend           = .true.
+  ! CWENO-style central candidate (2026-09-15, replaces the earlier
+  ! "WENO only on the grad step" interim fix): at use_weno_blend=.true.
+  ! only, folds a large-weight plain/linear candidate into the SAME
+  ! nonlinear blend at EVERY recursion level (grad, hess, third), instead
+  ! of skipping WENO entirely past the first step. See
+  ! arbitrary_high_order_module's use_cweno_center/cweno_center_weight
+  ! header and compute_next_order_derivative_cweno for the mechanism;
+  ! verified on a synthetic cubic field to let hess/third converge with a
+  ! real order (not just machine-precision from disabling WENO, nor
+  ! stuck at O(h^0) from plain WENO at every level) while keeping the
+  ! per-vertex nonlinear candidates genuinely present for shock detection.
+  logical, public :: use_cweno_center          = .true.
+  real(kind=DOUBLE), public :: cweno_center_weight = 1000.0_DOUBLE
   ! Numerical flux at each face quadrature point: 'rusanov' (local
   ! Lax-Friedrichs, the original default) or 'three_wave' (an HLLC-family,
   ! 3-wave approximate Riemann solver -- same algorithm as
@@ -98,6 +126,12 @@ module euler_ho_module
   ! compute_geometry_mesh) and read by reconstruct() at order 3. See the
   ! header comment above reconstruct() for why it is needed.
   real(kind=DOUBLE), dimension(:, :, :), allocatable :: cell_moment
+  ! Same idea, one degree up: the third geometric moment
+  ! M_jkl(i) = (1/V_i) * int_cell (x_j-xc_j)(x_k-xc_k)(x_l-xc_l) dV, needed
+  ! by reconstruct()'s order-4 (cubic) term for the same reason -- only
+  ! allocated/filled when order>=4 (compute_cell_moments needs degree-3
+  ! quadrature to get this one exactly, vs degree-2 for cell_moment alone).
+  real(kind=DOUBLE), dimension(:, :, :, :), allocatable :: cell_moment3
 
 contains
 
@@ -114,7 +148,8 @@ contains
       init, sol_uniform, x1drp, sol_w_1drp_l, sol_w_1drp_r, &
       u_bg_vortex, v_bg_vortex, &
       gamma_gas, order, cfl, tmax, n_sol_vtu, &
-      compute_error, error_2d, use_aho_reconstruction, flux_scheme
+      compute_error, error_2d, use_aho_reconstruction, use_weno_blend, &
+      use_cweno_center, cweno_center_weight, flux_scheme
     open(newunit=funit, file=trim(adjustl(filename)))
     read(nml=INPUT_PARAM, unit=funit)
     close(funit)
@@ -156,12 +191,9 @@ contains
     type(mesh_type), intent(in)    :: mesh
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(out) :: sol
 
-    integer(kind=ENTIER) :: i, kf, iface_loc, n_fv, k, q
-    real(kind=DOUBLE), dimension(5) :: w, w_sum, wq
+    integer(kind=ENTIER) :: i
+    real(kind=DOUBLE), dimension(5) :: w
     real(kind=DOUBLE), dimension(3) :: xc
-    real(kind=DOUBLE), dimension(:, :), allocatable :: qpts_v, fc
-    real(kind=DOUBLE), dimension(:),    allocatable :: qwts_v
-    real(kind=DOUBLE) :: area_q
 
     do i = 1, mesh%n_elems
       xc = mesh%elem(i)%coord
@@ -180,31 +212,8 @@ contains
         w = shu_osher_state(xc(1))
       case (5)   ! Woodward-Colella interacting blast waves, see woodward_colella_state
         w = woodward_colella_state(xc(1))
-      case (2)   ! isentropic vortex: high-order cell average via z-face quadrature
-        call vortex_prim(xc, 0.0_DOUBLE, w)
-        do kf = 1, mesh%elem(i)%n_faces
-          iface_loc = mesh%elem(i)%face(kf)
-          if (abs(abs(mesh%face(iface_loc)%norm(3)) - 1.0_DOUBLE) < 1.0e-6_DOUBLE) then
-            n_fv = mesh%face(iface_loc)%n_vert
-            if (n_fv >= 3 .and. allocated(mesh%face(iface_loc)%vert)) then
-              allocate(fc(3, n_fv))
-              do k = 1, n_fv
-                fc(:, k) = mesh%vert(mesh%face(iface_loc)%vert(k))%coord
-              end do
-              call face_quad_pts(n_fv, fc, max(order, 3), qpts_v, qwts_v)
-              deallocate(fc)
-              w_sum = 0.0_DOUBLE; area_q = 0.0_DOUBLE
-              do q = 1, size(qwts_v)
-                call vortex_prim(qpts_v(:, q), 0.0_DOUBLE, wq)
-                w_sum  = w_sum  + qwts_v(q) * wq
-                area_q = area_q + qwts_v(q)
-              end do
-              if (area_q > 0.0_DOUBLE) w = w_sum / area_q
-              deallocate(qpts_v, qwts_v)
-              exit
-            end if
-          end if
-        end do
+      case (2)   ! isentropic vortex: high-order cell average via volume quadrature
+        call vortex_cell_average(mesh, i, 0.0_DOUBLE, w)
       case default
         w = sol_uniform
       end select
@@ -228,7 +237,7 @@ contains
   ! ----------------------------------------------------------------
   ! RHS: -1/V * sum_faces(int_face F·n dA), using face quadrature
   ! ----------------------------------------------------------------
-  subroutine compute_rhs(mesh, sol, prim, rhs, sum_lambda, t)
+  subroutine compute_rhs(mesh, sol, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: sol
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: prim
@@ -239,10 +248,16 @@ contains
     ! step's start time) -- a minor, deliberate simplification for a
     ! qualitative test, not exact substage timing.
     real(kind=DOUBLE), intent(in) :: t
+    ! Optional: only needed by aho_reconstruction under MPI (see its header
+    ! comment) -- absent, compute_rhs behaves exactly as before (serial, or
+    ! the ls_reconstruction path which needs no cross-rank exchange here).
+    integer(kind=ENTIER), intent(in), optional :: num_procs
+    type(mpi_send_recv_type), intent(inout), optional :: mpi_send_recv
 
     ! Per-cell gradients (5 primitives x 3 spatial dims)
     real(kind=DOUBLE), allocatable :: grad(:, :, :)  ! (5, 3, n_elems)
     real(kind=DOUBLE), allocatable :: hess(:, :, :, :) ! (5, 3, 3, n_elems)
+    real(kind=DOUBLE), allocatable :: third(:, :, :, :, :) ! (5, 3, 3, 3, n_elems), order 4 only
 
     allocate(grad(5, 3, mesh%n_elems))
     grad = 0.0_DOUBLE
@@ -252,9 +267,22 @@ contains
       hess = 0.0_DOUBLE
     end if
 
+    if (order >= 4) then
+      ! ls_reconstruction only ever fits up to a quadratic (order-3)
+      ! polynomial (see its own header) -- no silent order-3-in-disguise
+      ! fallback here if someone asks for order 4 with it.
+      if (.not. use_aho_reconstruction) then
+        print *, 'FATAL: order>=4 requires use_aho_reconstruction=.true. -- ', &
+          'ls_reconstruction does not fit a cubic term (see its header comment).'
+        error stop 1
+      end if
+      allocate(third(5, 3, 3, 3, mesh%n_elems))
+      third = 0.0_DOUBLE
+    end if
+
     if (order >= 2) then
       if (use_aho_reconstruction) then
-        call aho_reconstruction(mesh, prim, grad, hess)
+        call aho_reconstruction(mesh, prim, grad, hess, third, num_procs, mpi_send_recv)
       else
         call ls_reconstruction(mesh, prim, grad, hess)
       end if
@@ -262,7 +290,7 @@ contains
 
     rhs        = 0.0_DOUBLE
     sum_lambda = 0.0_DOUBLE
-    call face_flux_loop(mesh, sol, prim, grad, hess, rhs, sum_lambda, t)
+    call face_flux_loop(mesh, sol, prim, grad, hess, rhs, sum_lambda, t, third)
 
     ! Divide by cell volume
     block
@@ -275,6 +303,7 @@ contains
     end block
 
 
+    if (allocated(third)) deallocate(third)
     if (allocated(hess)) deallocate(hess)
     deallocate(grad)
   end subroutine compute_rhs
@@ -283,10 +312,12 @@ contains
   ! CFL time step
   ! ----------------------------------------------------------------
   function compute_dt(mesh, sum_lambda) result(dt)
+    use mpi
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: sum_lambda
     real(kind=DOUBLE) :: dt, dt_i
     integer(kind=ENTIER) :: i
+    integer :: mpi_ierr
 
     dt = huge(1.0_DOUBLE)
     do i = 1, mesh%n_elems
@@ -295,6 +326,24 @@ contains
         dt = min(dt, dt_i)
       end if
     end do
+
+    ! Found 2026-09-14: this was a purely local (per-rank) minimum, with no
+    ! cross-rank reduction -- unlike ns_euler_module's own compute_dt
+    ! (ns_euler_module.F90, MPI_ALLREDUCE/MPI_MIN), which is why subfvns
+    ! never showed this problem on the same meshes. Under MPI, each rank's
+    ! own dt differs (most sharply near a strong feature like a bow shock,
+    ! where sum_lambda is far larger than in quiescent far-field cells), so
+    ! t = t + dt drifts apart rank-to-rank; a far-field rank can reach
+    ! t>=tmax and hit MPI_FINALIZE while a shock-region rank is still deep
+    ! in its own loop expecting to exchange with it -- an eternal
+    ! PMPI_Waitall inside mpi_memory_exchange on the ranks left behind.
+    ! Reproduced deterministically (same physical t, not the same iteration
+    ! count, across a cfl change) on cylinder-tri at 6 ranks locally, no
+    ! cluster involved; confirmed via gdb backtraces on multiple stuck
+    ! cluster runs (WC, DMR, Shu-Osher, cylinder-quad, cylinder-tri, FFS)
+    ! all landing in the same mpi_memory_exchange/PMPI_Waitall frame.
+    call MPI_ALLREDUCE(MPI_IN_PLACE, dt, 1, MPI_DOUBLE, &
+      MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
   end function compute_dt
 
   ! ----------------------------------------------------------------
@@ -429,9 +478,9 @@ contains
     real(kind=DOUBLE), intent(in) :: t
     real(kind=DOUBLE), intent(out) :: h, l2err
 
-    integer(kind=ENTIER) :: i, kf, iface_loc, n_fv, k, q, n_inner
+    integer(kind=ENTIER) :: i, kf, iface_loc, n_fv, k, n_inner
     real(kind=DOUBLE) :: err2, area_tot, area_q, area_2d
-    real(kind=DOUBLE), dimension(5) :: wexact, wsol, wq, w_sum
+    real(kind=DOUBLE), dimension(5) :: wexact, wsol
     real(kind=DOUBLE), dimension(3) :: xc
     real(kind=DOUBLE), dimension(:, :), allocatable :: qpts_v, fc
     real(kind=DOUBLE), dimension(:),    allocatable :: qwts_v
@@ -446,8 +495,21 @@ contains
       xc = mesh%elem(i)%coord
       if (abs(xc(1)) > 5.0_DOUBLE .or. abs(xc(2)) > 5.0_DOUBLE) cycle
 
-      ! Compute cell average of exact solution via face quadrature on z-face.
-      call vortex_prim(xc, t, wexact)
+      ! Cell average of the exact solution, via genuine volume quadrature
+      ! (works for any cell type, hex/tet/prism/pyramid alike -- see
+      ! vortex_cell_average's header for why this replaced the previous
+      ! z-face-projection approach, which relied on a guaranteed z-normal
+      ! face that a tet cell essentially never has). Mathematically
+      ! identical to the old approach for a z-invariant field on a
+      ! z-extruded boundary_2d mesh (the two are the same integral divided
+      ! by the same volume, just computed via a full 3D rule instead of a
+      ! face rule x cancelled z-thickness), so this does not change any
+      ! already-published boundary_2d result.
+      call vortex_cell_average(mesh, i, t, wexact)
+
+      ! h/area_2d bookkeeping is untouched (still needs a real z-face
+      ! for the boundary_2d convention's h = sqrt(area) definition): find
+      ! one purely to measure area_q below, independent of wexact now.
       found_zface = .false.
       do kf = 1, mesh%elem(i)%n_faces
         iface_loc = mesh%elem(i)%face(kf)
@@ -460,13 +522,7 @@ contains
             end do
             call face_quad_pts(n_fv, fc, max(order, 3), qpts_v, qwts_v)
             deallocate(fc)
-            w_sum = 0.0_DOUBLE; area_q = 0.0_DOUBLE
-            do q = 1, size(qwts_v)
-              call vortex_prim(qpts_v(:, q), t, wq)
-              w_sum  = w_sum  + qwts_v(q) * wq
-              area_q = area_q + qwts_v(q)
-            end do
-            if (area_q > 0.0_DOUBLE) wexact = w_sum / area_q
+            area_q = sum(qwts_v)
             deallocate(qpts_v, qwts_v)
             found_zface = .true.
             exit
@@ -548,6 +604,13 @@ contains
   !
   ! Coefficients are stored in the existing grad/hess arrays so that the
   ! reconstruct() function needs no changes.
+  !
+  ! Tops out at order 3 (quadratic, n_coeff above): no cubic/order-4 basis
+  ! is fitted here. compute_rhs enforces this explicitly (error stop if
+  ! order>=4 and use_aho_reconstruction is false) rather than silently
+  ! reusing the order-3 fit under an order-4 label -- growing this to a
+  ! cubic fit would also need a wider neighbor stencil (ls's ring widens
+  ! with order), not just more basis functions.
   subroutine ls_reconstruction(mesh, prim, grad, hess)
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: prim
@@ -746,7 +809,12 @@ contains
       integer(kind=ENTIER) :: jn
       logical :: found
 
-      if (cand <= 0 .or. cand == i .or. mesh%elem(cand)%is_ghost) return
+      ! Same non-guaranteed-short-circuit hazard as face_flux_loop's ir
+      ! check (see 2026-09-15 comment there): nest the sign guard so
+      ! mesh%elem(cand) is never indexed for a non-positive (boundary
+      ! marker) cand.
+      if (cand <= 0) return
+      if (cand == i .or. mesh%elem(cand)%is_ghost) return
       found = .false.
       do jn = 1, n_neigh
         if (neigh_list(jn) == cand) then
@@ -803,29 +871,100 @@ contains
 
   ! Drop-in alternative to ls_reconstruction: grad/hess of the 5 primitive
   ! variables from arbitrary_high_order_module's least-squares dual/primal
-  ! hierarchy (single-rank only -- no ghost exchange is issued here, matching
-  ! this solver's existing serial-only usage). The 5 variables are
-  ! differentiated together as one nc_in=5 "vector field" (the module's
-  ! least-squares fit already treats each component as an independent
-  ! right-hand side against a shared, geometry-only normal matrix, so this
-  ! is exactly as one call per variable would be, just batched).
+  ! hierarchy. The 5 variables are differentiated together as one nc_in=5
+  ! "vector field" (the module's least-squares fit already treats each
+  ! component as an independent right-hand side against a shared,
+  ! geometry-only normal matrix, so this is exactly as one call per
+  ! variable would be, just batched).
   !
   ! compute_next_order_derivative flattens its output with the *input*
   ! component fast-varying and the new derivative direction slow-varying:
   ! grad_flat((dir-1)*5 + v, e) = d(prim_v)/dx_dir. Differentiating that
   ! again gives hess_flat((dir2-1)*15 + (dir1-1)*5 + v, e) = d2(prim_v)/(dx_dir1 dx_dir2).
-  subroutine aho_reconstruction(mesh, prim, grad, hess)
+  !
+  ! MPI (2026-09-15, per the user's fresh 1-proc-vs-2-proc vortex test):
+  ! compute_next_order_derivative computes grad_flat/hess_flat for EVERY
+  ! cell it's given, ghost cells included, using this rank's OWN local
+  ! vertex-neighbor topology (mesh%vert%elem_neigh) for that cell's
+  ! vertices. A ghost cell's own vertices sit one hop further from the
+  ! interface than the interface itself -- exactly where subfv-gmsh's
+  ! single node-based ghost layer no longer guarantees a *complete*
+  ! elem_neigh (it only guarantees that for vertices directly touching an
+  ! owned cell). So a ghost cell's locally-computed grad/hess can be wrong
+  ! (built from a genuinely incomplete local stencil), yet it's exactly
+  ! what face_flux_loop uses for that ghost cell's own Taylor extrapolation
+  ! at the shared face with a real, owned cell -- corrupting that owned
+  ! cell's flux, then its evolution, then (over many RK3 steps) the whole
+  ! rank-adjacent region. compute_derivative_hierarchy (this module's own
+  ! sibling driver, used by arbitrary_high_order_main, not by this solver)
+  ! already exchanges every order's tensor before using it as the next
+  ! order's input for exactly this reason -- this routine just wasn't
+  ! doing the analogous thing, for either stage. Confirmed by two direct
+  ! tests: (1) subfvns, a classical single-ring-stencil solver sharing the
+  ! same partitioned mesh, gives IDENTICAL error at 1 and 2 ranks; (2) this
+  ! routine's order=2 (grad only, no hess) already showed the same
+  ! MPI-dependent error inflation as order=3, ruling out the hess stage
+  ! specifically and pointing at grad_flat itself being ghost-incomplete.
+  ! Fix: exchange grad_flat right after it's computed (both because
+  ! face_flux_loop reads it directly at order 2, and because it's hess's
+  ! own input at order 3), and exchange hess_flat right after IT is
+  ! computed, before face_flux_loop reads it. num_procs/mpi_send_recv are
+  ! optional so this remains a plain serial call wherever nothing MPI is
+  ! in play (verify_reconstruction_order's synthetic single-rank tests).
+  ! third (order-4 cubic term) is optional and follows the exact same
+  ! recursive pattern one step further: hess_flat (45 components/cell,
+  ! nc_in for this step) goes into compute_next_order_derivative to give
+  ! third_flat (135 components/cell), exchanged across ranks the same way,
+  ! then unflattened with the third (newest) direction slow-varying over
+  ! hess_flat's own index -- same convention as hess_flat's own layout
+  ! relative to grad_flat, one level up.
+  subroutine aho_reconstruction(mesh, prim, grad, hess, third, num_procs, mpi_send_recv)
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: prim
     real(kind=DOUBLE), dimension(5, 3, mesh%n_elems), intent(inout) :: grad
     real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(inout) :: hess
+    real(kind=DOUBLE), dimension(:, :, :, :, :), allocatable, intent(inout), optional :: third
+    integer(kind=ENTIER), intent(in), optional :: num_procs
+    type(mpi_send_recv_type), intent(inout), optional :: mpi_send_recv
 
-    real(kind=DOUBLE), dimension(:, :), allocatable :: grad_flat, hess_flat
-    integer(kind=ENTIER) :: e, v, dir1, dir2
+    real(kind=DOUBLE), dimension(:, :), allocatable :: grad_flat, hess_flat, third_flat
+    integer(kind=ENTIER) :: e, v, dir1, dir2, dir3
+    logical :: do_exchange
+
+    do_exchange = present(num_procs)
+    if (do_exchange) do_exchange = num_procs > 1
+
+    ! CWENO-style central candidate (2026-09-15, replaces an earlier,
+    ! cruder "WENO only on the grad step" interim fix): rather than
+    ! skipping WENO's nonlinear oscillation-indicator weight at the
+    ! deeper recursion levels (hess from grad, third from hess), fold a
+    ! large-weight linear/center candidate into the SAME nonlinear blend
+    ! at EVERY level via compute_next_order_derivative_cweno -- see that
+    ! subroutine's header and arbitrary_high_order_module's
+    ! use_cweno_center/cweno_center_weight. This keeps the per-vertex
+    ! nonlinear WENO candidates genuinely present (for real shock
+    ! detection) at every level, unlike the interim fix, while still
+    ! letting hess/third converge with a real order on smooth data
+    ! (verified via test_order4_cweno.F90, scratchpad, on a synthetic
+    ! cubic field: hess/third residual ~1/cweno_center_weight, real
+    ! O(h^2-3) convergence, vs. O(h^0)/non-convergent with plain WENO at
+    ! every level). Falls back to the original compute_next_order_derivative
+    ! (WENO or linear per use_weno_blend, uniformly at every level) when
+    ! use_cweno_center=.false.
+    aho_module_use_weno_blend = use_weno_blend
+    aho_module_use_cweno_center = use_cweno_center
+    aho_module_cweno_center_weight = cweno_center_weight
 
     allocate(grad_flat(15, mesh%n_elems))
-    call compute_next_order_derivative(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, &
-      prim, grad_flat)
+    if (use_cweno_center) then
+      call compute_next_order_derivative_cweno(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, &
+        prim, grad_flat)
+    else
+      call compute_next_order_derivative(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, &
+        prim, grad_flat)
+    end if
+
+    if (do_exchange) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 15_ENTIER, grad_flat)
 
     do e = 1, mesh%n_elems
       do dir1 = 1, 3
@@ -837,8 +976,14 @@ contains
 
     if (order >= 3 .and. allocated(hess)) then
       allocate(hess_flat(45, mesh%n_elems))
-      call compute_next_order_derivative(mesh, 3_ENTIER, 15_ENTIER, boundary_2d, &
-        grad_flat, hess_flat)
+      if (use_cweno_center) then
+        call compute_next_order_derivative_cweno(mesh, 3_ENTIER, 15_ENTIER, boundary_2d, &
+          grad_flat, hess_flat)
+      else
+        call compute_next_order_derivative(mesh, 3_ENTIER, 15_ENTIER, boundary_2d, &
+          grad_flat, hess_flat)
+      end if
+      if (do_exchange) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 45_ENTIER, hess_flat)
 
       do e = 1, mesh%n_elems
         do dir2 = 1, 3
@@ -849,6 +994,35 @@ contains
           end do
         end do
       end do
+
+      if (order >= 4 .and. present(third)) then
+        if (allocated(third)) then
+          allocate(third_flat(135, mesh%n_elems))
+          if (use_cweno_center) then
+            call compute_next_order_derivative_cweno(mesh, 3_ENTIER, 45_ENTIER, boundary_2d, &
+              hess_flat, third_flat)
+          else
+            call compute_next_order_derivative(mesh, 3_ENTIER, 45_ENTIER, boundary_2d, &
+              hess_flat, third_flat)
+          end if
+          if (do_exchange) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 135_ENTIER, third_flat)
+
+          do e = 1, mesh%n_elems
+            do dir3 = 1, 3
+              do dir2 = 1, 3
+                do dir1 = 1, 3
+                  do v = 1, 5
+                    third(v, dir1, dir2, dir3, e) = &
+                      third_flat((dir3-1)*45 + (dir2-1)*15 + (dir1-1)*5 + v, e)
+                  end do
+                end do
+              end do
+            end do
+          end do
+          deallocate(third_flat)
+        end if
+      end if
+
       deallocate(hess_flat)
     end if
 
@@ -1013,7 +1187,7 @@ contains
   end subroutine gauss_solve
 
   ! Main face flux loop
-  subroutine face_flux_loop(mesh, sol, prim, grad, hess, rhs, sum_lambda, t)
+  subroutine face_flux_loop(mesh, sol, prim, grad, hess, rhs, sum_lambda, t, third)
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: sol, prim
     real(kind=DOUBLE), dimension(5, 3, mesh%n_elems), intent(in) :: grad
@@ -1021,14 +1195,18 @@ contains
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(inout) :: rhs
     real(kind=DOUBLE), dimension(mesh%n_elems),    intent(inout) :: sum_lambda
     real(kind=DOUBLE), intent(in) :: t
+    real(kind=DOUBLE), dimension(:, :, :, :, :), allocatable, intent(in), optional :: third
 
     integer(kind=ENTIER) :: iface, il, ir, iv, k, n_fvert, n_qpts, q
     real(kind=DOUBLE), dimension(3) :: norm, xface
     real(kind=DOUBLE), dimension(:, :), allocatable :: face_coords, qpts
     real(kind=DOUBLE), dimension(:),    allocatable :: qwts
+    real(kind=DOUBLE), dimension(3, 1) :: qpts_single
+    real(kind=DOUBLE), dimension(1)    :: qwts_single
+    real(kind=DOUBLE) :: qwt
     real(kind=DOUBLE), dimension(5) :: wL, wR, flux
     real(kind=DOUBLE) :: lambda
-    logical :: is_zface
+    logical :: is_zface, use_face_quad
 
     do iface = 1, mesh%n_faces
       il   = mesh%face(iface)%left_neigh
@@ -1045,38 +1223,81 @@ contains
       ! avoids spurious net z-flux from GMSH's vertex ordering (top/bottom
       ! faces get different (x,y) Gauss points due to opposite windings).
       is_zface = boundary_2d .and. abs(abs(norm(3)) - 1.0_DOUBLE) < 1.0e-6_DOUBLE
-      if (order >= 2 .and. n_fvert > 0 .and. allocated(mesh%face(iface)%vert) &
-          .and. .not. is_zface) then
-        ! Quadrature points on face
+
+      ! For z-faces in 2D mode: zero net physics, skip entirely -- before
+      ! touching qpts/qwts at all, so the single-point fast path below
+      ! never allocates/deallocates anything for the (order>=2) branch
+      ! either.
+      if (is_zface) cycle
+
+      ! Order 2 (linear reconstruction) only needs a single centroid flux
+      ! evaluation -- the classical, textbook 2nd-order FV convention.
+      ! Found 2026-09-15: this used to take the multi-point face_quad_pts
+      ! branch at order 2 as well (n_face_quad_pts gives 4 points on a
+      ! quad face there, matching a much higher exactness degree than a
+      ! linear reconstruction needs). Even though wL/wR are each exactly
+      ! linear along the face, the *numerical flux* F(wL,wR) is a
+      ! nonlinear function of them, so the extra points were integrating
+      ! that nonlinearity more accurately than a 2nd-order scheme is
+      ! supposed to -- silently giving order 2 a quadrature-driven
+      ! accuracy boost past its design order, which is why its observed
+      ! rate/error sat suspiciously close to order 3's. Only order>=3
+      ! (a genuinely quadratic reconstruction) needs the multi-point rule.
+      use_face_quad = order >= 3 .and. n_fvert > 0 .and. allocated(mesh%face(iface)%vert)
+
+      if (use_face_quad) then
+        ! Quadrature points on face. face_quad_pts allocates qpts/qwts
+        ! itself (their size varies with n_fvert/order) -- unavoidable
+        ! per-face allocate/deallocate here, but this branch only runs at
+        ! order>=3, and only on genuinely curved/multi-point faces.
+        !
+        ! Found 2026-09-15: convergence order is always polynomial degree
+        ! + 1 (order 1 = degree-0/constant, order 2 = degree-1/affine,
+        ! order 3 = degree-2/quadratic via the Hessian term), and
+        ! quadrature_module's own "order" argument is defined to match
+        ! the polynomial DEGREE being integrated ("order N = exact for
+        ! degree N"), not the solver's convergence order. Passing `order`
+        ! itself here (3 at order=3) asks for degree-3 exactness -- a full
+        ! convergence-order too many -- when the reconstructed state is
+        ! only ever degree `order-1`. Pass `order-1` instead: a quad face
+        ! goes from 9 points (3x3 Gauss, exact to degree 5) down to 4
+        ! (2x2, exact to degree 3), still exact for the degree-2
+        ! reconstructed state, with no accuracy loss.
         allocate(face_coords(3, n_fvert))
         do k = 1, n_fvert
           iv = mesh%face(iface)%vert(k)
           face_coords(:, k) = mesh%vert(iv)%coord
         end do
         call face_quad_pts(int(n_fvert, ENTIER), face_coords, &
-          int(order, ENTIER), qpts, qwts)
+          int(order - 1, ENTIER), qpts, qwts)
         deallocate(face_coords)
+        n_qpts = size(qwts)
       else
-        ! Order 1 or z-face (2D extrusion): single point at face centroid
+        ! Order 1 (or a non-curved face at any order): single point at the
+        ! face centroid. Fixed-size local arrays -- no allocate/deallocate
+        ! at all, since this is the hot path (every face, every RK stage,
+        ! every iteration): millions of alloc/dealloc cycles here were
+        ! found (2026-09-14) to eventually stall OpenMPI's shared-memory
+        ! transport after tens of thousands of iterations (`gdb` on a
+        ! stuck rank always landed in `mca_btl_sm_component_progress` /
+        ! `opal_progress`, inside a `PMPI_Waitall` that never returns).
         n_qpts = 1
-        allocate(qpts(3, 1), qwts(1))
-        qpts(:, 1) = mesh%face(iface)%coord
-        qwts(1)    = mesh%face(iface)%area
+        qpts_single(:, 1) = mesh%face(iface)%coord
+        qwts_single(1)    = mesh%face(iface)%area
       end if
 
-      ! For z-faces in 2D mode: zero net physics, skip entirely
-      if (is_zface) then
-        deallocate(qpts, qwts)
-        cycle
-      end if
-
-      n_qpts = size(qwts)
       do q = 1, n_qpts
-        xface = qpts(:, q)
+        if (use_face_quad) then
+          xface = qpts(:, q)
+          qwt   = qwts(q)
+        else
+          xface = qpts_single(:, q)
+          qwt   = qwts_single(q)
+        end if
 
-        wL = reconstruct(prim, grad, hess, il, xface, mesh%elem(il)%coord)
+        wL = reconstruct(prim, grad, hess, il, xface, mesh%elem(il)%coord, third)
         if (ir > 0) then
-          wR = reconstruct(prim, grad, hess, ir, xface, mesh%elem(ir)%coord)
+          wR = reconstruct(prim, grad, hess, ir, xface, mesh%elem(ir)%coord, third)
         else
           ! Boundary: reconstruct left then apply BC
           wR = ghost_prim(xface, norm, wL, -ir, t)
@@ -1087,24 +1308,34 @@ contains
         ! declaration for why this is an integer compare, not a string one.
         select case (flux_scheme_id)
         case (FLUX_THREE_WAVE)
-          flux = three_wave_flux(wL, wR, norm) * qwts(q)
+          flux = three_wave_flux(wL, wR, norm) * qwt
         case (FLUX_TWO_WAVE)
-          flux = two_wave_flux(wL, wR, norm) * qwts(q)
+          flux = two_wave_flux(wL, wR, norm) * qwt
         case default
-          flux = rusanov(wL, wR, norm) * qwts(q)
+          flux = rusanov(wL, wR, norm) * qwt
         end select
         lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
-                     abs(dot_product(wR(2:4), norm)) + cs(wR)) * qwts(q)
+                     abs(dot_product(wR(2:4), norm)) + cs(wR)) * qwt
 
         rhs(:, il)  = rhs(:, il)  - flux
         sum_lambda(il) = sum_lambda(il) + lambda
-        if (ir > 0 .and. .not. mesh%elem(ir)%is_ghost) then
-          rhs(:, ir)     = rhs(:, ir)     + flux
-          sum_lambda(ir) = sum_lambda(ir) + lambda
+        if (ir > 0) then
+          ! Fortran's .and. does not guarantee short-circuit evaluation
+          ! (unlike C) -- a combined "ir > 0 .and. .not. mesh%elem(ir)%is_ghost"
+          ! let an unoptimized (-O0) build evaluate mesh%elem(ir) even when
+          ! ir was a negative boundary-condition marker, indexing e.g.
+          ! mesh%elem(-3) (found 2026-09-15, cluster debug build with
+          ! -fcheck=bounds; silently read out-of-bounds memory instead of
+          ! crashing in every optimized build up to now). Nest the checks
+          ! instead so ir's sign always gates the array access.
+          if (.not. mesh%elem(ir)%is_ghost) then
+            rhs(:, ir)     = rhs(:, ir)     + flux
+            sum_lambda(ir) = sum_lambda(ir) + lambda
+          end if
         end if
       end do
 
-      deallocate(qpts, qwts)
+      if (use_face_quad) deallocate(qpts, qwts)
     end do
   end subroutine face_flux_loop
 
@@ -1129,33 +1360,50 @@ contains
     ok = .true.
   end function physical_state
 
-  ! Second geometric moment of every cell about its own centroid,
-  ! M_jk(i) = (1/V_i) * int_cell (x_j-xc_j)(x_k-xc_k) dV, needed so that
-  ! reconstruct()'s order-3 (quadratic) Taylor polynomial has the correct
+  ! Second (and, at order>=4, third) geometric moment of every cell about
+  ! its own centroid, M_jk(i) = (1/V_i) * int_cell (x_j-xc_j)(x_k-xc_k) dV
+  ! [and M_jkl(i), the same one degree up], needed so that reconstruct()'s
+  ! order-3 (quadratic) and order-4 (cubic) Taylor terms have the correct
   ! CELL AVERAGE (equal to the given prim(i)), not merely the correct
   ! VALUE at the centroid -- for an affine field the two coincide (the
   ! moment of a linear term vanishes by definition of the centroid), but
-  ! for a field with real curvature the cell average of x_j*x_k differs
-  ! from xc_j*xc_i by exactly this moment, an O(h^2) bias that a plain
-  ! "prim(i) + grad.dx + 0.5*hess:dxdx" expansion silently carries into
-  ! every order-3 reconstructed value. A pure mesh-geometry quantity,
-  ! independent of order/field/reconstruction source (ls or aho) --
-  ! computed once (call from euler_ho_main right after
-  ! compute_geometry_mesh) and cached in the module-level cell_moment
-  ! array read by reconstruct(). Quadrature order 2 is exact for this
-  ! (degree-2 integrand), regardless of the solver's own order.
+  ! for a field with real curvature the cell average of a degree-p monomial
+  ! differs from its centroid value by exactly this moment, an O(h^p) bias
+  ! that a plain Taylor expansion would otherwise silently carry into every
+  ! reconstructed value. Each Taylor term's own moment correction is
+  ! independent of the others (integration is linear, so the mean of the
+  ! full polynomial is just the sum of each term's own mean) -- adding the
+  ! cubic term never changes the existing quadratic correction. A pure
+  ! mesh-geometry quantity, independent of field/reconstruction source (ls
+  ! or aho) -- computed once (call from euler_ho_main right after
+  ! compute_geometry_mesh) and cached in the module-level cell_moment /
+  ! cell_moment3 arrays read by reconstruct(). Quadrature order 2 is exact
+  ! for M_jk (a degree-2 integrand); M_jkl needs order 3 (degree-3), so
+  ! cell_moment3 is only allocated/filled at order>=4, using that pricier
+  ! rule for both moments together rather than allocating two separate
+  ! quadratures per cell.
   subroutine compute_cell_moments(mesh)
     type(mesh_type), intent(in) :: mesh
 
-    integer(kind=ENTIER) :: i, k, n_v
+    integer(kind=ENTIER) :: i, k, n_v, quad_order
     real(kind=DOUBLE), dimension(:, :), allocatable :: vcoords, pts
     real(kind=DOUBLE), dimension(:), allocatable :: wts
     real(kind=DOUBLE), dimension(3) :: xc
-    integer(kind=ENTIER) :: jj, kk
+    integer(kind=ENTIER) :: jj, kk, ll
+    logical :: need_third
+
+    need_third = (order >= 4)
+    quad_order = merge(3_ENTIER, 2_ENTIER, need_third)
 
     if (allocated(cell_moment)) deallocate(cell_moment)
     allocate(cell_moment(3, 3, mesh%n_elems))
     cell_moment = 0.0_DOUBLE
+
+    if (allocated(cell_moment3)) deallocate(cell_moment3)
+    if (need_third) then
+      allocate(cell_moment3(3, 3, 3, mesh%n_elems))
+      cell_moment3 = 0.0_DOUBLE
+    end if
 
     do i = 1, mesh%n_elems
       n_v = mesh%elem(i)%n_vert
@@ -1164,7 +1412,7 @@ contains
       do k = 1, n_v
         vcoords(:, k) = mesh%vert(mesh%elem(i)%vert(k))%coord
       end do
-      call volume_quad_pts(n_v, vcoords, 2_ENTIER, pts, wts)
+      call volume_quad_pts(n_v, vcoords, quad_order, pts, wts)
       deallocate(vcoords)
 
       xc = mesh%elem(i)%coord
@@ -1174,24 +1422,39 @@ contains
             / max(mesh%elem(i)%volume, 1.0e-300_DOUBLE)
         end do
       end do
+      if (need_third) then
+        do jj = 1, 3
+          do kk = 1, 3
+            do ll = 1, 3
+              cell_moment3(jj, kk, ll, i) = sum(wts * (pts(jj, :) - xc(jj)) &
+                * (pts(kk, :) - xc(kk)) * (pts(ll, :) - xc(ll))) &
+                / max(mesh%elem(i)%volume, 1.0e-300_DOUBLE)
+            end do
+          end do
+        end do
+      end if
       deallocate(pts, wts)
     end do
   end subroutine compute_cell_moments
 
   ! Polynomial reconstruction of primitive variable w at point xq from cell i.
   ! Hierarchical fallback: if an order-p reconstruction gives unphysical
-  ! rho or p, it is replaced by the order-(p-1) result.
-  function reconstruct(prim, grad, hess, i, xq, xc) result(w)
+  ! rho or p, it is replaced by the order-(p-1) result. `third` (the
+  ! order-4 cubic term) is optional, allocatable-but-absent-when-unused
+  ! exactly like `hess` already is, so every existing call site that only
+  ! ever ran at order<=3 compiles and behaves unchanged without passing it.
+  function reconstruct(prim, grad, hess, i, xq, xc, third) result(w)
     real(kind=DOUBLE), dimension(:, :),          intent(in) :: prim    ! (5, n_elems)
     real(kind=DOUBLE), dimension(:, :, :),       intent(in) :: grad    ! (5, 3, n_elems)
     real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(in) :: hess
     integer(kind=ENTIER), intent(in) :: i
     real(kind=DOUBLE), dimension(3), intent(in) :: xq, xc
+    real(kind=DOUBLE), dimension(:, :, :, :, :), allocatable, intent(in), optional :: third
     real(kind=DOUBLE), dimension(5) :: w
 
     real(kind=DOUBLE), dimension(3) :: dx
-    real(kind=DOUBLE), dimension(5) :: w_try
-    integer(kind=ENTIER) :: j, k
+    real(kind=DOUBLE), dimension(5) :: w_try, w_prev
+    integer(kind=ENTIER) :: j, k, l
 
     dx = xq - xc
     w  = prim(:, i)
@@ -1221,6 +1484,38 @@ contains
         end do
       end do
       if (physical_state(w_try, prim(:, i))) w = w_try
+    end if
+
+    if (order >= 4 .and. present(third)) then
+      if (allocated(third)) then
+        if (.not. allocated(cell_moment3)) then
+          print *, 'FATAL: reconstruct() called at order>=4 but compute_cell_moments ', &
+            'never filled cell_moment3 (order was not yet 4 when it ran, or it was ', &
+            'never called) -- the order-4 cubic term would silently carry the wrong ', &
+            'cell average. Call compute_cell_moments(mesh) once, at order=4, right ', &
+            'after compute_geometry_mesh.'
+          error stop 1
+        end if
+        ! Same pattern one degree up: cell value + gradient + Hessian
+        ! (with its own moment correction, unchanged by adding this term --
+        ! see compute_cell_moments' header) + cubic term, minus the
+        ! cell's own third-moment bias, so this polynomial's cell average
+        ! is still exactly prim(:,i). w_prev is the order-3 candidate
+        ! from just above (already validated against physical_state); the
+        ! order-4 candidate falls back to it, not all the way to order 2,
+        ! if the cubic term alone pushes the state unphysical.
+        w_prev = w
+        w_try = w_prev
+        do j = 1, 3
+          do k = 1, 3
+            do l = 1, 3
+              w_try = w_try + (1.0_DOUBLE / 6.0_DOUBLE) * third(:, j, k, l, i) &
+                * (dx(j) * dx(k) * dx(l) - cell_moment3(j, k, l, i))
+            end do
+          end do
+        end do
+        if (physical_state(w_try, w_prev)) w = w_try
+      end if
     end if
 
     ! Enforce positivity (safety net)
@@ -1457,6 +1752,59 @@ contains
     w(4) = 0.0_DOUBLE
     w(5) = w(1)**gamma_gas
   end subroutine vortex_prim
+
+  ! High-order cell average of the exact vortex field, via genuine volume
+  ! quadrature -- works for any cell type volume_quad_pts supports (hex,
+  ! tet, prism, pyramid), unlike the z-face-projection trick this
+  ! replaced (init_sol's case(2) and compute_error_vortex both used to
+  ! find a face with norm ~= +-z and integrate over IT instead, exact
+  ! only because a hex/quad cell on the boundary_2d single-layer-extrusion
+  ! convention is guaranteed to have one; a tet cell essentially never
+  ! does, so that approach silently fell back to a point value at the
+  ! centroid there -- a real, if asymptotically vanishing, bias on a
+  ! genuinely 3D tet mesh). Degree-3 quadrature is far more than this
+  ! smooth (Gaussian-profile) field's own accuracy needs at any mesh size
+  ! tested, so it is not the bottleneck at any order; unsupported cell
+  ! kinds fall back to the point value at the centroid, same as
+  ! compute_cell_moments does for its own moments.
+  subroutine vortex_cell_average(mesh, i, t, w)
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: i
+    real(kind=DOUBLE), intent(in) :: t
+    real(kind=DOUBLE), dimension(5), intent(out) :: w
+
+    integer(kind=ENTIER) :: n_v, k, q
+    real(kind=DOUBLE), dimension(:, :), allocatable :: vcoords, pts
+    real(kind=DOUBLE), dimension(:), allocatable :: wts
+    real(kind=DOUBLE), dimension(5) :: w_sum, wq
+    real(kind=DOUBLE) :: vol_q
+
+    n_v = mesh%elem(i)%n_vert
+    if (n_v /= 4 .and. n_v /= 5 .and. n_v /= 6 .and. n_v /= 8) then
+      call vortex_prim(mesh%elem(i)%coord, t, w)
+      return
+    end if
+
+    allocate(vcoords(3, n_v))
+    do k = 1, n_v
+      vcoords(:, k) = mesh%vert(mesh%elem(i)%vert(k))%coord
+    end do
+    call volume_quad_pts(n_v, vcoords, 3_ENTIER, pts, wts)
+    deallocate(vcoords)
+
+    w_sum = 0.0_DOUBLE; vol_q = 0.0_DOUBLE
+    do q = 1, size(wts)
+      call vortex_prim(pts(:, q), t, wq)
+      w_sum = w_sum + wts(q) * wq
+      vol_q = vol_q + wts(q)
+    end do
+    if (vol_q > 0.0_DOUBLE) then
+      w = w_sum / vol_q
+    else
+      call vortex_prim(mesh%elem(i)%coord, t, w)
+    end if
+    deallocate(pts, wts)
+  end subroutine vortex_cell_average
 
   ! Classical double Mach reflection (Woodward & Colella 1984): a Mach-10
   ! shock, inclined 60 deg to the x-axis, initially touching the x-axis at

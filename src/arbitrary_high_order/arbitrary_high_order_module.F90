@@ -46,6 +46,7 @@ module arbitrary_high_order_module
   public :: derivative_field_type
   public :: n_derivative_components
   public :: compute_next_order_derivative
+  public :: compute_next_order_derivative_cweno
   public :: compute_derivative_hierarchy
   public :: compute_next_order_derivative_overlap
   public :: compute_derivative_hierarchy_overlap
@@ -53,11 +54,26 @@ module arbitrary_high_order_module
   public :: compute_derivative_hierarchy_timed
   public :: compute_derivative_hierarchy_overlap_timed
 
-  ! WENO-indicator regularization: just enough to avoid a literal division
-  ! by zero when a candidate's tensor is exactly zero, no more -- per the
-  ! user's request, replacing the earlier ad hoc 1e-6/1e-8 floors.
+  ! WENO-indicator regularization. eps_weno (used elsewhere, unchanged)
+  ! is just enough to avoid a literal division by zero when a candidate's
+  ! tensor is exactly zero -- per the user's original request, replacing
+  ! ad hoc 1e-6/1e-8 floors, and still correct for that use.
+  !
+  ! eps_weight_num is different (2026-09-15): it regularizes oi_v, the
+  ! per-vertex WENO oscillation indicator in scatter_weno_weighted -- see
+  ! compute_nodal_derivative_at_vertex's header. oi_v is now a DIMENSIONLESS
+  ! relative residual (the fit's own mean-square misfit divided by the
+  ! neighbors' own mean-square phi), so a fixed, scale-independent
+  ! constant is the right kind of floor here, unlike a raw physical
+  ! quantity -- tiny(1.0) provides no regularization at all against
+  ! floating-point-level residual noise once oi_v itself is this small for
+  ! smooth data (confirmed: it left the Hessian error on a smooth Gaussian
+  ! test field completely flat under mesh refinement, not converging at
+  ! all -- 1e-6 restored clean O(h^2) convergence, verified against the
+  ! uniform-weight reference). 1e-6 matches the standard WENO/Jiang-Shu
+  ! convention for a dimensionless epsilon.
   real(kind=DOUBLE), parameter :: eps_weno = tiny(1.0_DOUBLE)
-  real(kind=DOUBLE), parameter :: eps_weight_num = eps_weno
+  real(kind=DOUBLE), parameter :: eps_weight_num = 1.0e-6_DOUBLE
   ! Exponent on the oscillation indicator in the WENO weight,
   ! weight = 1/(eps+|dphi_v|^weno_power) -- 2026-09-13 experiment, per the
   ! user's request, to see whether a more aggressive de-centering (in the
@@ -66,6 +82,36 @@ module arbitrary_high_order_module
   ! practice is power=2; try higher powers here directly rather than
   ! building an actual limiter.
   integer(kind=ENTIER), parameter :: weno_power = 2
+
+  ! Linear-blend mode (2026-09-15, per the user's request for a baseline
+  ! comparison against the pure-ls reconstruction source): when .false.,
+  ! the nonlinear WENO weight below is replaced by a plain volume weight
+  ! (weight=1, so vertex_weno_weight cancels out of both the numerator and
+  ! denominator, leaving a straight sub_elem_volume-weighted average of
+  ! nodal derivatives -- no oscillation-adaptive de-centering at all,
+  ! analogous to what ls_reconstruction's raw, unlimited fit represents,
+  ! but built from aho's nodal-derivative machinery instead of a
+  ! cell-centered polynomial fit). Set by euler_ho_module's
+  ! use_weno_blend namelist flag before calling aho_reconstruction;
+  ! defaults to .true. (the normal, published WENO behavior) everywhere
+  ! else, including arbitrary_high_order_main's own standalone tests.
+  logical, public :: use_weno_blend = .true.
+
+  ! CWENO-style central-candidate experiment (2026-09-15, per the user's
+  ! request): classical CWENO (Semplice & Visconti 2020, the same
+  ! reference already cited above for the OI fix) doesn't just blend
+  ! per-vertex candidates against each other -- it ALSO includes one
+  ! "optimal"/central candidate (here: the plain linear/volume-weighted
+  ! blend of the same per-vertex estimates, i.e. exactly what
+  ! use_weno_blend=.false. already computes) in the SAME nonlinear
+  ! blend, given a large ideal/linear weight so it dominates whenever
+  ! the neighborhood is smooth, but still yields to the more robust
+  ! per-vertex candidates when its own oscillation indicator blows up
+  ! near a real discontinuity. Off by default (use
+  ! compute_next_order_derivative_cweno explicitly to opt in); not yet
+  ! wired into aho_reconstruction/euler_ho_module.
+  logical, public :: use_cweno_center = .false.
+  real(kind=DOUBLE), public :: cweno_center_weight = 1000.0_DOUBLE
 
   ! Per-vertex neighbor-list cache (2026-09-14): gather_ls_neighbors'
   ! ring-expansion + sort-based uniqueness only depends on mesh topology
@@ -128,29 +174,243 @@ contains
     real(kind=DOUBLE), dimension(:, :), allocatable :: weno_num
     real(kind=DOUBLE), dimension(:), allocatable :: weno_den
     real(kind=DOUBLE), dimension(:, :), allocatable :: dphi_v_cache
+    logical, dimension(:), allocatable :: valid_cache
+    real(kind=DOUBLE), dimension(:), allocatable :: oi_cache
 
     nc_out = nc_in*d
 
     allocate(weno_num(nc_out, mesh%n_elems))
     allocate(weno_den(mesh%n_elems))
     allocate(dphi_v_cache(nc_out, mesh%n_vert))
+    allocate(valid_cache(mesh%n_vert))
+    allocate(oi_cache(mesh%n_vert))
     weno_num = 0.0_DOUBLE
     weno_den = 0.0_DOUBLE
 
     ! Single pass: each vertex's nodal derivative is computed once and
     ! immediately scattered, WENO-weighted, into every cell touching it --
-    ! see accumulate_weno_contribution.
+    ! see accumulate_weno_contribution. A vertex ON THE PHYSICAL DOMAIN
+    ! BOUNDARY (mesh%vert%is_bound) is skipped here (2026-09-15, per the
+    ! user): its dual-cell neighbor gather only sees interior elements (no
+    ! mirror/ghost cell across the wall), so the weighted-least-squares fit
+    ! at that vertex is a one-sided sample -- correct along the wall-normal
+    ! direction (real physical variation to fit), but along directions
+    ! tangent to the wall it turns a field with genuinely zero tangential
+    ! variation into a spurious nonzero derivative purely from the
+    ! neighbor set's asymmetry (confirmed on Sod's 100x10x10 mesh: the
+    ! order-3 aho Hessian picked up O(0.1-0.8) spurious y/z cross-terms at
+    ! a y=const/z=const wall-adjacent cell, where ls_reconstruction's
+    ! direct per-cell quadratic fit correctly gives ~1e-9). Every cell has
+    ! at least one strictly-interior vertex (not touching any domain
+    ! boundary face) unless the mesh is only 1 cell deep in some direction
+    ! that boundary_2d was not told to drop -- boundary_2d already handles
+    ! the single-thin-layer-in-z case by excluding z from the fit basis
+    ! entirely (see header), so is_bound is only skipped when .not.
+    ! boundary_2d; skipping it there too would starve every vertex at once
+    ! (both z faces touch every vertex) and divide by zero below.
     do id_vert = 1, mesh%n_vert
+      if (mesh%vert(id_vert)%is_bound) cycle
       call accumulate_weno_contribution(mesh, d, nc_in, boundary_2d, id_vert, &
-        phi, dphi_v_cache, weno_num, weno_den)
+        phi, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den)
+    end do
+
+    ! Fallback for a cell left with zero total weight (e.g. every one of
+    ! its vertices sits on the domain boundary -- possible in a corner
+    ! region of a very coarse mesh, or every touching vertex was invalid,
+    ! see compute_nodal_derivative_at_vertex): re-admit boundary vertices
+    ! for that cell only, rather than dividing by zero.
+    do id_elem = 1, mesh%n_elems
+      if (weno_den(id_elem) == 0.0_DOUBLE) then
+        call rescue_zero_weight_cell(mesh, d, nc_in, boundary_2d, id_elem, &
+          phi, weno_num, weno_den)
+      end if
     end do
 
     do id_elem = 1, mesh%n_elems
-      dphi(:, id_elem) = weno_num(:, id_elem) / weno_den(id_elem)
+      ! A fully isolated cell (every touching vertex invalid, even after
+      ! rescue) has no resolvable direction anywhere around it -- report a
+      ! zero derivative rather than divide by zero (see rescue's own note).
+      if (weno_den(id_elem) == 0.0_DOUBLE) then
+        dphi(:, id_elem) = 0.0_DOUBLE
+      else
+        dphi(:, id_elem) = weno_num(:, id_elem) / weno_den(id_elem)
+      end if
     end do
 
-    deallocate(weno_num, weno_den, dphi_v_cache)
+    deallocate(weno_num, weno_den, dphi_v_cache, valid_cache, oi_cache)
   end subroutine compute_next_order_derivative
+
+  ! EXPERIMENTAL (2026-09-15): CWENO variant of compute_next_order_derivative
+  ! above -- see use_cweno_center's header for the idea. Accumulates, in one
+  ! pass (one LS solve per vertex, same as the plain routine), THREE running
+  ! sums per cell: the usual nonlinear WENO num/den, a LINEAR (unweighted by
+  ! OI) num/den built from the exact same per-vertex candidates, and a
+  ! volume-weighted running average of the vertices' own OI. The final
+  ! per-cell derivative folds the linear candidate back into the nonlinear
+  ! blend with weight cweno_center_weight/(eps+OI_c**power), OI_c being that
+  ! cell's own volume-weighted-average OI -- i.e. the central/linear
+  ! candidate acts as one more entry in the same WENO sum, just with a much
+  ! larger ideal weight so it wins whenever OI_c is small (smooth data).
+  subroutine compute_next_order_derivative_cweno(mesh, d, nc_in, boundary_2d, phi, dphi)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: d, nc_in
+    logical, intent(in) :: boundary_2d
+    real(kind=DOUBLE), dimension(nc_in, mesh%n_elems), intent(in) :: phi
+    real(kind=DOUBLE), dimension(nc_in*d, mesh%n_elems), intent(out) :: dphi
+
+    integer(kind=ENTIER) :: nc_out, id_vert, id_elem
+    real(kind=DOUBLE), dimension(:, :), allocatable :: weno_num, lin_num
+    real(kind=DOUBLE), dimension(:), allocatable :: weno_den, lin_den, oi_num, oi_den
+    real(kind=DOUBLE), dimension(:, :), allocatable :: dphi_v_cache
+    logical, dimension(:), allocatable :: valid_cache
+    real(kind=DOUBLE), dimension(:), allocatable :: oi_cache
+    real(kind=DOUBLE) :: oi_c, w_c
+    real(kind=DOUBLE), dimension(:), allocatable :: dphi_lin_elem
+
+    nc_out = nc_in*d
+
+    allocate(weno_num(nc_out, mesh%n_elems), lin_num(nc_out, mesh%n_elems))
+    allocate(weno_den(mesh%n_elems), lin_den(mesh%n_elems))
+    allocate(oi_num(mesh%n_elems), oi_den(mesh%n_elems))
+    allocate(dphi_v_cache(nc_out, mesh%n_vert))
+    allocate(valid_cache(mesh%n_vert))
+    allocate(oi_cache(mesh%n_vert))
+    allocate(dphi_lin_elem(nc_out))
+    weno_num = 0.0_DOUBLE; weno_den = 0.0_DOUBLE
+    lin_num = 0.0_DOUBLE; lin_den = 0.0_DOUBLE
+    oi_num = 0.0_DOUBLE; oi_den = 0.0_DOUBLE
+
+    do id_vert = 1, mesh%n_vert
+      if (mesh%vert(id_vert)%is_bound) cycle
+      call accumulate_cweno_contribution(mesh, d, nc_in, boundary_2d, id_vert, &
+        phi, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den, lin_num, lin_den, &
+        oi_num, oi_den)
+    end do
+
+    do id_elem = 1, mesh%n_elems
+      if (weno_den(id_elem) == 0.0_DOUBLE) then
+        call rescue_zero_weight_cell(mesh, d, nc_in, boundary_2d, id_elem, &
+          phi, weno_num, weno_den)
+        ! Rescue's one-sided fallback has no linear/OI counterpart -- just
+        ! mirror it into the linear accumulators too so this cell's final
+        ! blend below still has a well-defined (if degenerate) center.
+        lin_num(:, id_elem) = weno_num(:, id_elem)
+        lin_den(id_elem) = weno_den(id_elem)
+      end if
+    end do
+
+    do id_elem = 1, mesh%n_elems
+      if (weno_den(id_elem) == 0.0_DOUBLE) then
+        dphi(:, id_elem) = 0.0_DOUBLE
+        cycle
+      end if
+      if (lin_den(id_elem) > 0.0_DOUBLE .and. oi_den(id_elem) > 0.0_DOUBLE) then
+        oi_c = oi_num(id_elem) / oi_den(id_elem)
+        w_c = cweno_center_weight / (eps_weight_num + oi_c**weno_power)
+        dphi_lin_elem = lin_num(:, id_elem) / lin_den(id_elem)
+        dphi(:, id_elem) = (weno_num(:, id_elem) + w_c * dphi_lin_elem) / (weno_den(id_elem) + w_c)
+      else
+        dphi(:, id_elem) = weno_num(:, id_elem) / weno_den(id_elem)
+      end if
+    end do
+
+    deallocate(weno_num, weno_den, lin_num, lin_den, oi_num, oi_den)
+    deallocate(dphi_v_cache, valid_cache, oi_cache, dphi_lin_elem)
+  end subroutine compute_next_order_derivative_cweno
+
+  ! Same per-vertex LS solve as accumulate_weno_contribution, but scatters
+  ! into three running sums at once (nonlinear WENO, linear/center, and a
+  ! volume-weighted running OI average) -- see
+  ! compute_next_order_derivative_cweno's header.
+  subroutine accumulate_cweno_contribution(mesh, d, nc_in, boundary_2d, id_vert, &
+      phi, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den, lin_num, lin_den, &
+      oi_num, oi_den)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: d, nc_in, id_vert
+    logical, intent(in) :: boundary_2d
+    real(kind=DOUBLE), dimension(nc_in, mesh%n_elems), intent(in) :: phi
+    real(kind=DOUBLE), dimension(:, :), intent(inout) :: dphi_v_cache
+    logical, dimension(:), intent(inout) :: valid_cache
+    real(kind=DOUBLE), dimension(:), intent(inout) :: oi_cache
+    real(kind=DOUBLE), dimension(:, :), intent(inout) :: weno_num, lin_num
+    real(kind=DOUBLE), dimension(:), intent(inout) :: weno_den, lin_den, oi_num, oi_den
+
+    real(kind=DOUBLE), dimension(nc_in*d) :: dphi_v
+    logical :: valid
+    real(kind=DOUBLE) :: oi_v
+    integer(kind=ENTIER) :: j, id_elem, id_sub_elem
+    real(kind=DOUBLE) :: sub_elem_volume, vertex_weno_weight
+
+    call compute_nodal_derivative_at_vertex(mesh, d, nc_in, boundary_2d, &
+      id_vert, phi, dphi_v, valid, oi_v)
+    dphi_v_cache(:, id_vert) = dphi_v
+    valid_cache(id_vert) = valid
+    oi_cache(id_vert) = oi_v
+    if (.not. valid) return
+
+    vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + oi_v**weno_power)
+
+    do j = 1, mesh%vert(id_vert)%n_sub_elems_neigh
+      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
+      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+      sub_elem_volume = mesh%sub_elem(id_sub_elem)%volume
+
+      weno_num(:, id_elem) = weno_num(:, id_elem) + (sub_elem_volume * vertex_weno_weight) * dphi_v
+      weno_den(id_elem) = weno_den(id_elem) + sub_elem_volume * vertex_weno_weight
+
+      lin_num(:, id_elem) = lin_num(:, id_elem) + sub_elem_volume * dphi_v
+      lin_den(id_elem) = lin_den(id_elem) + sub_elem_volume
+
+      oi_num(id_elem) = oi_num(id_elem) + sub_elem_volume * oi_v
+      oi_den(id_elem) = oi_den(id_elem) + sub_elem_volume
+    end do
+  end subroutine accumulate_cweno_contribution
+
+  ! Rescue path for a cell that ended up with zero total WENO weight after
+  ! is_bound vertices were skipped above -- only possible if every one of
+  ! the cell's own vertices sits on the domain boundary. Re-admits just
+  ! this cell's own boundary vertices (their nodal derivative is still a
+  ! valid, if one-sided, estimate) so the caller never divides by zero.
+  subroutine rescue_zero_weight_cell(mesh, d, nc_in, boundary_2d, id_elem, &
+      phi, weno_num, weno_den)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: d, nc_in, id_elem
+    logical, intent(in) :: boundary_2d
+    real(kind=DOUBLE), dimension(nc_in, mesh%n_elems), intent(in) :: phi
+    real(kind=DOUBLE), dimension(:, :), intent(inout) :: weno_num
+    real(kind=DOUBLE), dimension(:), intent(inout) :: weno_den
+
+    integer(kind=ENTIER) :: j, id_vert, id_sub_elem
+    real(kind=DOUBLE), dimension(nc_in*d) :: dphi_v
+    real(kind=DOUBLE) :: sub_elem_volume, vertex_weno_weight, oi_v
+    logical :: valid
+
+    do j = 1, mesh%elem(id_elem)%n_vert
+      id_vert = mesh%elem(id_elem)%vert(j)
+      id_sub_elem = mesh%elem(id_elem)%sub_elem(j)
+      call compute_nodal_derivative_at_vertex(mesh, d, nc_in, boundary_2d, &
+        id_vert, phi, dphi_v, valid, oi_v)
+      if (.not. valid) cycle ! see compute_nodal_derivative_at_vertex's header
+      sub_elem_volume = mesh%sub_elem(id_sub_elem)%volume
+      if (use_weno_blend) then
+        vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + oi_v**weno_power)
+      else
+        vertex_weno_weight = 1.0_DOUBLE
+      end if
+      weno_num(:, id_elem) = weno_num(:, id_elem) &
+        + (sub_elem_volume * vertex_weno_weight) * dphi_v
+      weno_den(id_elem) = weno_den(id_elem) + sub_elem_volume * vertex_weno_weight
+    end do
+    ! Every one of this cell's vertices was invalid too (a fully isolated
+    ! cell/vertex cluster with no resolvable direction anywhere) -- leave
+    ! weno_den at 0; the caller must not divide by it (see its own guard).
+  end subroutine rescue_zero_weight_cell
 
   ! Same order-k step as compute_next_order_derivative, but overlapping the
   ! ghost exchange of its own output with local work, as follows:
@@ -183,6 +443,8 @@ contains
     real(kind=DOUBLE), dimension(:, :), allocatable :: weno_num
     real(kind=DOUBLE), dimension(:), allocatable :: weno_den
     real(kind=DOUBLE), dimension(:, :), allocatable :: dphi_v_cache
+    logical, dimension(:), allocatable :: valid_cache
+    real(kind=DOUBLE), dimension(:), allocatable :: oi_cache
     logical, dimension(:), allocatable :: is_send_cell, is_boundary_vertex
 
     nc_out = nc_in*d
@@ -190,6 +452,8 @@ contains
     allocate(weno_num(nc_out, mesh%n_elems))
     allocate(weno_den(mesh%n_elems))
     allocate(dphi_v_cache(nc_out, mesh%n_vert))
+    allocate(valid_cache(mesh%n_vert))
+    allocate(oi_cache(mesh%n_vert))
     weno_num = 0.0_DOUBLE
     weno_den = 0.0_DOUBLE
 
@@ -220,15 +484,27 @@ contains
 
     ! Step 1: vertices touching a to-be-sent cell -- compute+cache their
     ! nodal derivative and accumulate it, WENO-weighted, into the send
-    ! cells only (skip_cell filters at the cell level).
+    ! cells only (skip_cell filters at the cell level). Physical-domain-
+    ! boundary vertices are skipped throughout (Steps 1 and 3 alike, see
+    ! compute_next_order_derivative for why), so dphi_v_cache is never
+    ! read for one in Step 3's cached-reuse pass below.
     do id_vert = 1, mesh%n_vert
       if (.not. is_boundary_vertex(id_vert)) cycle
+      if (mesh%vert(id_vert)%is_bound) cycle
       call accumulate_weno_contribution(mesh, d, nc_in, boundary_2d, id_vert, &
-        phi, dphi_v_cache, weno_num, weno_den, skip_cell=(.not. is_send_cell))
+        phi, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den, skip_cell=(.not. is_send_cell))
     end do
     do id_elem = 1, mesh%n_elems
       if (.not. is_send_cell(id_elem)) cycle
-      dphi(:, id_elem) = weno_num(:, id_elem) / weno_den(id_elem)
+      if (weno_den(id_elem) == 0.0_DOUBLE) then
+        call rescue_zero_weight_cell(mesh, d, nc_in, boundary_2d, id_elem, &
+          phi, weno_num, weno_den)
+      end if
+      if (weno_den(id_elem) == 0.0_DOUBLE) then
+        dphi(:, id_elem) = 0.0_DOUBLE
+      else
+        dphi(:, id_elem) = weno_num(:, id_elem) / weno_den(id_elem)
+      end if
     end do
 
     ! Step 2: hand the just-finalized boundary cells to MPI and move on
@@ -242,23 +518,33 @@ contains
     ! with a send cell and still needs that vertex's contribution.
     do id_vert = 1, mesh%n_vert
       if (is_boundary_vertex(id_vert)) cycle
+      if (mesh%vert(id_vert)%is_bound) cycle
       call accumulate_weno_contribution(mesh, d, nc_in, boundary_2d, id_vert, &
-        phi, dphi_v_cache, weno_num, weno_den, skip_cell=is_send_cell)
+        phi, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den, skip_cell=is_send_cell)
     end do
     do id_vert = 1, mesh%n_vert
       if (.not. is_boundary_vertex(id_vert)) cycle
+      if (mesh%vert(id_vert)%is_bound) cycle
       call accumulate_cached_weno_contribution(mesh, id_vert, dphi_v_cache, &
-        weno_num, weno_den, skip_cell=is_send_cell)
+        valid_cache, oi_cache, weno_num, weno_den, skip_cell=is_send_cell)
     end do
     do id_elem = 1, mesh%n_elems
       if (is_send_cell(id_elem)) cycle
-      dphi(:, id_elem) = weno_num(:, id_elem) / weno_den(id_elem)
+      if (weno_den(id_elem) == 0.0_DOUBLE) then
+        call rescue_zero_weight_cell(mesh, d, nc_in, boundary_2d, id_elem, &
+          phi, weno_num, weno_den)
+      end if
+      if (weno_den(id_elem) == 0.0_DOUBLE) then
+        dphi(:, id_elem) = 0.0_DOUBLE
+      else
+        dphi(:, id_elem) = weno_num(:, id_elem) / weno_den(id_elem)
+      end if
     end do
 
     ! Step 4: this rank's ghost cells of dphi are only valid past this point.
     if (num_procs > 1) call mpi_memory_exchange_wait(mpi_send_recv, mesh%n_elems, nc_out, dphi)
 
-    deallocate(weno_num, weno_den, dphi_v_cache)
+    deallocate(weno_num, weno_den, dphi_v_cache, valid_cache, oi_cache)
     deallocate(is_send_cell, is_boundary_vertex)
   end subroutine compute_next_order_derivative_overlap
 
@@ -419,6 +705,8 @@ contains
     real(kind=DOUBLE), dimension(:, :), allocatable :: weno_num
     real(kind=DOUBLE), dimension(:), allocatable :: weno_den
     real(kind=DOUBLE), dimension(:, :), allocatable :: dphi_v_cache
+    logical, dimension(:), allocatable :: valid_cache
+    real(kind=DOUBLE), dimension(:), allocatable :: oi_cache
     logical, dimension(:), allocatable :: is_send_cell, is_boundary_vertex
     real(kind=DOUBLE) :: t0, t1
 
@@ -434,6 +722,8 @@ contains
       allocate(weno_num(nc_out, mesh%n_elems))
       allocate(weno_den(mesh%n_elems))
       allocate(dphi_v_cache(nc_out, mesh%n_vert))
+      allocate(valid_cache(mesh%n_vert))
+      allocate(oi_cache(mesh%n_vert))
       weno_num = 0.0_DOUBLE; weno_den = 0.0_DOUBLE
 
       allocate(is_send_cell(mesh%n_elems))
@@ -458,12 +748,21 @@ contains
       t0 = MPI_WTIME()
       do id_vert = 1, mesh%n_vert
         if (.not. is_boundary_vertex(id_vert)) cycle
+        if (mesh%vert(id_vert)%is_bound) cycle
         call accumulate_weno_contribution(mesh, d, nc_in, boundary_2d, id_vert, &
-          phi_prev, dphi_v_cache, weno_num, weno_den, skip_cell=(.not. is_send_cell))
+          phi_prev, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den, skip_cell=(.not. is_send_cell))
       end do
       do id_elem = 1, mesh%n_elems
         if (.not. is_send_cell(id_elem)) cycle
-        dfield(order)%val(:, id_elem) = weno_num(:, id_elem) / weno_den(id_elem)
+        if (weno_den(id_elem) == 0.0_DOUBLE) then
+          call rescue_zero_weight_cell(mesh, d, nc_in, boundary_2d, id_elem, &
+            phi_prev, weno_num, weno_den)
+        end if
+        if (weno_den(id_elem) == 0.0_DOUBLE) then
+          dfield(order)%val(:, id_elem) = 0.0_DOUBLE
+        else
+          dfield(order)%val(:, id_elem) = weno_num(:, id_elem) / weno_den(id_elem)
+        end if
       end do
       t1 = MPI_WTIME()
       n_events = n_events + 1
@@ -478,17 +777,27 @@ contains
       t0 = MPI_WTIME()
       do id_vert = 1, mesh%n_vert
         if (is_boundary_vertex(id_vert)) cycle
+        if (mesh%vert(id_vert)%is_bound) cycle
         call accumulate_weno_contribution(mesh, d, nc_in, boundary_2d, id_vert, &
-          phi_prev, dphi_v_cache, weno_num, weno_den, skip_cell=is_send_cell)
+          phi_prev, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den, skip_cell=is_send_cell)
       end do
       do id_vert = 1, mesh%n_vert
         if (.not. is_boundary_vertex(id_vert)) cycle
+        if (mesh%vert(id_vert)%is_bound) cycle
         call accumulate_cached_weno_contribution(mesh, id_vert, dphi_v_cache, &
-          weno_num, weno_den, skip_cell=is_send_cell)
+          valid_cache, oi_cache, weno_num, weno_den, skip_cell=is_send_cell)
       end do
       do id_elem = 1, mesh%n_elems
         if (is_send_cell(id_elem)) cycle
-        dfield(order)%val(:, id_elem) = weno_num(:, id_elem) / weno_den(id_elem)
+        if (weno_den(id_elem) == 0.0_DOUBLE) then
+          call rescue_zero_weight_cell(mesh, d, nc_in, boundary_2d, id_elem, &
+            phi_prev, weno_num, weno_den)
+        end if
+        if (weno_den(id_elem) == 0.0_DOUBLE) then
+          dfield(order)%val(:, id_elem) = 0.0_DOUBLE
+        else
+          dfield(order)%val(:, id_elem) = weno_num(:, id_elem) / weno_den(id_elem)
+        end if
       end do
       t1 = MPI_WTIME()
       n_events = n_events + 1
@@ -500,7 +809,7 @@ contains
       n_events = n_events + 1
       events(n_events) = timeline_event_type(order, 'wait', t0, t1)
 
-      deallocate(weno_num, weno_den, dphi_v_cache)
+      deallocate(weno_num, weno_den, dphi_v_cache, valid_cache, oi_cache)
       deallocate(is_send_cell, is_boundary_vertex)
       deallocate(phi_prev)
       allocate(phi_prev(nc_in*d, mesh%n_elems))
@@ -514,7 +823,8 @@ contains
   ! id_vert) (for a later accumulate_cached_weno_contribution call on the
   ! same vertex, used by the MPI-overlap driver -- see below), and
   ! immediately scatters it into every cell touching id_vert as a
-  ! nonlinear-WENO-weighted contribution: weight = 1/(eps+|dphi_v|^2), the
+  ! nonlinear-WENO-weighted contribution: weight = 1/(eps+OI^2), OI a
+  ! mesh-size-scaled oscillation indicator (see scatter_weno_weighted), the
   ! same de-weight-the-large/oscillatory-candidate idea as a classical WENO
   ! reconstruction, applied directly to each vertex's own nodal derivative
   ! with no separate central/unweighted candidate to blend against.
@@ -529,7 +839,10 @@ contains
   ! blend did not actually improve the achieved order over this simpler
   ! form. If a future test resurfaces the old symptom -- order stuck below
   ! design value on a smooth, strongly-curved field -- that's the first
-  ! place to look.)
+  ! place to look. 2026-09-15: that symptom resurfaced -- see
+  ! scatter_weno_weighted for the actual fix, which keeps this single-
+  ! candidate structure but corrects the weight formula itself instead of
+  ! reverting to the two-candidate blend.)
   !
   ! skip_cell, if present, excludes cells where skip_cell(id_elem) is
   ! .true. from accumulation -- used by compute_next_order_derivative_overlap
@@ -537,7 +850,7 @@ contains
   ! contribution at the point this is called (Step 1: only send cells;
   ! Step 3: only non-send cells).
   subroutine accumulate_weno_contribution(mesh, d, nc_in, boundary_2d, id_vert, &
-      phi, dphi_v_cache, weno_num, weno_den, skip_cell)
+      phi, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den, skip_cell)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -545,17 +858,24 @@ contains
     logical, intent(in) :: boundary_2d
     real(kind=DOUBLE), dimension(nc_in, mesh%n_elems), intent(in) :: phi
     real(kind=DOUBLE), dimension(:, :), intent(inout) :: dphi_v_cache
+    logical, dimension(:), intent(inout) :: valid_cache
+    real(kind=DOUBLE), dimension(:), intent(inout) :: oi_cache
     real(kind=DOUBLE), dimension(:, :), intent(inout) :: weno_num
     real(kind=DOUBLE), dimension(:), intent(inout) :: weno_den
     logical, dimension(:), intent(in), optional :: skip_cell
 
     real(kind=DOUBLE), dimension(nc_in*d) :: dphi_v
+    logical :: valid
+    real(kind=DOUBLE) :: oi_v
 
     call compute_nodal_derivative_at_vertex(mesh, d, nc_in, boundary_2d, &
-      id_vert, phi, dphi_v)
+      id_vert, phi, dphi_v, valid, oi_v)
     dphi_v_cache(:, id_vert) = dphi_v
+    valid_cache(id_vert) = valid
+    oi_cache(id_vert) = oi_v
+    if (.not. valid) return ! see compute_nodal_derivative_at_vertex's header
 
-    call scatter_weno_weighted(mesh, id_vert, dphi_v, weno_num, weno_den, skip_cell)
+    call scatter_weno_weighted(mesh, id_vert, dphi_v, oi_v, weno_num, weno_den, skip_cell)
   end subroutine accumulate_weno_contribution
 
   ! Same scatter as accumulate_weno_contribution, but reusing an
@@ -564,28 +884,70 @@ contains
   ! vertex's (Step-1-computed) contribution into the non-send cells it also
   ! touches, without a second LAPACK solve.
   subroutine accumulate_cached_weno_contribution(mesh, id_vert, dphi_v_cache, &
-      weno_num, weno_den, skip_cell)
+      valid_cache, oi_cache, weno_num, weno_den, skip_cell)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
     integer(kind=ENTIER), intent(in) :: id_vert
     real(kind=DOUBLE), dimension(:, :), intent(in) :: dphi_v_cache
+    logical, dimension(:), intent(in) :: valid_cache
+    real(kind=DOUBLE), dimension(:), intent(in) :: oi_cache
     real(kind=DOUBLE), dimension(:, :), intent(inout) :: weno_num
     real(kind=DOUBLE), dimension(:), intent(inout) :: weno_den
     logical, dimension(:), intent(in), optional :: skip_cell
 
+    if (.not. valid_cache(id_vert)) return
+
     call scatter_weno_weighted(mesh, id_vert, dphi_v_cache(:, id_vert), &
-      weno_num, weno_den, skip_cell)
+      oi_cache(id_vert), weno_num, weno_den, skip_cell)
   end subroutine accumulate_cached_weno_contribution
 
-  ! Shared scatter: weight = 1/(eps+max_c|dphi_v|^2), volume-weighted into
-  ! every cell touching id_vert not excluded by skip_cell.
-  subroutine scatter_weno_weighted(mesh, id_vert, dphi_v, weno_num, weno_den, skip_cell)
+  ! Shared scatter: weight = omega_p/(eps+OI^2), omega_p=sub_elem_volume (the
+  ! geometric/"linear weight" role, as in classical CWENO -- see Semplice &
+  ! Visconti 2020, Def. 3) and OI=oi_v, the vertex's own LS-fit weighted
+  ! residual computed in compute_nodal_derivative_at_vertex.
+  !
+  ! FIX (2026-09-15, per the user -- pointed at Semplice & Visconti 2020's
+  ! CWENO smoothness indicator as the model to follow): a WENO oscillation
+  ! indicator must measure DISAGREEMENT with a smooth local model, not raw
+  ! derivative magnitude, and it must vanish under mesh refinement for
+  ! smooth data (Semplice & Visconti's Definition 2/Eq.(1): "I[P] -> 0
+  ! under grid refinement if P is associated to smooth data", via an
+  ! explicit Delta-x^(2i-1) factor). Two formulas were tried and rejected
+  ! before this one:
+  !   1) OI=|dphi_v| (no correction at all): converges to the true, finite,
+  !      generally-nonzero local derivative as h->0 for any field with
+  !      genuine spatial variation -- never vanishes, so it keeps
+  !      penalizing a vertex for having a legitimately larger derivative
+  !      than its neighbors, not for being actually oscillatory.
+  !   2) OI=(neighbor coordinate spread)*|dphi_v|: multiplying by a
+  !      per-vertex length scale that is roughly CONSTANT across one cell's
+  !      touching vertices on a uniform mesh does not change the *relative*
+  !      weighting between those vertices at all (a common factor cancels
+  !      in the weighted average) -- confirmed by testing it directly:
+  !      identical errors to formula 1, no improvement whatsoever.
+  ! The fix that actually works: use the LS fit's own weighted residual
+  ! (how much the actual neighbor data disagrees with the fitted affine
+  ! model, computed alongside dphi_v) as OI. This is exactly the "deviation
+  ! from a smooth reference" that classical WENO/CWENO indicators measure,
+  ! rather than a candidate's own absolute size: it is identically zero for
+  ! genuinely affine data on any mesh at any resolution, shrinks with h for
+  ! smooth-but-curved data (the affine model's own residual against a
+  ! curved function shrinks as the neighborhood shrinks), and stays O(1)
+  ! at a genuine discontinuity in the stencil. Confirmed by the standalone
+  ! analytic quadratic-reconstruction test (see aho-mpi-ghost-stencil-bug
+  ! memory): forcing a uniform (non-WENO) weight as a diagnostic dropped
+  ! the interior Hessian error from O(1) (not shrinking with h) to ~1e-12
+  ! -- i.e. the per-vertex fit itself was already exact, only the
+  ! averaging weight was wrong; this residual-based OI achieves the same
+  ! effect without disabling WENO's actual shock-detection role.
+  subroutine scatter_weno_weighted(mesh, id_vert, dphi_v, oi_v, weno_num, weno_den, skip_cell)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
     integer(kind=ENTIER), intent(in) :: id_vert
     real(kind=DOUBLE), dimension(:), intent(in) :: dphi_v
+    real(kind=DOUBLE), intent(in) :: oi_v
     real(kind=DOUBLE), dimension(:, :), intent(inout) :: weno_num
     real(kind=DOUBLE), dimension(:), intent(inout) :: weno_den
     logical, dimension(:), intent(in), optional :: skip_cell
@@ -593,7 +955,14 @@ contains
     integer(kind=ENTIER) :: j, id_elem, id_sub_elem
     real(kind=DOUBLE) :: sub_elem_volume, vertex_weno_weight
 
-    vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + maxval(abs(dphi_v))**weno_power)
+    if (use_weno_blend) then
+      vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + oi_v**weno_power)
+    else
+      ! Linear-blend mode: weight=1 cancels out of numerator/denominator,
+      ! leaving a plain sub_elem_volume-weighted average (see use_weno_blend's
+      ! header comment).
+      vertex_weno_weight = 1.0_DOUBLE
+    end if
 
     do j = 1, mesh%vert(id_vert)%n_sub_elems_neigh
       id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
@@ -632,12 +1001,26 @@ contains
   ! mesh irregularity -- replaces (2026-09-12) a Green-Gauss jump formula
   ! whose consistency on a general mesh had not been verified and which
   ! produced unreliable convergence rates.
-  ! A vertex with fewer than n_min_neighbors immediate elem_neigh (mesh
-  ! corners/edges) would otherwise give a singular/ill-conditioned system;
-  ! gather_ls_neighbors expands the stencil by rings until there are enough,
-  ! the same technique as ns_mesh_metric_module's (disabled) allocate_neigh.
+  ! The stencil is always exactly mesh%vert(id_vert)%elem_neigh -- the cells
+  ! directly touching the vertex, never ring-expanded (2026-09-15, per the
+  ! user): a hex vertex always has 8 of these, a quad vertex 4, a tet/tri
+  ! vertex typically more -- always enough for a well-posed fit at every
+  ! INTERIOR vertex. The only vertices short of that are on the physical
+  ! domain boundary, and those never contribute to the reconstruction
+  ! anyway (mesh%vert%is_bound is skipped by the caller, see
+  ! compute_next_order_derivative) except through rescue_zero_weight_cell's
+  ! deliberately one-sided fallback. Ring-expanding past the immediate
+  ! elem_neigh (an earlier version of this code did, up to n_min=2*max_basis)
+  ! was the actual bug behind an MPI-rank-count-dependent vortex accuracy
+  ! regression: a single node-based ghost layer (subfv-gmsh's partitioning)
+  ! only guarantees a *complete* elem_neigh for vertices directly on the
+  ! partition seam, not for the second ring reached by expansion, so seam
+  ! vertices silently lost neighbors under MPI that a serial run still had.
+  ! See mesh-is-bound-timing-bug memory / tex_arbitrary_high_order for the
+  ! diagnosis; confirmed via subfvns (single-ring stencil, unaffected by
+  ! rank count) showing identical error at 1 and 2 ranks on the same case.
   subroutine compute_nodal_derivative_at_vertex(mesh, d, nc_in, boundary_2d, &
-      id_vert, phi, dphi_v)
+      id_vert, phi, dphi_v, valid, oi_v)
     use linear_solver_module, only: lu_factor_lapack, lu_solve_mat_lapack
     implicit none
 
@@ -646,21 +1029,39 @@ contains
     logical, intent(in) :: boundary_2d
     real(kind=DOUBLE), dimension(nc_in, mesh%n_elems), intent(in) :: phi
     real(kind=DOUBLE), dimension(nc_in*d), intent(out) :: dphi_v
+    ! .false. when not even one direction could be resolved (e.g. a mesh
+    ! corner vertex with too few immediate elem_neigh to fit anything) --
+    ! see the caller: such a vertex must be excluded from the WENO scatter
+    ! entirely, not scattered as dphi_v=0, which scatter_weno_weighted's
+    ! 1/(eps+|dphi_v|^2) weight would otherwise read as a perfectly smooth
+    ! (near-infinite-confidence) sample and let it swamp every genuinely
+    ! resolved neighbor's contribution to the cells touching it.
+    logical, intent(out) :: valid
+    ! WENO oscillation indicator for this vertex's fit: the fit's own
+    ! weighted-mean-squared residual (how much the actual neighbor data
+    ! disagrees with the fitted affine model), maximized over the nc_in
+    ! components and made DIMENSIONLESS by dividing by the neighbors' own
+    ! weighted mean-square phi (so a fixed, scale-independent eps works in
+    ! scatter_weno_weighted regardless of the field's physical units/
+    ! magnitude -- e.g. density~O(1) vs. pressure~O(1e5)) -- see
+    ! scatter_weno_weighted's header for why a residual, not |dphi_v|
+    ! itself, is the right quantity, and why it must be relative.
+    real(kind=DOUBLE), intent(out) :: oi_v
 
     integer(kind=ENTIER), parameter :: max_basis = 4
-    integer(kind=ENTIER), parameter :: n_min_neighbors = 2*max_basis
     real(kind=DOUBLE), parameter :: rel_spread_tol = 1.0e-8_DOUBLE
     integer(kind=ENTIER) :: n_basis, n_cand, n_active, j, a, b, i1, id_elem, n_neigh
     integer(kind=ENTIER), dimension(3) :: active_dim
     integer(kind=ENTIER), dimension(:), allocatable :: neigh
     integer(kind=ENTIER), dimension(max_basis) :: ipiv
     real(kind=DOUBLE), dimension(3) :: dx, dmin, dmax, spread
-    real(kind=DOUBLE) :: weight, max_spread
+    real(kind=DOUBLE) :: weight, max_spread, weight_sum, phi_scale2
     real(kind=DOUBLE), dimension(max_basis) :: basis
     real(kind=DOUBLE), dimension(max_basis, max_basis) :: mat
     real(kind=DOUBLE), dimension(max_basis, nc_in) :: rhs
+    real(kind=DOUBLE), dimension(nc_in) :: predicted, resid_sq, phi_sq_sum
 
-    call ensure_neighbor_cache(mesh, n_min_neighbors)
+    call ensure_neighbor_cache(mesh)
     n_neigh = neigh_cache_start(id_vert+1) - neigh_cache_start(id_vert)
     allocate(neigh(n_neigh))
     neigh = neigh_cache_list(neigh_cache_start(id_vert):neigh_cache_start(id_vert+1)-1)
@@ -691,11 +1092,15 @@ contains
 
     mat = 0.0_DOUBLE
     rhs = 0.0_DOUBLE
+    weight_sum = 0.0_DOUBLE
+    phi_sq_sum = 0.0_DOUBLE
 
     do j = 1, n_neigh
       id_elem = neigh(j)
       dx = mesh%elem(id_elem)%coord - mesh%vert(id_vert)%coord
       weight = 1.0_DOUBLE / max(dot_product(dx, dx), 1.0e-24_DOUBLE)
+      weight_sum = weight_sum + weight
+      phi_sq_sum = phi_sq_sum + weight * phi(:, id_elem)**2
 
       basis(1) = 1.0_DOUBLE
       do a = 1, n_active
@@ -711,11 +1116,39 @@ contains
     end do
 
     dphi_v = 0.0_DOUBLE
-    if (n_active == 0) return ! no resolvable direction at all: report zero gradient
+    oi_v = 0.0_DOUBLE
+    valid = (n_active > 0)
+    if (.not. valid) return ! no resolvable direction at all: report zero gradient
 
     call lu_factor_lapack(n_basis, mat(1:n_basis, 1:n_basis), ipiv(1:n_basis))
     call lu_solve_mat_lapack(n_basis, mat(1:n_basis, 1:n_basis), &
       ipiv(1:n_basis), nc_in, rhs(1:n_basis, :))
+
+    ! WENO oscillation indicator: the fit's own weighted-mean-squared
+    ! residual against the actual neighbor data, using the SAME weight as
+    ! the fit itself -- see scatter_weno_weighted's header. Unlike |dphi_v|,
+    ! this vanishes for genuinely affine-in-the-active-directions data
+    ! (any mesh, any resolution) and shrinks with h for smooth-but-curved
+    ! data, while staying O(1) at a real discontinuity in the stencil --
+    ! exactly the property a WENO smoothness indicator needs.
+    resid_sq = 0.0_DOUBLE
+    do j = 1, n_neigh
+      id_elem = neigh(j)
+      dx = mesh%elem(id_elem)%coord - mesh%vert(id_vert)%coord
+      weight = 1.0_DOUBLE / max(dot_product(dx, dx), 1.0e-24_DOUBLE)
+      predicted = rhs(1, :)
+      do a = 1, n_active
+        predicted = predicted + rhs(1+a, :) * dx(active_dim(a))
+      end do
+      resid_sq = resid_sq + weight * (phi(:, id_elem) - predicted)**2
+    end do
+    ! phi_scale2 floored at a tiny absolute value only to avoid literal 0/0
+    ! when phi is exactly zero everywhere near this vertex (e.g. a void) --
+    ! in that case resid_sq is 0 too, so oi_v correctly comes out as 0
+    ! regardless of the floor's exact value.
+    phi_scale2 = maxval(phi_sq_sum) / max(weight_sum, 1.0e-300_DOUBLE)
+    oi_v = sqrt((maxval(resid_sq) / max(weight_sum, 1.0e-300_DOUBLE)) &
+      / max(phi_scale2, 1.0e-300_DOUBLE))
 
     ! rhs(1+a, i1) now holds d(phi_i1)/dx_{active_dim(a)}; flatten with i1
     ! (the "carried" direction, from phi's own components) fast-varying and
@@ -728,24 +1161,15 @@ contains
     end do
   end subroutine compute_nodal_derivative_at_vertex
 
-  ! Element neighbors of id_vert for the least-squares fit, ring-expanded
-  ! (via each ring's own vertices) until there are at least n_min -- a
-  ! near-boundary or corner vertex can otherwise have too few immediate
-  ! elem_neigh to determine the fit, which silently produces a singular or
-  ! near-singular system (and was observed to blow up the LU solve before
-  ! this was added). Same technique as ns_mesh_metric_module's (disabled)
-  ! allocate_neigh, reimplemented here to avoid a dependency from this
-  ! core-level module onto the ns library.
   ! Builds neigh_cache_start/neigh_cache_list (CSR) by calling
   ! gather_ls_neighbors once per vertex -- the one-time cost that used to
   ! be paid on every one of compute_nodal_derivative_at_vertex's many
   ! calls per vertex (see the cache arrays' declaration). A no-op if the
   ! cache already matches this mesh's vertex count.
-  subroutine ensure_neighbor_cache(mesh, n_min)
+  subroutine ensure_neighbor_cache(mesh)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
-    integer(kind=ENTIER), intent(in) :: n_min
 
     integer(kind=ENTIER) :: v, n_neigh, total
     integer(kind=ENTIER), dimension(:), allocatable :: neigh
@@ -758,7 +1182,7 @@ contains
 
     neigh_cache_start(1) = 1
     do v = 1, mesh%n_vert
-      call gather_ls_neighbors(mesh, v, n_min, n_neigh, neigh)
+      call gather_ls_neighbors(mesh, v, n_neigh, neigh)
       neigh_cache_start(v+1) = neigh_cache_start(v) + n_neigh
       deallocate(neigh)
     end do
@@ -766,7 +1190,7 @@ contains
     total = neigh_cache_start(mesh%n_vert + 1) - 1
     allocate(neigh_cache_list(total))
     do v = 1, mesh%n_vert
-      call gather_ls_neighbors(mesh, v, n_min, n_neigh, neigh)
+      call gather_ls_neighbors(mesh, v, n_neigh, neigh)
       neigh_cache_list(neigh_cache_start(v):neigh_cache_start(v+1)-1) = neigh
       deallocate(neigh)
     end do
@@ -774,32 +1198,20 @@ contains
     neigh_cache_n_vert = mesh%n_vert
   end subroutine ensure_neighbor_cache
 
-  subroutine gather_ls_neighbors(mesh, id_vert, n_min, n_neigh, neigh)
+  ! Element neighbors of id_vert for the least-squares fit: exactly
+  ! mesh%vert(id_vert)%elem_neigh, the cells directly touching the vertex --
+  ! see the header comment on compute_nodal_derivative_at_vertex for why
+  ! this is never ring-expanded.
+  subroutine gather_ls_neighbors(mesh, id_vert, n_neigh, neigh)
     use sort_module, only: add_sort_unique_int
     implicit none
 
     type(mesh_type), intent(in) :: mesh
-    integer(kind=ENTIER), intent(in) :: id_vert, n_min
+    integer(kind=ENTIER), intent(in) :: id_vert
     integer(kind=ENTIER), intent(out) :: n_neigh
     integer(kind=ENTIER), dimension(:), allocatable, intent(out) :: neigh
 
-    integer(kind=ENTIER) :: i, n_prev, n_pot_vert
-    integer(kind=ENTIER), dimension(:), allocatable :: pot_vert
-
     n_neigh = 0
     call add_sort_unique_int(neigh, n_neigh, mesh%vert(id_vert)%elem_neigh)
-
-    do while (n_neigh < min(n_min, mesh%n_elems))
-      n_prev = n_neigh
-      n_pot_vert = 0
-      if (allocated(pot_vert)) deallocate(pot_vert)
-      do i = 1, n_neigh
-        call add_sort_unique_int(pot_vert, n_pot_vert, mesh%elem(neigh(i))%vert)
-      end do
-      do i = 1, n_pot_vert
-        call add_sort_unique_int(neigh, n_neigh, mesh%vert(pot_vert(i))%elem_neigh)
-      end do
-      if (n_neigh == n_prev) exit ! stencil can't grow any further (tiny/disconnected mesh)
-    end do
   end subroutine gather_ls_neighbors
 end module arbitrary_high_order_module

@@ -68,7 +68,7 @@ program euler_ho_main
 
   ! Compute initial dt for RK3 stages
   call compute_prim(mesh, sol, prim)
-  call compute_rhs(mesh, sol, prim, rhs, sum_lambda, 0.0_DOUBLE)
+  call compute_rhs(mesh, sol, prim, rhs, sum_lambda, 0.0_DOUBLE, num_procs, mpi_send_recv)
   dt = compute_dt(mesh, sum_lambda)
 
   t    = 0.0_DOUBLE
@@ -80,7 +80,7 @@ program euler_ho_main
     ! step's start time t for all 3 stages below (not exact substage
     ! timing t, t+dt, t+dt/2 -- see compute_rhs).
     call compute_prim(mesh, sol, prim)
-    call compute_rhs(mesh, sol, prim, rhs, sum_lambda, t)
+    call compute_rhs(mesh, sol, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
     dt   = min(dt, compute_dt(mesh, sum_lambda))
     sol1 = sol + dt * rhs
     ! Under MPI, sol1's ghost cells were just formed from THIS rank's own
@@ -98,13 +98,13 @@ program euler_ho_main
 
     ! SSP-RK3 stage 2: u2 = 3/4*u0 + 1/4*(u1 + dt*L(u1))
     call compute_prim(mesh, sol1, prim)
-    call compute_rhs(mesh, sol1, prim, rhs, sum_lambda, t)
+    call compute_rhs(mesh, sol1, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
     sol2 = 0.75_DOUBLE * sol + 0.25_DOUBLE * (sol1 + dt * rhs)
     if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5_ENTIER, sol2)
 
     ! SSP-RK3 stage 3: u^{n+1} = 1/3*u0 + 2/3*(u2 + dt*L(u2))
     call compute_prim(mesh, sol2, prim)
-    call compute_rhs(mesh, sol2, prim, rhs, sum_lambda, t)
+    call compute_rhs(mesh, sol2, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
     sol  = (1.0_DOUBLE/3.0_DOUBLE) * sol &
          + (2.0_DOUBLE/3.0_DOUBLE) * (sol2 + dt * rhs)
     if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5_ENTIER, sol)
@@ -114,7 +114,7 @@ program euler_ho_main
 
     ! New dt for next step
     call compute_prim(mesh, sol, prim)
-    call compute_rhs(mesh, sol, prim, rhs, sum_lambda, t)
+    call compute_rhs(mesh, sol, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
     dt = compute_dt(mesh, sum_lambda)
 
     if (me == 0 .and. mod(iter, 100) == 0) print *, "iter=", iter, "t=", t, "dt=", dt
