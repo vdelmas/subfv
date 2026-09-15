@@ -537,10 +537,12 @@ contains
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) &
           + mesh%sub_face(id_sub_face)%area*lr_flux(:, 1, j)
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
             + mesh%sub_face(id_sub_face)%area*max(0.0_DOUBLE, sr)
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) + mesh%sub_face(id_sub_face)%area*lr_flux(:, 2, j)
+        end if
         end if
       end if
     end do

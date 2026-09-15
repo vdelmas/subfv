@@ -294,9 +294,11 @@ contains
         flux(2:4) = pr_et * mesh%face(id_face)%norm
         flux(5)   = pr_et * v_et
         rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == i_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == i_vert) then
           rse_loc = mesh%sub_elem(rse)%id_loc_around_node
           rhs(:, rse_loc) = rhs(:, rse_loc) + mesh%sub_face(id_sub_face)%area/mass(idr) * flux
+        end if
         end if
       end if
     end do
