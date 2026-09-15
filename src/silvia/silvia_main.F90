@@ -7,6 +7,7 @@ program main
     use mesh_geometry_module
     use mesh_connectivity_module
     use io_module
+    use silvia_module
     implicit none
 
     real(kind=DOUBLE), parameter :: gamma = 1.4_DOUBLE
@@ -16,11 +17,13 @@ program main
     type(mesh_type) :: mesh
     type(mpi_send_recv_type) :: mpi_send_recv
 
-    character(len=255) :: meshfile_path, meshfile
-    integer(kind=ENTIER) :: n_bc=0, i, le, re, i_bc
+    !character(len=255) :: meshfile_path, meshfile
+    !integer(kind=ENTIER) :: n_bc=0
+    integer(kind=ENTIER) :: i, le, re, i_bc
     integer(kind=ENTIER) :: iter
-    character(len=255), dimension(10) :: bc_name, bc_type
-    logical :: boundary_2d
+    !character(len=255), dimension(10) :: bc_name
+    !character(len=255), dimension(10) :: bc_type
+    !logical :: boundary_2d
 
     real(kind=DOUBLE) :: t, dt, t_max, area
     real(kind=DOUBLE), dimension(3) :: n
@@ -45,22 +48,6 @@ program main
         n_bc, bc_name, me, num_procs, mpi_send_recv)
     call build_mesh(mesh, num_procs, mpi_send_recv, .true., boundary_2d)
     call compute_geometry_mesh(mesh, .true., boundary_2d)
-
-    ! Same treatment for bc_type -- see bc_type_id's declaration. Same
-    ! fallback as ghost_prim's old string select case: anything
-    ! unrecognized (including blank) defaults to a slip wall.
-    ! do i_bc = 1, n_bc
-    !   select case (trim(adjustl(bc_type(i_bc))))
-    !   case ('freestream')
-    !     bc_type_id(i_bc) = BC_FREESTREAM
-    !   case ('outflowsupersonic', 'outflow')
-    !     bc_type_id(i_bc) = BC_OUTFLOW
-    !   case ('dmr_top')
-    !     bc_type_id(i_bc) = BC_DMR_TOP
-    !   case default
-    !     bc_type_id(i_bc) = BC_WALL
-    !   end select
-    ! end do
 
     do i=1, mesh%n_faces
       le = mesh%face(i)%left_neigh
@@ -181,30 +168,6 @@ subroutine write_vtu(mesh, sol, me, idx)
 
     deallocate(prim_loc, rho, ux, uy, uz, p, temp, centroid)
   end subroutine write_vtu
-
-pure function primit_to_conserv(w) result(u)
-    implicit none
-
-    real(kind=DOUBLE), dimension(5), intent(in) :: w
-    real(kind=DOUBLE), dimension(5) :: u
-
-    u(1) = w(1)
-    u(2:4) = w(2:4)*w(1)
-    u(5) = w(5)/(gamma - 1) &
-      + 0.5_DOUBLE*w(1)*(w(2)**2 + w(3)**2 + w(4)**2)
-  end function primit_to_conserv
-
-  pure function conserv_to_primit(u) result(w)
-    implicit none
-
-    real(kind=DOUBLE), dimension(5), intent(in) :: u
-    real(kind=DOUBLE), dimension(5) :: w
-
-    w(1) = u(1)
-    w(2:4) = u(2:4)/u(1)
-    w(5) = (gamma - 1)*(u(5) &
-      - 0.5_DOUBLE*w(1)*(w(2)**2 + w(3)**2 + w(4)**2))
-  end function conserv_to_primit
 
   ! Ghost cell primitive state for boundary condition
   ! pure function ghost_prim(xf, norm, wL, id_bc, t) result(wR)
