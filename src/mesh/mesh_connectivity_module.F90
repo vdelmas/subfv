@@ -54,8 +54,16 @@ contains
       if (use_sub_entities) call build_periodic_stencil(mesh)
     end if
 
-    ! run after periodic stitching so that stitched faces (right_neigh > 0) are not treated as walls
-    call find_if_vert_is_bound(mesh, b2d)
+    ! find_if_vert_is_bound is NOT called here (2026-09-15 fix): this point
+    ! runs before compute_geometry_mesh, so mesh%face%norm is still (0,0,0)
+    ! for every face -- the boundary_2d branch's z-face exclusion,
+    ! abs(norm(3)) < 1e-12, was trivially true for every face regardless of
+    ! orientation, marking essentially every vertex as "bound" on any
+    ! boundary_2d=.true. mesh (single-layer-z extrusion: vortex, FFS, DMR,
+    ! cylinder -- everything using this convention). compute_geometry_mesh
+    ! (mesh_geometry_module.F90) already has its own correctly-timed call
+    ! to the same-named subroutine, right after face norms are computed;
+    ! that is now the only place it runs.
   end subroutine build_mesh
 
   subroutine build_faces(mesh)
@@ -723,31 +731,11 @@ contains
     end if
   end function same_faces_boundary
 
-  subroutine find_if_vert_is_bound(mesh, b2d)
-    implicit none
-
-    type(mesh_type), intent(inout) :: mesh
-    logical, intent(in) :: b2d
-
-    integer(kind=DOUBLE) :: i, j, id_face
-
-    do i = 1, mesh%n_vert
-      mesh%vert(i)%is_bound = .FALSE.
-      do j = 1, mesh%vert(i)%n_faces_neigh
-        id_face = mesh%vert(i)%face_neigh(j)
-        if( b2d ) then
-          if (mesh%face(id_face)%right_neigh <= 0 .and. &
-            abs(mesh%face(id_face)%norm(3)) < 1e-12_DOUBLE ) then
-            mesh%vert(i)%is_bound = .TRUE.
-          end if
-        else
-          if (mesh%face(id_face)%right_neigh <= 0) then
-            mesh%vert(i)%is_bound = .TRUE.
-          end if
-        end if
-      end do
-    end do
-  end subroutine find_if_vert_is_bound
+  ! Removed 2026-09-15: this was a stale duplicate, called too early (before
+  ! compute_geometry_mesh sets face%norm, breaking the boundary_2d z-face
+  ! exclusion below it -- see the comment left at its former call site in
+  ! build_mesh above). mesh_geometry_module.F90's own copy, called at the
+  ! correct point (after face norms are computed), is now the only one.
 
   subroutine renumber_elem_mesh(mesh, num_procs, mpi_send_recv)
     implicit none
