@@ -74,14 +74,62 @@ module arbitrary_high_order_module
   ! convention for a dimensionless epsilon.
   real(kind=DOUBLE), parameter :: eps_weno = tiny(1.0_DOUBLE)
   real(kind=DOUBLE), parameter :: eps_weight_num = 1.0e-6_DOUBLE
+  ! Separate, LARGER eps for the hess/third recursion levels only
+  ! (deriv_order>=2) -- 2026-09-16 experiment, per the user's request to
+  ! keep pushing on the order-4 vs order-3 gap while staying within the
+  ! existing single-affine-fit-per-vertex architecture (no quadratic fit,
+  ! no wider stencil). Motivation: order 2 (grad only, no hess/third) was
+  ! found to regress on Sod as soon as eps_weight_num was raised past
+  ! 1e-6, proving the Sod cost comes specifically from the GRAD level's
+  ! own de-centering being weakened -- so a single shared eps forces an
+  ! all-or-nothing tradeoff between Sod robustness and smooth-field
+  ! hess/third accuracy. Splitting them lets hess/third (only exercised
+  ! at order>=3, and whose own smooth-data OI values this session found
+  ! are already tiny/negligible except right at a genuine discontinuity)
+  ! use a more forgiving floor without touching grad's own protection.
+  real(kind=DOUBLE), parameter :: eps_weight_num_deep = 1.0_DOUBLE
   ! Exponent on the oscillation indicator in the WENO weight,
-  ! weight = 1/(eps+|dphi_v|^weno_power) -- 2026-09-13 experiment, per the
-  ! user's request, to see whether a more aggressive de-centering (in the
-  ! absence of any real positivity/slope limiter) reduces the small
-  ! overshoots seen e.g. just behind a Sod rarefaction tail. Standard WENO
-  ! practice is power=2; try higher powers here directly rather than
-  ! building an actual limiter.
-  integer(kind=ENTIER), parameter :: weno_power = 2
+  ! weight = omega_p/(eps+OI_v^weno_power). Standard WENO/Jiang-Shu
+  ! practice is power=2; RECALIBRATED to power=1 on 2026-09-16, per the
+  ! user's request for more aggressive de-centering on Sod. Since OI_v
+  ! (Eq. in the paper, combined residual+gradient-norm indicator) is
+  ! dimensionless and typically < 1 even at a discontinuity (raw
+  ! oi_gradnorm divided by grad_norm_derate=1e4), RAISING the power
+  ! SHRINKS oi_v^power faster than it shrinks eps -- i.e. a higher power
+  ! makes the indicator LESS discriminating here, not more, once oi_v^power
+  ! drops below eps_weight_num. Confirmed directly: sweeping
+  ! power=1,2,4,6,8 on Sod (order 2/3/4, local run) found power=1 gives
+  ! by far the smallest pressure overshoot/undershoot (order 3:
+  ! p_min=0.099994/p_max=1.000494, vs power=2's 0.099904/1.006215 and
+  ! power=4's 0.093734/1.013196 -- degrading monotonically as power
+  ! increases from there). Also verified power=1 does NOT regress (in
+  ! fact modestly IMPROVES) the smooth stationary-vortex benchmark
+  ! (order 3 L2: 1.0511e-2 vs power=2's 1.1233e-2; order 4: 1.2081e-2 vs
+  ! 1.2426e-2) and leaves the synthetic-cubic grad/hess convergence
+  ! order unchanged (hess still ~order 1, third still flat but smaller
+  ! in absolute magnitude). A real, dual-validated improvement, not a
+  ! narrow overfit to one case.
+  integer(kind=ENTIER), parameter :: weno_power = 1
+
+  ! Calibration divisor on the gradient-norm term added to oi_v (see
+  ! compute_nodal_derivative_at_vertex) -- calibrated 2026-09-16 by an A/B
+  ! sweep on the real order-4 isentropic vortex solver (N=80, cfl=0.1,
+  ! two_wave), not just the synthetic cubic test. At derate=1 the raw term
+  ! regressed the smooth vortex by 26-33% (L2 1.24e-2->1.56e-2 at order 4)
+  ! because a REAL flow's gradient magnitude is far from the tiny synthetic
+  ! test's -- the term was firing on ordinary smooth variation everywhere,
+  ! not just at a discontinuity. Swept 1/1e2/1e4/1e6/1e8: the regression is
+  ! fully gone (matches the pre-fix L2 to 4 significant figures) by 1e4 and
+  ! stays flat at 1e6, so 1e4 is picked as the smallest value that already
+  ! plateaus (no reason to derate further and needlessly shrink the shock
+  ! margin below). Confirmed still comfortably detects a Sod-like
+  ! axis-aligned jump at this value: that field's own oi_gradnorm/derate is
+  ! ~1.5e-4 (N=20) growing to ~1.2e-3 (N=80) -- 150x-1200x above
+  ! eps_weight_num=1e-6, a margin that only IMPROVES with mesh refinement
+  ! -- while the smooth vortex/cubic field's own oi_gradnorm/derate (~1e-9
+  ! at N=40) sits safely BELOW eps, i.e. genuinely negligible there, unlike
+  ! at derate=1.
+  real(kind=DOUBLE), parameter :: grad_norm_derate = 1.0e4_DOUBLE
 
   ! Linear-blend mode (2026-09-15, per the user's request for a baseline
   ! comparison against the pure-ls reconstruction source): when .false.,
@@ -161,7 +209,7 @@ contains
   ! 2D cases), every vertex's element neighbors sit at the same z offset
   ! from it, which makes the full 3D least-squares fit of Step~1 singular
   ! -- boundary_2d=.true. drops z from the fit basis instead.
-  subroutine compute_next_order_derivative(mesh, d, nc_in, boundary_2d, phi, dphi)
+  subroutine compute_next_order_derivative(mesh, d, nc_in, boundary_2d, phi, dphi, deriv_order)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -169,8 +217,14 @@ contains
     logical, intent(in) :: boundary_2d
     real(kind=DOUBLE), dimension(nc_in, mesh%n_elems), intent(in) :: phi
     real(kind=DOUBLE), dimension(nc_in*d, mesh%n_elems), intent(out) :: dphi
+    ! Which recursion level this call computes: 1=grad, 2=hess, 3=third --
+    ! selects eps_weight_num (level 1) vs eps_weight_num_deep (level>=2)
+    ! in accumulate_weno_contribution/scatter_weno_weighted. Optional,
+    ! defaults to 1 (the more protective/conservative choice) for any
+    ! caller that doesn't specify it.
+    integer(kind=ENTIER), intent(in), optional :: deriv_order
 
-    integer(kind=ENTIER) :: nc_out, id_vert, id_elem
+    integer(kind=ENTIER) :: nc_out, id_vert, id_elem, deriv_order_eff
     real(kind=DOUBLE), dimension(:, :), allocatable :: weno_num
     real(kind=DOUBLE), dimension(:), allocatable :: weno_den
     real(kind=DOUBLE), dimension(:, :), allocatable :: dphi_v_cache
@@ -178,6 +232,8 @@ contains
     real(kind=DOUBLE), dimension(:), allocatable :: oi_cache
 
     nc_out = nc_in*d
+    deriv_order_eff = 1
+    if (present(deriv_order)) deriv_order_eff = deriv_order
 
     allocate(weno_num(nc_out, mesh%n_elems))
     allocate(weno_den(mesh%n_elems))
@@ -211,7 +267,8 @@ contains
     do id_vert = 1, mesh%n_vert
       if (mesh%vert(id_vert)%is_bound) cycle
       call accumulate_weno_contribution(mesh, d, nc_in, boundary_2d, id_vert, &
-        phi, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den)
+        phi, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den, &
+        deriv_order=deriv_order_eff)
     end do
 
     ! Fallback for a cell left with zero total weight (e.g. every one of
@@ -352,7 +409,22 @@ contains
     oi_cache(id_vert) = oi_v
     if (.not. valid) return
 
-    vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + oi_v**weno_power)
+    ! BUG FIX (2026-09-15): this was unconditionally nonlinear, ignoring
+    ! use_weno_blend entirely -- a linear-mode run (use_weno_blend=.false.)
+    ! silently still got the full nonlinear per-vertex weighting here, so
+    ! the "linear blend" ablation was never actually linear once CWENO
+    ! shipped. Mirrors scatter_weno_weighted's own use_weno_blend gate.
+    ! When use_weno_blend=.false., weno_num/weno_den reduce to exactly
+    ! lin_num/lin_den (same formula, weight=1), so the center-candidate
+    ! blend below is provably a no-op in that mode (algebraically
+    ! (X + w_c*(X/Y))/(Y + w_c) = X/Y for any w_c) -- CWENO stays
+    ! correct, it just has nothing left to do when there is no nonlinear
+    ! candidate to protect against.
+    if (use_weno_blend) then
+      vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + oi_v**weno_power)
+    else
+      vertex_weno_weight = 1.0_DOUBLE
+    end if
 
     do j = 1, mesh%vert(id_vert)%n_sub_elems_neigh
       id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
@@ -582,7 +654,7 @@ contains
 
       allocate(dfield(order)%val(nc_in*d, mesh%n_elems))
       call compute_next_order_derivative(mesh, d, nc_in, boundary_2d, &
-        phi_prev, dfield(order)%val)
+        phi_prev, dfield(order)%val, deriv_order=order)
 
       deallocate(phi_prev)
       allocate(phi_prev(nc_in*d, mesh%n_elems))
@@ -668,7 +740,7 @@ contains
       allocate(dfield(order)%val(nc_in*d, mesh%n_elems))
       t0 = MPI_WTIME()
       call compute_next_order_derivative(mesh, d, nc_in, boundary_2d, &
-        phi_prev, dfield(order)%val)
+        phi_prev, dfield(order)%val, deriv_order=order)
       t1 = MPI_WTIME()
       n_events = n_events + 1
       events(n_events) = timeline_event_type(order, 'compute', t0, t1)
@@ -850,7 +922,7 @@ contains
   ! contribution at the point this is called (Step 1: only send cells;
   ! Step 3: only non-send cells).
   subroutine accumulate_weno_contribution(mesh, d, nc_in, boundary_2d, id_vert, &
-      phi, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den, skip_cell)
+      phi, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den, skip_cell, deriv_order)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -863,10 +935,12 @@ contains
     real(kind=DOUBLE), dimension(:, :), intent(inout) :: weno_num
     real(kind=DOUBLE), dimension(:), intent(inout) :: weno_den
     logical, dimension(:), intent(in), optional :: skip_cell
+    integer(kind=ENTIER), intent(in), optional :: deriv_order
 
     real(kind=DOUBLE), dimension(nc_in*d) :: dphi_v
     logical :: valid
-    real(kind=DOUBLE) :: oi_v
+    real(kind=DOUBLE) :: oi_v, eps_here
+    integer(kind=ENTIER) :: deriv_order_eff
 
     call compute_nodal_derivative_at_vertex(mesh, d, nc_in, boundary_2d, &
       id_vert, phi, dphi_v, valid, oi_v)
@@ -875,7 +949,11 @@ contains
     oi_cache(id_vert) = oi_v
     if (.not. valid) return ! see compute_nodal_derivative_at_vertex's header
 
-    call scatter_weno_weighted(mesh, id_vert, dphi_v, oi_v, weno_num, weno_den, skip_cell)
+    deriv_order_eff = 1
+    if (present(deriv_order)) deriv_order_eff = deriv_order
+    eps_here = merge(eps_weight_num, eps_weight_num_deep, deriv_order_eff <= 1)
+
+    call scatter_weno_weighted(mesh, id_vert, dphi_v, oi_v, weno_num, weno_den, skip_cell, eps_here)
   end subroutine accumulate_weno_contribution
 
   ! Same scatter as accumulate_weno_contribution, but reusing an
@@ -941,7 +1019,7 @@ contains
   ! -- i.e. the per-vertex fit itself was already exact, only the
   ! averaging weight was wrong; this residual-based OI achieves the same
   ! effect without disabling WENO's actual shock-detection role.
-  subroutine scatter_weno_weighted(mesh, id_vert, dphi_v, oi_v, weno_num, weno_den, skip_cell)
+  subroutine scatter_weno_weighted(mesh, id_vert, dphi_v, oi_v, weno_num, weno_den, skip_cell, eps_in)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -951,12 +1029,19 @@ contains
     real(kind=DOUBLE), dimension(:, :), intent(inout) :: weno_num
     real(kind=DOUBLE), dimension(:), intent(inout) :: weno_den
     logical, dimension(:), intent(in), optional :: skip_cell
+    ! Overrides eps_weight_num when present -- lets the caller pick a
+    ! level-dependent eps (grad vs hess/third), see eps_weight_num_deep's
+    ! header and accumulate_weno_contribution.
+    real(kind=DOUBLE), intent(in), optional :: eps_in
 
     integer(kind=ENTIER) :: j, id_elem, id_sub_elem
-    real(kind=DOUBLE) :: sub_elem_volume, vertex_weno_weight
+    real(kind=DOUBLE) :: sub_elem_volume, vertex_weno_weight, eps_use
+
+    eps_use = eps_weight_num
+    if (present(eps_in)) eps_use = eps_in
 
     if (use_weno_blend) then
-      vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + oi_v**weno_power)
+      vertex_weno_weight = 1.0_DOUBLE / (eps_use + oi_v**weno_power)
     else
       ! Linear-blend mode: weight=1 cancels out of numerator/denominator,
       ! leaving a plain sub_elem_volume-weighted average (see use_weno_blend's
@@ -1131,6 +1216,35 @@ contains
     ! (any mesh, any resolution) and shrinks with h for smooth-but-curved
     ! data, while staying O(1) at a real discontinuity in the stencil --
     ! exactly the property a WENO smoothness indicator needs.
+    !
+    ! FIX (2026-09-16, per the user): this residual is BLIND to a
+    ! discontinuity that happens to be locally aligned with the mesh (e.g.
+    ! a 1D shock like Sod's, or any shock front locally parallel to a grid
+    ! line): an interior quad/hex vertex's dual stencil samples only 2
+    ! distinct coordinate values per active direction, so a jump that is
+    ! constant along the OTHER active direction(s) is fit *exactly* by the
+    ! affine model regardless of its size -- confirmed numerically
+    ! (test_oi_stats in the aho-oi-redesign investigation): resid-based
+    ! OI = O(1e-16) machine noise at a genuine Sod-like 8x jump straddling
+    ! a vertex, indistinguishable from smooth data. Combined here with a
+    ! second, classical (Jiang-Shu-style) indicator that does NOT share
+    ! this blind spot: beta = h_local*|grad|^2/phi_scale^2, using this
+    ! same vertex's own just-solved gradient (rhs(2:,:)) and the local
+    ! neighbor coordinate spread (max_spread) already computed above. A
+    ! smooth, converged gradient gives beta -> 0 as h_local -> 0 (finite
+    ! |grad|, shrinking prefactor); a vertex whose stencil straddles a
+    ! real jump has an affine-fit slope that blows up like 1/h_local
+    ! (fitting a fixed jump over a shrinking baseline), so beta ~
+    ! h_local*(1/h_local)^2 = 1/h_local DIVERGES under refinement --
+    ! confirmed to catch exactly the Sod-like case the residual alone
+    ! missed (beta ~1.2-12, growing with resolution, vs ~1e-5 max on the
+    ! smooth cubic verification field), while adding negligible cost
+    ! (reuses this vertex's own fit, no extra neighbor pass). Taking the
+    ! max of the two keeps whichever indicator is already doing its job:
+    ! the residual for genuine multi-directional curvature/oscillation,
+    ! the gradient-norm term for an axis-aligned jump the residual can't
+    ! see. eps_weight_num/weno_power (both unchanged, classical WENO
+    ! values) apply to this combined oi_v exactly as before.
     resid_sq = 0.0_DOUBLE
     do j = 1, n_neigh
       id_elem = neigh(j)
@@ -1149,6 +1263,8 @@ contains
     phi_scale2 = maxval(phi_sq_sum) / max(weight_sum, 1.0e-300_DOUBLE)
     oi_v = sqrt((maxval(resid_sq) / max(weight_sum, 1.0e-300_DOUBLE)) &
       / max(phi_scale2, 1.0e-300_DOUBLE))
+    oi_v = max(oi_v, (max_spread * sum(rhs(2:n_basis, :)**2) / max(phi_scale2, 1.0e-300_DOUBLE)) &
+      / grad_norm_derate)
 
     ! rhs(1+a, i1) now holds d(phi_i1)/dx_{active_dim(a)}; flatten with i1
     ! (the "carried" direction, from phi's own components) fast-varying and

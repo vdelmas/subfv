@@ -52,18 +52,23 @@ module euler_ho_module
   ! but built from aho's nodal-derivative machinery instead of a
   ! cell-centered polynomial fit.
   logical, public :: use_weno_blend           = .true.
-  ! CWENO-style central candidate (2026-09-15, replaces the earlier
-  ! "WENO only on the grad step" interim fix): at use_weno_blend=.true.
+  ! CWENO-style central candidate (2026-09-15): at use_weno_blend=.true.
   ! only, folds a large-weight plain/linear candidate into the SAME
-  ! nonlinear blend at EVERY recursion level (grad, hess, third), instead
-  ! of skipping WENO entirely past the first step. See
-  ! arbitrary_high_order_module's use_cweno_center/cweno_center_weight
-  ! header and compute_next_order_derivative_cweno for the mechanism;
-  ! verified on a synthetic cubic field to let hess/third converge with a
-  ! real order (not just machine-precision from disabling WENO, nor
-  ! stuck at O(h^0) from plain WENO at every level) while keeping the
-  ! per-vertex nonlinear candidates genuinely present for shock detection.
-  logical, public :: use_cweno_center          = .true.
+  ! nonlinear blend at EVERY recursion level (grad, hess, third). Verified
+  ! on a synthetic cubic field to let hess/third converge with a real
+  ! order instead of being stuck at O(h^0) under plain WENO -- but
+  ! reverted to .false. as the production default on 2026-09-16: on real
+  ! shock benchmarks (DMR, cylinder, FFS) it made positivity/overshoot
+  ! measurably WORSE than plain WENO at orders 2 and 3 too (not just 4),
+  ! because the large always-on linear-candidate weight dilutes classical
+  ! WENO's de-centering near genuine discontinuities everywhere, not just
+  ! where CWENO's own OI_c indicator judges it safe to do so -- and it
+  ! still never reached true order-4 accuracy (capped at order 3's rate
+  ! by the grad step's own bias, untouched by this fix). Kept available
+  ! behind this flag for reference/experimentation; the production path
+  ! is plain compute_next_order_derivative at every level. See
+  ! arbitrary-high-order memory for the full writeup.
+  logical, public :: use_cweno_center          = .false.
   real(kind=DOUBLE), public :: cweno_center_weight = 1000.0_DOUBLE
   ! Numerical flux at each face quadrature point: 'rusanov' (local
   ! Lax-Friedrichs, the original default) or 'three_wave' (an HLLC-family,
@@ -961,7 +966,7 @@ contains
         prim, grad_flat)
     else
       call compute_next_order_derivative(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, &
-        prim, grad_flat)
+        prim, grad_flat, deriv_order=1_ENTIER)
     end if
 
     if (do_exchange) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 15_ENTIER, grad_flat)
@@ -981,7 +986,7 @@ contains
           grad_flat, hess_flat)
       else
         call compute_next_order_derivative(mesh, 3_ENTIER, 15_ENTIER, boundary_2d, &
-          grad_flat, hess_flat)
+          grad_flat, hess_flat, deriv_order=2_ENTIER)
       end if
       if (do_exchange) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 45_ENTIER, hess_flat)
 
@@ -1003,7 +1008,7 @@ contains
               hess_flat, third_flat)
           else
             call compute_next_order_derivative(mesh, 3_ENTIER, 45_ENTIER, boundary_2d, &
-              hess_flat, third_flat)
+              hess_flat, third_flat, deriv_order=3_ENTIER)
           end if
           if (do_exchange) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 135_ENTIER, third_flat)
 
