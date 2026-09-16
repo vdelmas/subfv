@@ -175,9 +175,9 @@ contains
       scheme_id, scheme_adv_id, scheme_lag_id, &
       SCHEME_ZB, SCHEME_WIP, SCHEME_USI3D, &
       SCHEME_ADV_AR1D, SCHEME_ADV_AM, SCHEME_ADV_AMISO, &
-      SCHEME_ADV_ARMD, SCHEME_ADV_ARMDU, SCHEME_ADV_ARMDM, &
-      SCHEME_ADV_ARMDMAT, SCHEME_ADV_ARMDUMAT, SCHEME_ADV_ARMDMMAT, &
-      SCHEME_LAG_LS, SCHEME_LAG_LSU, SCHEME_LAG_LSM, SCHEME_ADV_ARMDWIP, &
+      SCHEME_ADV_ARMD, SCHEME_ADV_ARMDU, &
+      SCHEME_ADV_ARMDMAT, SCHEME_ADV_ARMDUMAT, &
+      SCHEME_LAG_LS, SCHEME_LAG_LSU, SCHEME_ADV_ARMDWIP, &
       SCHEME_LAG_LSWIP, SCHEME_LAG_LPP, SCHEME_LAG_LVPPP, SCHEME_LAG_LS1D, SCHEME_LAG_LPF
     use linear_solver_module
     use mpi
@@ -241,10 +241,6 @@ contains
           call compute_rhs_around_vert_ARMDU(mesh, sol, grad, &
             nsen, sum_lambda_vert, &
             flux_sum_vert, second_order, id_vert, vp)
-        case (SCHEME_ADV_ARMDM)
-          call compute_rhs_around_vert_ARMDM(mesh, sol, grad, &
-            nsen, sum_lambda_vert, &
-            flux_sum_vert, second_order, id_vert, vp, mat_h_p)
         case (SCHEME_ADV_ARMDMAT)
           call compute_rhs_around_vert_ARMDMAT(mesh, sol, grad, &
             nsen, sum_lambda_vert, &
@@ -253,10 +249,6 @@ contains
           call compute_rhs_around_vert_ARMDUMAT(mesh, sol, grad, &
             nsen, sum_lambda_vert, &
             flux_sum_vert, second_order, id_vert, vp)
-        case (SCHEME_ADV_ARMDMMAT)
-          call compute_rhs_around_vert_ARMDMMAT(mesh, sol, grad, &
-            nsen, sum_lambda_vert, &
-            flux_sum_vert, second_order, id_vert, vp, mat_h_p)
         case default
           print*,"Unknown ZB advection"
           error stop
@@ -275,10 +267,6 @@ contains
           call compute_rhs_around_vert_LSU(mesh, sol, grad, &
             nsen, flux_sum_vert, &
             id_vert, vp, second_order)
-        case (SCHEME_LAG_LSM)
-          call compute_rhs_around_vert_LSM(mesh, sol, grad, &
-            nsen, flux_sum_vert, &
-            id_vert, vp, mat_h_p, second_order)
         case (SCHEME_LAG_LPP)
           call compute_rhs_around_vert_LPP(mesh, sol, grad, &
             nsen, flux_sum_vert, id_vert, second_order)

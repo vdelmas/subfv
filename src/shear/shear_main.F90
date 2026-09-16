@@ -51,7 +51,7 @@ program main_shear
   if (scheme_id == SCHEME_ZB) then
     do i = 1, mesh%n_vert
       h_p(i)         = compute_length(mesh, i)
-      mat_h_p(:,:,i) = compute_ellip(mesh, i)
+      ! compute_ellip call removed 2026-09-15 (dead code, see ns_euler_zb_module.F90); mat_h_p stays 0
     end do
   end if
 

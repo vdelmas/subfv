@@ -81,15 +81,17 @@ module ns_global_data_module
   integer, parameter :: SCHEME_ADV_AMISO    = 3  ! "AMISO"
   integer, parameter :: SCHEME_ADV_ARMD     = 4  ! "ARMD"
   integer, parameter :: SCHEME_ADV_ARMDU    = 5  ! "ARMDU"
-  integer, parameter :: SCHEME_ADV_ARMDM    = 6  ! "ARMDM"
   integer, parameter :: SCHEME_ADV_ARMDMAT  = 7  ! "ARMDMAT"
   integer, parameter :: SCHEME_ADV_ARMDUMAT = 8  ! "ARMDUMAT"
-  integer, parameter :: SCHEME_ADV_ARMDMMAT = 9  ! "ARMDMMAT"
+  ! SCHEME_ADV_ARMDM (6), SCHEME_ADV_ARMDMMAT (9) removed 2026-09-15: only
+  ! active users of compute_ellip's mat_h_p output, and unreachable via any
+  ! schemes.txt entry (advection sub-schemes there are AMISO/AR1D only)
   integer, parameter :: SCHEME_ADV_ARMDWIP     = 10  ! "ARMDWIP"
   ! ZB Lagrange sub-scheme IDs
   integer, parameter :: SCHEME_LAG_LS  = 1  ! "LS"
   integer, parameter :: SCHEME_LAG_LSU = 2  ! "LSU"
-  integer, parameter :: SCHEME_LAG_LSM = 3  ! "LSM"
+  ! SCHEME_LAG_LSM (3) removed 2026-09-15: same reason, unreachable via
+  ! schemes.txt (lag sub-schemes there are LVPPP/LPP/LS1D/LPF only)
   integer, parameter :: SCHEME_LAG_LSWIP = 4  ! "LSWIP"
   integer, parameter :: SCHEME_LAG_LPP = 5  ! "LPP"
   integer, parameter :: SCHEME_LAG_LVPPP = 6  ! "LVPPP"
@@ -309,10 +311,8 @@ contains
       if (t_adv == "ARMD")     then; scheme_adv_id = SCHEME_ADV_ARMD;     recognized = .true.; end if
       if (t_adv == "ARMDWIP")  then; scheme_adv_id = SCHEME_ADV_ARMDWIP;  recognized = .true.; end if
       if (t_adv == "ARMDU")    then; scheme_adv_id = SCHEME_ADV_ARMDU;    recognized = .true.; end if
-      if (t_adv == "ARMDM")    then; scheme_adv_id = SCHEME_ADV_ARMDM;    recognized = .true.; end if
       if (t_adv == "ARMDMAT")  then; scheme_adv_id = SCHEME_ADV_ARMDMAT;  recognized = .true.; end if
       if (t_adv == "ARMDUMAT") then; scheme_adv_id = SCHEME_ADV_ARMDUMAT; recognized = .true.; end if
-      if (t_adv == "ARMDMMAT") then; scheme_adv_id = SCHEME_ADV_ARMDMMAT; recognized = .true.; end if
       if (.not. recognized) then
         print *, "ERROR: ZB advection unrecognized: '", trim(t_adv), "'"
         error stop
@@ -323,7 +323,6 @@ contains
       if (t_lag == "LPP")  then; scheme_lag_id = SCHEME_LAG_LPP; recognized = .true.; end if
       if (t_lag == "LVPPP")  then; scheme_lag_id = SCHEME_LAG_LVPPP; recognized = .true.; end if
       if (t_lag == "LSU") then; scheme_lag_id = SCHEME_LAG_LSU;   recognized = .true.; end if
-      if (t_lag == "LSM") then; scheme_lag_id = SCHEME_LAG_LSM;   recognized = .true.; end if
       if (t_lag == "LS1D") then; scheme_lag_id = SCHEME_LAG_LS1D; recognized = .true.; end if
       if (t_lag == "LPF")  then; scheme_lag_id = SCHEME_LAG_LPF;  recognized = .true.; end if
       if (.not. recognized) then
