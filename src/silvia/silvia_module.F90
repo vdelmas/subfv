@@ -174,11 +174,10 @@ module silvia_module
   real(kind=DOUBLE) :: final_res = 1e-4_DOUBLE
   integer(kind=ENTIER) :: n_max_iter = 10000
 
-  ! public :: read_params
+  public :: read_input_parameters
   public :: init_sol
-  ! public :: compute_prim
-  ! public :: compute_rhs
-  ! public :: compute_dt
+  public :: compute_dt
+  public :: compute_rhs
   ! public :: compute_error_vortex
   ! public :: test_reconstruction_exactness
   ! public :: compute_cell_moments
@@ -199,52 +198,56 @@ module silvia_module
 
 contains
 
-  ! ----------------------------------------------------------------
-  ! Namelist I/O
-  ! ----------------------------------------------------------------
-  ! subroutine read_params(filename)
-  !   character(len=*), intent(in) :: filename
-  !   integer(kind=ENTIER) :: funit, i_bc
-  !   namelist /INPUT_PARAM/ &
-  !     meshfile_path, meshfile, &
-  !     n_bc, bc_name, bc_type, bc_val, &
-  !     boundary_2d, &
-  !     sol_uniform, x1drp, sol_w_1drp_l, sol_w_1drp_r, &
-  !     order, cfl, tmax, n_sol_vtu, &
-  !     compute_error, error_2d, use_aho_reconstruction, flux_scheme
-  !   open(newunit=funit, file=trim(adjustl(filename)))
-  !   read(nml=INPUT_PARAM, unit=funit)
-  !   close(funit)
+  subroutine read_input_parameters(filename)
+    implicit none
 
-  !   ! Resolve flux_scheme to an integer once here, matching subfvns's own
-  !   ! scheme_id convention (ns_global_data_module) -- see flux_scheme_id's
-  !   ! declaration for why. Same fallback as the old string select case:
-  !   ! anything not recognized defaults to Rusanov.
-  !   select case (trim(adjustl(flux_scheme)))
-  !   case ('three_wave')
-  !     flux_scheme_id = FLUX_THREE_WAVE
-  !   case ('two_wave')
-  !     flux_scheme_id = FLUX_TWO_WAVE
-  !   case default
-  !     flux_scheme_id = FLUX_RUSANOV
-  !   end select
+    character(len=*), intent(in) :: filename
 
-  !   ! Same treatment for bc_type -- see bc_type_id's declaration. Same
-  !   ! fallback as ghost_prim's old string select case: anything
-  !   ! unrecognized (including blank) defaults to a slip wall.
-  !   do i_bc = 1, n_bc
-  !     select case (trim(adjustl(bc_type(i_bc))))
-  !     case ('freestream')
-  !       bc_type_id(i_bc) = BC_FREESTREAM
-  !     case ('outflowsupersonic', 'outflow')
-  !       bc_type_id(i_bc) = BC_OUTFLOW
-  !     case ('dmr_top')
-  !       bc_type_id(i_bc) = BC_DMR_TOP
-  !     case default
-  !       bc_type_id(i_bc) = BC_WALL
-  !     end select
-  !   end do
-  ! end subroutine read_params
+    integer(kind=ENTIER) :: funit
+
+    namelist /INPUT_PARAM/ &
+      meshfile_path, meshfile, &
+      rescale, rescale_factor, &
+      periodic_mesh, &
+      use_cylinder_map, dim_cylinder_map, &
+      n_bc, bc_name, bc_type, bc_val, &
+      bc_type_V, bc_val_V, bc_type_T, bc_val_T, &
+      n_iter_print, n_iter_write_sol, &
+      second_order, method, &
+      scheme, exclude_bound_vert, &
+      activate_diffusion, &
+      local_time_step, &
+      bc_style, boundary_2d, &
+      write_residual, n_iter_residual, &
+      final_res, n_max_iter, &
+      init_uniform, sol_uniform, &
+      init_sedov, r_sedov, &
+      init_isentropic_vortex, &
+      init_gresho, &
+      init_potential_flow_2d, &
+      init_potential_flow_3d, &
+      init_kelvin, &
+      init_double_mach, &
+      init_triple_point, &
+      init_1drp, sol_w_1drp_l, sol_w_1drp_r, x1drp, &
+      error_2d, error_2d_h, &
+      init_restart, restart_file, id_vtk_restart, &
+      compute_coeffs, pinf, rhoinf, vinf, coeffs_surf, &
+      plot_solution_dat, &
+      xmin_dat, xmax_dat, &
+      ymin_dat, ymax_dat, &
+      zmin_dat, zmax_dat, &
+      write_cell_size, &
+      delta_mach_imp, &
+      mu_p, Cv_p, use_sutherland, &
+      mu0, T0, &
+      cfl, tmax, &
+      thermal_couette
+
+    open (newunit=funit, file=trim(adjustl(filename)))
+    read (nml=INPUT_PARAM, unit=funit)
+    close (unit=funit)
+  end subroutine read_input_parameters
 
   pure function primit_to_conserv(w) result(u)
     implicit none
@@ -401,90 +404,170 @@ contains
     end if
   end subroutine init_sol
 
-  subroutine compute_rhs(mesh, sol, rhs)
-    implicit none
-
+  subroutine compute_dt(mesh, sum_lambda, dt)
     type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE) :: area
-    real(kind=DOUBLE), dimension(3) :: n
-    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
-    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(inout) :: rhs
-    real(kind=DOUBLE), dimension(5) :: sol_l, sol_r, sol_w_l, sol_w_r
-    real(kind=DOUBLE), dimension(5, 2) :: lr_flux
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: sum_lambda
+    real(kind=DOUBLE) :: dt, dt_i
+    integer(kind=ENTIER) :: i
 
-    integer(kind=ENTIER) :: i, le, re
-
-    do i=1, mesh%n_faces
-      le = mesh%face(i)%left_neigh
-      sol_l = sol(:, le)
-      sol_w_l = conserv_to_primit(sol_l)
-
-      re = mesh%face(i)%right_neigh
-      if(re > 0) then
-        sol_r = sol(:, re)
-        sol_w_r = conserv_to_primit(sol_r)
-      else
-        ! reconstruct left state and then apply BCs
-        ! sol_w_r = ghost_prim(xface, norm, wL, -ir, t)
+    dt = huge(1.0_DOUBLE)
+    do i = 1, mesh%n_elems
+      if (.not. mesh%elem(i)%is_ghost .and. sum_lambda(i) > 0.0_DOUBLE) then
+        dt_i = cfl * mesh%elem(i)%volume / sum_lambda(i)
+        dt = min(dt, dt_i)
       end if
-    
-      area = mesh%face(i)%area
-      n = mesh%face(i)%norm
-      !call two_wave(sol_w_l, sol_w_r, n, lr_flux, sl, sr)
-
-      rhs(:, le) = rhs(:, le) + area*lr_flux(:, 1)
-      if(re > 0) then
-        rhs(:, re) = rhs(:, re) + area*lr_flux(:, 2)
-      end if
-
     end do
+  end subroutine compute_dt
+
+  subroutine compute_rhs(mesh, sol, prim, rhs, sum_lambda, t)
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: sol
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: prim
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(out) :: rhs
+    real(kind=DOUBLE), dimension(mesh%n_elems),    intent(out) :: sum_lambda
+    ! Current stage's time, for a time-dependent BC (e.g. 'dmr_top'). Not
+    ! tracked per-RK-substage (all 3 SSP-RK3 stages of one step reuse the
+    ! step's start time) -- a minor, deliberate simplification for a
+    ! qualitative test, not exact substage timing.
+    real(kind=DOUBLE), intent(in) :: t
+
+    rhs        = 0.0_DOUBLE
+    sum_lambda = 0.0_DOUBLE
+    call face_flux_loop(mesh, sol, prim, rhs, sum_lambda, t)
+
+    ! Divide by cell volume
+    block
+      integer(kind=ENTIER) :: i
+      do i = 1, mesh%n_elems
+        if (.not. mesh%elem(i)%is_ghost) then
+          rhs(:, i) = rhs(:, i) / mesh%elem(i)%volume
+        end if
+      end do
+    end block
+
   end subroutine compute_rhs
 
-  subroutine two_wave(sol_w_l, sol_w_r, n, lr_flux, sl, sr)
-    implicit none
+  subroutine face_flux_loop(mesh, sol, prim, rhs, sum_lambda, t)
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: sol, prim
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(inout) :: rhs
+    real(kind=DOUBLE), dimension(mesh%n_elems),    intent(inout) :: sum_lambda
+    real(kind=DOUBLE), intent(in) :: t
 
-    real(kind=DOUBLE), dimension(5), intent(in) :: sol_w_l, sol_w_r
+    integer(kind=ENTIER) :: iface, il, ir, iv, k, n_fvert, n_qpts, q
+    real(kind=DOUBLE), dimension(3) :: norm, xface
+    real(kind=DOUBLE), dimension(:, :), allocatable :: face_coords, qpts
+    real(kind=DOUBLE), dimension(:),    allocatable :: qwts
+    real(kind=DOUBLE), dimension(5) :: wL, wR, flux
+    real(kind=DOUBLE) :: lambda
+    logical :: is_zface
+
+    do iface = 1, mesh%n_faces
+      il   = mesh%face(iface)%left_neigh
+      ir   = mesh%face(iface)%right_neigh
+      norm = mesh%face(iface)%norm
+
+      ! Skip ghost-owned faces
+      if (mesh%elem(il)%is_ghost) cycle
+
+      n_fvert = mesh%face(iface)%n_vert
+
+      ! Find z-faces
+      is_zface = boundary_2d .and. abs(abs(norm(3)) - 1.0_DOUBLE) < 1.0e-6_DOUBLE
+      n_qpts = 1
+      allocate(qpts(3, 1), qwts(1))
+      qpts(:, 1) = mesh%face(iface)%coord
+      qwts(1)    = mesh%face(iface)%area
+
+      ! For z-faces in 2D mode: zero net physics, skip entirely
+      if (is_zface) then
+        deallocate(qpts, qwts)
+        cycle
+      end if
+
+      n_qpts = size(qwts)
+      do q = 1, n_qpts
+        xface = qpts(:, q)
+
+        wL = prim(:, il)
+        if (ir > 0) then
+          wR = prim(:, ir)
+        else
+          ! Boundary: reconstruct left then apply BC
+          wR = wL
+          ! if (mesh%elem(ir)%is_ghost) then
+          !   print*, 'found ghost!'
+          ! end if
+          !wR = ghost_prim(xface, norm, wL, -ir, t)
+        end if
+
+        ! Numerical flux (physical: per-area * area_weight_at_qpt).
+        ! flux_scheme_id resolved once in read_params -- see its
+        ! declaration for why this is an integer compare, not a string one.
+        ! select case (flux_scheme_id)
+        ! case (FLUX_THREE_WAVE)
+        !   flux = three_wave_flux(wL, wR, norm) * qwts(q)
+        ! case (FLUX_TWO_WAVE)
+        flux = two_wave_flux(wL, wR, norm) * qwts(q)
+        ! case default
+        !   flux = rusanov(wL, wR, norm) * qwts(q)
+        ! end select
+        lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
+                     abs(dot_product(wR(2:4), norm)) + cs(wR)) * qwts(q)
+
+        rhs(:, il)  = rhs(:, il)  - flux
+        sum_lambda(il) = sum_lambda(il) + lambda
+        !if (ir > 0 .and. .not. mesh%elem(ir)%is_ghost) then
+          rhs(:, ir)     = rhs(:, ir)     + flux
+          sum_lambda(ir) = sum_lambda(ir) + lambda
+        !end if
+      end do
+
+      deallocate(qpts, qwts)
+    end do
+  end subroutine face_flux_loop
+
+  pure function two_wave_flux(wL, wR, n) result(F)
+    real(kind=DOUBLE), dimension(5), intent(in) :: wL, wR
     real(kind=DOUBLE), dimension(3), intent(in) :: n
-    real(kind=DOUBLE), dimension(5) :: sol_l, sol_r
-    real(kind=DOUBLE), dimension(5, 2), intent(inout) :: lr_flux
-    real(kind=DOUBLE), intent(inout) :: sl, sr
+    real(kind=DOUBLE), dimension(5) :: F
 
-    real(kind=DOUBLE) :: rhol, rhor, vn_l, vn_r, pl, pr, &
-      al, ar, lambda_l, lambda_r
-    real(kind=DOUBLE), dimension(5) :: fl, fr, sol_et
+    real(kind=DOUBLE), dimension(5) :: uL, uR, fL, fR, u_star
+    real(kind=DOUBLE) :: rhoL, rhoR, vnL, vnR, pL, pR, aL, aR
+    real(kind=DOUBLE) :: lambdaL, lambdaR, sL_wave, sR_wave
 
-    rhol = sol_w_l(1)
-    vn_l = dot_product(sol_w_l(2:4), n)
-    pl = sol_w_l(5)
-    al = sound_speed_w(sol_w_l)
-    sol_l = primit_to_conserv(sol_w_l)
+    rhoL = wL(1); vnL = dot_product(wL(2:4), n); pL = wL(5)
+    aL = cs(wL); uL = primit_to_conserv(wL)
 
-    rhor = sol_w_r(1)
-    vn_r = dot_product(sol_w_r(2:4), n)
-    pr = sol_w_r(5)
-    ar = sound_speed_w(sol_w_r)
-    sol_r = primit_to_conserv(sol_w_r)
+    rhoR = wR(1); vnR = dot_product(wR(2:4), n); pR = wR(5)
+    aR = cs(wR); uR = primit_to_conserv(wR)
 
-    fl(1)   = vn_l*sol_l(1)
-    fl(2:4) = vn_l*sol_l(2:4) + pl*n
-    fl(5)   = (sol_l(5) + pl)*vn_l
+    fL(1)   = vnL*uL(1)
+    fL(2:4) = vnL*uL(2:4) + pL*n
+    fL(5)   = (uL(5) + pL)*vnL
 
-    fr(1)   = vn_r*sol_r(1)
-    fr(2:4) = vn_r*sol_r(2:4) + pr*n
-    fr(5)   = (sol_r(5) + pr)*vn_r
+    fR(1)   = vnR*uR(1)
+    fR(2:4) = vnR*uR(2:4) + pR*n
+    fR(5)   = (uR(5) + pR)*vnR
 
-    lambda_l = max(al*rhol, sqrt(rhol*max(0.0_DOUBLE, pr - pl)), -rhol*(vn_r - vn_l))
-    lambda_r = max(ar*rhor, sqrt(rhor*max(0.0_DOUBLE, pl - pr)), -rhor*(vn_r - vn_l))
+    lambdaL = max(aL*rhoL, sqrt(rhoL*max(0.0_DOUBLE, pR - pL)), -rhoL*(vnR - vnL))
+    lambdaR = max(aR*rhoR, sqrt(rhoR*max(0.0_DOUBLE, pL - pR)), -rhoR*(vnR - vnL))
 
-    sl = vn_l - lambda_l/rhol
-    sr = vn_r + lambda_r/rhor
+    sL_wave = vnL - lambdaL/rhoL
+    sR_wave = vnR + lambdaR/rhoR
 
-    sol_et = (sr*sol_r - sl*sol_l - (fr - fl))/(sr - sl)
+    u_star = (sR_wave*uR - sL_wave*uL - (fR - fL)) / (sR_wave - sL_wave)
 
-    lr_flux(:, 1) = 0.5_DOUBLE*(fl + fr) &
-      - 0.5_DOUBLE*(abs(sl)*(sol_et - sol_l) + abs(sr)*(sol_r - sol_et))
-    lr_flux(:, 2) = -lr_flux(:, 1)
-  end subroutine two_wave
+    F = 0.5_DOUBLE*(fL + fR) - 0.5_DOUBLE*( &
+      abs(sL_wave)*(u_star - uL) + abs(sR_wave)*(uR - u_star))
+  end function two_wave_flux
+
+  ! Sound speed from primitive state
+  pure function cs(w) result(c)
+    real(kind=DOUBLE), dimension(5), intent(in) :: w
+    real(kind=DOUBLE) :: c
+    c = sqrt(max(gamma * w(5) / max(w(1), 1.0e-16_DOUBLE), 0.0_DOUBLE))
+  end function cs
 
   pure function sound_speed_w(w) result(a)
     implicit none

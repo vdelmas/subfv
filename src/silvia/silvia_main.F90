@@ -20,31 +20,15 @@ program main
     
     real(kind=DOUBLE) :: area
     real(kind=DOUBLE), dimension(3) :: n
-    real(kind=DOUBLE), dimension(:,:), allocatable :: sol
+    real(kind=DOUBLE), dimension(:,:), allocatable :: sol, sol_w
     real(kind=DOUBLE), dimension(:,:), allocatable :: rhs
-    
-    namelist /INPUT_PARAM/ &
-        meshfile_path, meshfile, &
-        boundary_2d, bc_style, &
-        n_bc, bc_name, bc_type, bc_val, &
-        bc_type_V, bc_val_V, bc_type_T, bc_val_T, &
-        periodic_mesh, use_cylinder_map, &
-        dim_cylinder_map, &
-        n_iter_print, n_iter_write_sol, &
-        n_max_iter, final_res, &
-        second_order, activate_diffusion, &
-        local_time_step, cfl, tmax, &
-        init_gresho, &
-        error_2d, error_2d_h, exclude_bound_vert, &
-        scheme, write_residual
+    real(kind=DOUBLE), allocatable :: sum_lambda(:)
 
     call MPI_INIT(mpi_ierr)
     call MPI_COMM_SIZE(MPI_COMM_WORLD, num_procs, mpi_ierr)
     call MPI_COMM_RANK(MPI_COMM_WORLD, me, mpi_ierr)
 
-    open (newunit=funit, file=trim(adjustl("input_data.f")))
-    read (nml=INPUT_PARAM, unit=funit)
-    close (unit=funit)
+    call read_input_parameters('input_data.f')
 
     call read_mesh_msh(mesh, meshfile_path, meshfile, &
         n_bc, bc_name, me, num_procs, mpi_send_recv)
@@ -52,24 +36,31 @@ program main
     call compute_geometry_mesh(mesh, .true., boundary_2d)
 
     allocate(sol(5,mesh%n_elems))
+    allocate(sol_w(5,mesh%n_elems))
+    allocate(rhs(5,mesh%n_elems))
+    allocate(sum_lambda(mesh%n_elems))
+
     do i=1, mesh%n_elems
-      sol(:, i) = (/1.0_DOUBLE,1.0_DOUBLE,1.0_DOUBLE,1.0_DOUBLE,100.0_DOUBLE/)
+      sol(:,i) = (/1.0_DOUBLE,1.0_DOUBLE,1.0_DOUBLE,1.0_DOUBLE,100.0_DOUBLE/)
+      sol_w(:,i) = conserv_to_primit(sol(:,i))
+      rhs(:,i) = (/0.0_DOUBLE,0.0_DOUBLE,0.0_DOUBLE,0.0_DOUBLE,0.0_DOUBLE/)
+      sum_lambda(i) = 0.0_DOUBLE
     end do
 
     call init_sol(mesh, sol)
 
     t=0.0_DOUBLE
-    tmax=1.0_DOUBLE
     iter=0
     call write_vtu(mesh, sol, 0, iter)
-    do while (t<tmax)
-      dt=0.1_DOUBLE
-      !call compute_dt(mesh, sol, dt)
-      !call compute_rhs(mesh, sol, rhs)
-      do i=1,mesh%n_elems
-        !sol(:, i) = sol(:, i) - dt/mesh%elem(i)%volume * rhs(:, i)
-        sol(:, i) = sol(:, i)
+    do while (t<tmax .AND. iter<n_max_iter)
+      do i=1, mesh%n_elems
+        sol_w(:,i) = conserv_to_primit(sol(:,i))
       end do
+      call compute_rhs(mesh, sol, sol_w, rhs, sum_lambda, t)
+      call compute_dt(mesh, sum_lambda, dt)
+      sol = sol + dt * rhs
+      
+      print*, 'iter=', iter, ' dt=', dt, ' time=', t
       t = t + dt
       iter = iter + 1
       call write_vtu(mesh, sol, 0, iter)
