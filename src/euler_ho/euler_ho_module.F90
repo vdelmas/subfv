@@ -1201,6 +1201,22 @@ contains
               ! .false. call is a documented no-op.
               call apply_grad_bias_correction(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, &
                 grad_flat, hess_v, third_v, valid_hess_v, valid_third_v, grad_oi_v)
+              ! grad_flat was corrected IN PLACE above, for this rank's own
+              ! owned cells only (apply_grad_bias_correction has no notion
+              ! of ownership, but a cell's bias is only ever accumulated
+              ! from ITS OWN touching vertices, computed identically on
+              ! whichever rank owns each vertex). Found 2026-09-17 (MPI
+              ! order-4 vs serial comparison, isentropic vortex): without
+              ! re-exchanging here, a rank's GHOST copy of a neighbor
+              ! rank's cell still holds the PRE-correction grad_flat, so a
+              ! face straddling a partition boundary reconstructs wL
+              ! (locally owned, corrected) against wR (ghost, uncorrected)
+              ! -- a real, partition-count-dependent ~4-6% L2 discrepancy
+              ! on the same vortex test at 6 MPI ranks vs 1 (confirmed
+              ! absent with use_grad_bias_correction=.false.: no
+              ! correction, no discrepancy, at any rank count -- isolating
+              ! this call as the cause before this fix).
+              if (do_exchange) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 15_ENTIER, grad_flat)
             else
               call compute_next_order_derivative(mesh, 3_ENTIER, 45_ENTIER, boundary_2d, &
                 hess_flat, third_flat, deriv_order=3_ENTIER)
