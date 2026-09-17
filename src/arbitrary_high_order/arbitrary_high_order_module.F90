@@ -53,6 +53,7 @@ module arbitrary_high_order_module
   public :: timeline_event_type
   public :: compute_derivative_hierarchy_timed
   public :: compute_derivative_hierarchy_overlap_timed
+  public :: apply_grad_bias_correction
 
   ! WENO-indicator regularization. eps_weno (used elsewhere, unchanged)
   ! is just enough to avoid a literal division by zero when a candidate's
@@ -69,11 +70,45 @@ module arbitrary_high_order_module
   ! floating-point-level residual noise once oi_v itself is this small for
   ! smooth data (confirmed: it left the Hessian error on a smooth Gaussian
   ! test field completely flat under mesh refinement, not converging at
-  ! all -- 1e-6 restored clean O(h^2) convergence, verified against the
-  ! uniform-weight reference). 1e-6 matches the standard WENO/Jiang-Shu
-  ! convention for a dimensionless epsilon.
+  ! all).
   real(kind=DOUBLE), parameter :: eps_weno = tiny(1.0_DOUBLE)
-  real(kind=DOUBLE), parameter :: eps_weight_num = 1.0e-6_DOUBLE
+  ! Made runtime-settable (2026-09-17, was `parameter`), per the user's
+  ! request to sweep OI/epsilon choices without a rebuild per value.
+  !
+  ! DEFAULT RAISED 1e-6 -> 1e-2 (2026-09-17), per a precise per-level
+  ! diagnostic (test_tensor_levels.F90, scratchpad -- compares grad/hess/
+  ! third against the ISENTROPIC VORTEX's own analytic derivatives, not
+  ! the synthetic cubic field 1e-6 was originally calibrated against).
+  ! Root cause: on genuinely smooth (non-polynomial) data, oi_v's
+  ! residual term shrinks like O(h^2) as expected, but its actual
+  ! magnitude at PRACTICAL mesh resolutions (h down to 0.0125, N=80) sits
+  ! around 1e-2 to 1e-4 for this field's real curvature -- nowhere near
+  ! small enough for a 1e-6 floor to ever dominate the weight, so the
+  ! "WENO degenerates to the linear blend on smooth data" property never
+  ! actually engaged at any resolution that's practical to run. Measured
+  ! directly: at 1e-6, grad's own order caps at ~1.5 (not 2) and
+  ! compounds through hess (~0.7-1.1, degrading with refinement) down to
+  ! third (order goes NEGATIVE, N=40->80) -- confirmed NOT caused by
+  ! eps_weight_num_deep (swept 1 to 1e4, negligible effect) nor by the
+  ! gradient-norm term (grad_norm_derate=1e12, i.e. effectively disabled,
+  ! made no difference either). Raising eps_weight_num itself to 1e-2
+  ! recovers each level to within a few percent of the pure-linear-blend
+  ! reference at the same resolutions (grad order ~2.0-2.04, hess/third
+  ! visually overlapping the linear curve), and the full solver's
+  ! order-4 vortex convergence rate rises from ~2.1-2.7 to ~3.4-3.9
+  ! (N=20->40->80, matched cfl/tmax to Table~\ref{tab:vortex-solver-conv}
+  ! in the paper). Cost: Sod's order-4 overshoot grows from
+  ! rho_max=1.00048 to 1.00758 (p_max 1.00067->1.01063) -- roughly an
+  ! order of magnitude worse in relative terms, but still comparable to
+  ! or better than the already-accepted pure-linear-blend overshoot
+  ! (rho_max=1.0103, p_max=1.0145) reported elsewhere in this paper, and
+  ! nowhere near unstable (no NaN, no qualitative blowup at any order
+  ! tested). Net: a real, better-motivated calibration than 1e-6 was,
+  ! not merely a different arbitrary constant -- 1e-6 was calibrated
+  ! against a field (exactly cubic, so oi_v's residual term is
+  ! identically zero away from any true discontinuity) that could not
+  ! have exposed this problem in the first place.
+  real(kind=DOUBLE), public :: eps_weight_num = 1.0e-2_DOUBLE
   ! Separate, LARGER eps for the hess/third recursion levels only
   ! (deriv_order>=2) -- 2026-09-16 experiment, per the user's request to
   ! keep pushing on the order-4 vs order-3 gap while staying within the
@@ -87,7 +122,7 @@ module arbitrary_high_order_module
   ! at order>=3, and whose own smooth-data OI values this session found
   ! are already tiny/negligible except right at a genuine discontinuity)
   ! use a more forgiving floor without touching grad's own protection.
-  real(kind=DOUBLE), parameter :: eps_weight_num_deep = 1.0_DOUBLE
+  real(kind=DOUBLE), public :: eps_weight_num_deep = 1.0_DOUBLE
   ! Exponent on the oscillation indicator in the WENO weight,
   ! weight = omega_p/(eps+OI_v^weno_power). Standard WENO/Jiang-Shu
   ! practice is power=2; RECALIBRATED to power=1 on 2026-09-16, per the
@@ -109,7 +144,7 @@ module arbitrary_high_order_module
   ! order unchanged (hess still ~order 1, third still flat but smaller
   ! in absolute magnitude). A real, dual-validated improvement, not a
   ! narrow overfit to one case.
-  integer(kind=ENTIER), parameter :: weno_power = 1
+  integer(kind=ENTIER), public :: weno_power = 1
 
   ! Calibration divisor on the gradient-norm term added to oi_v (see
   ! compute_nodal_derivative_at_vertex) -- calibrated 2026-09-16 by an A/B
@@ -129,7 +164,7 @@ module arbitrary_high_order_module
   ! -- while the smooth vortex/cubic field's own oi_gradnorm/derate (~1e-9
   ! at N=40) sits safely BELOW eps, i.e. genuinely negligible there, unlike
   ! at derate=1.
-  real(kind=DOUBLE), parameter :: grad_norm_derate = 1.0e4_DOUBLE
+  real(kind=DOUBLE), public :: grad_norm_derate = 1.0e4_DOUBLE
 
   ! Linear-blend mode (2026-09-15, per the user's request for a baseline
   ! comparison against the pure-ls reconstruction source): when .false.,
@@ -177,6 +212,15 @@ module arbitrary_high_order_module
   integer(kind=ENTIER), dimension(:), allocatable, save :: neigh_cache_start
   integer(kind=ENTIER), dimension(:), allocatable, save :: neigh_cache_list
 
+  ! Per-cell second geometric moment (M2, about each cell's own centroid),
+  ! used by apply_grad_bias_correction -- purely a function of mesh
+  ! geometry, so cached once per distinct mesh (same n_elems fingerprint
+  ! convention as neigh_cache above) rather than recomputed via quadrature
+  ! on every call (every RK stage, every iteration): the un-cached version
+  ! measurably slowed down an order-4 run (found 2026-09-16).
+  integer(kind=ENTIER), save :: m2_cache_n_elems = -1
+  real(kind=DOUBLE), dimension(:), allocatable, save :: m2_cache_xx, m2_cache_xy, m2_cache_yy
+
   type :: derivative_field_type
     real(kind=DOUBLE), dimension(:, :), allocatable :: val ! (d**order, n_elems)
   end type derivative_field_type
@@ -209,7 +253,8 @@ contains
   ! 2D cases), every vertex's element neighbors sit at the same z offset
   ! from it, which makes the full 3D least-squares fit of Step~1 singular
   ! -- boundary_2d=.true. drops z from the fit basis instead.
-  subroutine compute_next_order_derivative(mesh, d, nc_in, boundary_2d, phi, dphi, deriv_order)
+  subroutine compute_next_order_derivative(mesh, d, nc_in, boundary_2d, phi, dphi, deriv_order, &
+      dphi_v_out, valid_v_out, oi_v_out)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -223,6 +268,24 @@ contains
     ! defaults to 1 (the more protective/conservative choice) for any
     ! caller that doesn't specify it.
     integer(kind=ENTIER), intent(in), optional :: deriv_order
+    ! Optional: exposes the PER-VERTEX nodal estimate (before WENO
+    ! scatter/blend into cells) that this call computes internally anyway
+    ! -- used by the order-4 grad bias correction (apply_grad_bias_
+    ! correction) to get an accurate per-vertex Hessian (from the hess-
+    ! level call) and third-derivative tensor (from the third-level call)
+    ! without a second, redundant LS solve.
+    real(kind=DOUBLE), dimension(:, :), allocatable, intent(out), optional :: dphi_v_out
+    logical, dimension(:), allocatable, intent(out), optional :: valid_v_out
+    ! Optional: exposes the PER-VERTEX oscillation indicator oi_v this
+    ! call computes internally anyway. Used by apply_grad_bias_correction
+    ! (2026-09-17) to recompute the SAME per-vertex WENO weight
+    ! (1/(eps_weight_num+oi_v**weno_power), or 1 if use_weno_blend is
+    ! .false.) that this call itself used to scatter the gradient into
+    ! cells -- see that subroutine's header for why this consistency
+    ! matters (the correction's own vertex-to-cell scatter must match the
+    ! weighting grad_cell was actually built with, or the two don't
+    ! cancel correctly under a non-uniform WENO blend).
+    real(kind=DOUBLE), dimension(:), allocatable, intent(out), optional :: oi_v_out
 
     integer(kind=ENTIER) :: nc_out, id_vert, id_elem, deriv_order_eff
     real(kind=DOUBLE), dimension(:, :), allocatable :: weno_num
@@ -293,6 +356,19 @@ contains
         dphi(:, id_elem) = weno_num(:, id_elem) / weno_den(id_elem)
       end if
     end do
+
+    if (present(dphi_v_out)) then
+      allocate(dphi_v_out(nc_out, mesh%n_vert))
+      dphi_v_out = dphi_v_cache
+    end if
+    if (present(valid_v_out)) then
+      allocate(valid_v_out(mesh%n_vert))
+      valid_v_out = valid_cache
+    end if
+    if (present(oi_v_out)) then
+      allocate(oi_v_out(mesh%n_vert))
+      oi_v_out = oi_cache
+    end if
 
     deallocate(weno_num, weno_den, dphi_v_cache, valid_cache, oi_cache)
   end subroutine compute_next_order_derivative
@@ -1314,6 +1390,46 @@ contains
     neigh_cache_n_vert = mesh%n_vert
   end subroutine ensure_neighbor_cache
 
+  ! Builds m2_cache_xx/xy/yy (each cell's own second geometric moment
+  ! about its own centroid) once per distinct mesh, via the same
+  ! degree-5 quadrature apply_grad_bias_correction used to recompute this
+  ! on every call before this cache existed (2026-09-16 perf fix -- see
+  ! that cache's own header). A no-op if already built for this mesh.
+  subroutine ensure_m2_cache(mesh)
+    use quadrature_module, only: volume_quad_pts
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+
+    integer(kind=ENTIER) :: i, kv, n_v
+    real(kind=DOUBLE), dimension(:, :), allocatable :: vcoords, pq
+    real(kind=DOUBLE), dimension(:), allocatable :: wq
+    real(kind=DOUBLE) :: xc, yc
+
+    if (m2_cache_n_elems == mesh%n_elems) return
+
+    if (allocated(m2_cache_xx)) deallocate(m2_cache_xx)
+    if (allocated(m2_cache_xy)) deallocate(m2_cache_xy)
+    if (allocated(m2_cache_yy)) deallocate(m2_cache_yy)
+    allocate(m2_cache_xx(mesh%n_elems), m2_cache_xy(mesh%n_elems), m2_cache_yy(mesh%n_elems))
+
+    do i = 1, mesh%n_elems
+      n_v = mesh%elem(i)%n_vert
+      allocate(vcoords(3, n_v))
+      do kv = 1, n_v
+        vcoords(:, kv) = mesh%vert(mesh%elem(i)%vert(kv))%coord
+      end do
+      call volume_quad_pts(n_v, vcoords, 5_ENTIER, pq, wq)
+      xc = mesh%elem(i)%coord(1); yc = mesh%elem(i)%coord(2)
+      m2_cache_xx(i) = sum(wq*(pq(1,:)-xc)**2) / sum(wq)
+      m2_cache_xy(i) = sum(wq*(pq(1,:)-xc)*(pq(2,:)-yc)) / sum(wq)
+      m2_cache_yy(i) = sum(wq*(pq(2,:)-yc)**2) / sum(wq)
+      deallocate(vcoords, pq, wq)
+    end do
+
+    m2_cache_n_elems = mesh%n_elems
+  end subroutine ensure_m2_cache
+
   ! Element neighbors of id_vert for the least-squares fit: exactly
   ! mesh%vert(id_vert)%elem_neigh, the cells directly touching the vertex --
   ! see the header comment on compute_nodal_derivative_at_vertex for why
@@ -1330,4 +1446,240 @@ contains
     n_neigh = 0
     call add_sort_unique_int(neigh, n_neigh, mesh%vert(id_vert)%elem_neigh)
   end subroutine gather_ls_neighbors
+
+  ! Corrects the grad step's own O(h^2) bias against a genuinely cubic
+  ! field, IN PLACE, using the per-vertex nodal Hessian (Hv, from the
+  ! hess-level compute_next_order_derivative call's dphi_v_out) and
+  ! per-vertex nodal third-derivative tensor (Tv, from the third-level
+  ! call's dphi_v_out) -- both already computed anyway as intermediate
+  ! quantities, no extra neighbors or LS solves needed beyond a handful
+  ! of quadrature calls for each cell's own second geometric moment.
+  !
+  ! Derivation (2026-09-16, validated on the synthetic cubic field to
+  ! machine precision under a plain/linear blend, and to ~order 4 under
+  ! WENO with a sufficiently large eps_weight_num_deep): the vertex's own
+  ! weighted-LS affine fit (Step 1, same 4-neighbor stencil) is biased by
+  ! THREE distinct, additive contributions, all linear in the (assumed
+  ! locally cubic) field and its own H,T:
+  !   (1) the vertex's OWN Taylor terms beyond affine (quadratic+cubic),
+  !       evaluated exactly at the vertex using its own Hv,Tv;
+  !   (2) each NEIGHBOR cell's own cell-average-vs-point-value gap
+  !       (phi_j fed to the fit is a genuine cell AVERAGE, not the point
+  !       value at that neighbor's centroid the Taylor expansion in (1)
+  !       assumes) -- 0.5*H(centroid_j):M2_j, H(centroid_j)=Hv+Tv.dx_j
+  !       (exact, H linear for a cubic field), M2_j that neighbor cell's
+  !       own second geometric moment (same quantity compute_cell_moments
+  !       computes elsewhere in this codebase, just for every INPUT
+  !       neighbor here, not only the cell being reconstructed);
+  !   (3) a further gap once the (now Taylor-corrected) per-vertex
+  !       estimates are themselves blended (volume-weighted average, same
+  !       weights as the ordinary grad blend) into a CELL value: since
+  !       the true gradient is itself curved across the cell (its own
+  !       "Hessian" is exactly Tv), averaging several corner (vertex)
+  !       samples does not equal the value at the cell's own centroid --
+  !       corrected the same way, using the DISCRETE second moment of the
+  !       touching vertices' own positions (not a continuous quadrature
+  !       moment) weighted by the same sub_elem_volume blend weights.
+  ! All three are exactly zero for genuinely affine or quadratic data (no
+  ! bias introduced where none exists); for a cubic field they combine to
+  ! reproduce the FULL observed grad bias exactly (confirmed by direct
+  ! comparison against the analytic bias at several individual vertices).
+  !
+  ! Only implemented for boundary_2d=.true. (2D active directions x,y);
+  ! a .false. call is a no-op (grad returned unchanged) -- extending to
+  ! genuine 3D would need the analogous but algebraically larger 3D
+  ! Taylor/moment formulas, not attempted here.
+  subroutine apply_grad_bias_correction(mesh, d, nc_in, boundary_2d, grad_cell, &
+      hess_v, third_v, valid_hess_v, valid_third_v, grad_oi_v)
+    use linear_solver_module, only: lu_factor_lapack, lu_solve_mat_lapack
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: d, nc_in
+    logical, intent(in) :: boundary_2d
+    real(kind=DOUBLE), dimension(nc_in*d, mesh%n_elems), intent(inout) :: grad_cell
+    real(kind=DOUBLE), dimension(nc_in*d*d, mesh%n_vert), intent(in) :: hess_v
+    real(kind=DOUBLE), dimension(nc_in*d*d*d, mesh%n_vert), intent(in) :: third_v
+    logical, dimension(mesh%n_vert), intent(in) :: valid_hess_v, valid_third_v
+    ! Per-vertex oscillation indicator from the GRADIENT-level call of
+    ! compute_next_order_derivative (its oi_v_out) -- used to recompute
+    ! the exact per-vertex weight (sub_elem_volume*vertex_weno_weight)
+    ! that grad_cell was actually scattered with, so the two
+    ! vertex-to-cell scatters below (bias and cell-blend-curvature) match
+    ! how grad_cell was built instead of silently assuming a plain
+    ! sub_elem_volume (uniform) blend. Under use_weno_blend=.false. this
+    ! reduces to weight=1 exactly as before (bit-identical to the
+    ! pre-2026-09-17 code); under WENO it is what closes the gap between
+    ! this correction reaching machine precision (linear blend) and only
+    ! ~order 2.7 (WENO blend) on the same smooth field -- see
+    ! sec:results-order4's "Fix, attempt 3" discussion.
+    real(kind=DOUBLE), dimension(mesh%n_vert), intent(in) :: grad_oi_v
+
+    integer(kind=ENTIER) :: iv, j, id_elem, id_sub_elem, kv, n_v, ic, i
+    integer(kind=ENTIER) :: n_neigh, n_basis
+    integer(kind=ENTIER), dimension(:), allocatable :: neigh
+    real(kind=DOUBLE), dimension(3, 3) :: mat
+    real(kind=DOUBLE), dimension(3, nc_in) :: rhs
+    real(kind=DOUBLE), dimension(3) :: basis
+    integer(kind=ENTIER), dimension(3) :: ipiv
+    real(kind=DOUBLE), dimension(3) :: dx_v
+    real(kind=DOUBLE) :: weight, dxx, dyy, sub_elem_volume, dvx, dvy, vweight
+    real(kind=DOUBLE), dimension(:), allocatable :: Hxx, Hxy, Hyy, Txxx, Txxy, Txyy, Tyyy
+    real(kind=DOUBLE), dimension(:), allocatable :: HxxJ, HxyJ, HyyJ, moment_j
+    real(kind=DOUBLE), dimension(:, :), allocatable :: bias_num_x, bias_num_y
+    real(kind=DOUBLE), dimension(:), allocatable :: bias_den
+
+    if (.not. boundary_2d) return ! 3D not implemented, see header
+
+    call ensure_m2_cache(mesh)
+    call ensure_neighbor_cache(mesh)
+
+    allocate(Hxx(nc_in), Hxy(nc_in), Hyy(nc_in), Txxx(nc_in), Txxy(nc_in), Txyy(nc_in), Tyyy(nc_in))
+    allocate(HxxJ(nc_in), HxyJ(nc_in), HyyJ(nc_in), moment_j(nc_in))
+    allocate(bias_num_x(nc_in, mesh%n_elems), bias_num_y(nc_in, mesh%n_elems), bias_den(mesh%n_elems))
+    bias_num_x = 0.0_DOUBLE; bias_num_y = 0.0_DOUBLE; bias_den = 0.0_DOUBLE
+
+    n_basis = 3 ! 1, dx, dy -- SAME affine basis as the Step-1 fit
+    do iv = 1, mesh%n_vert
+      if (mesh%vert(iv)%is_bound) cycle
+      if (.not. valid_hess_v(iv) .or. .not. valid_third_v(iv)) cycle
+
+      do ic = 1, nc_in
+        Hxx(ic) = hess_v(ic, iv)                                    ! (dir1,dir2)=(1,1)
+        Hxy(ic) = 0.5_DOUBLE*(hess_v(2*nc_in+ic, iv) + hess_v(nc_in+ic, iv)) ! (1,2)&(2,1) avg
+        Hyy(ic) = hess_v(3*nc_in+ic, iv)                             ! (2,2)  [nc_in*d=3*nc_in]
+        Txxx(ic) = third_v(ic, iv)                                   ! (1,1,1)
+        Txxy(ic) = (third_v(3*nc_in+ic, iv) + third_v(9*nc_in+ic, iv) &
+          + third_v(nc_in+ic, iv)) / 3.0_DOUBLE                      ! (1,1,2)&(1,2,1)&(2,1,1)
+        Txyy(ic) = (third_v(4*nc_in+ic, iv) + third_v(10*nc_in+ic, iv) &
+          + third_v(12*nc_in+ic, iv)) / 3.0_DOUBLE                   ! (2,2,1)&(2,1,2)&(1,2,2)
+        Tyyy(ic) = third_v(13*nc_in+ic, iv)                          ! (2,2,2) [nc_in*d*d=9*nc_in]
+      end do
+
+      n_neigh = neigh_cache_start(iv+1) - neigh_cache_start(iv)
+      allocate(neigh(n_neigh))
+      neigh = neigh_cache_list(neigh_cache_start(iv):neigh_cache_start(iv+1)-1)
+      mat = 0.0_DOUBLE; rhs = 0.0_DOUBLE
+      do j = 1, n_neigh
+        id_elem = neigh(j)
+        dx_v = mesh%elem(id_elem)%coord - mesh%vert(iv)%coord
+        weight = 1.0_DOUBLE / max(dot_product(dx_v, dx_v), 1.0e-24_DOUBLE)
+        dxx = dx_v(1); dyy = dx_v(2)
+        basis(1) = 1.0_DOUBLE; basis(2) = dxx; basis(3) = dyy
+        mat = mat + weight * spread(basis, 2, 3) * spread(basis, 1, 3)
+
+        ! (1) vertex's own Taylor terms beyond affine
+        moment_j = 0.5_DOUBLE*(Hxx*dxx**2 + 2.0_DOUBLE*Hxy*dxx*dyy + Hyy*dyy**2) &
+          + (Txxx*dxx**3 + 3.0_DOUBLE*Txxy*dxx**2*dyy + 3.0_DOUBLE*Txyy*dxx*dyy**2 + Tyyy*dyy**3)/6.0_DOUBLE
+
+        ! (2) this neighbor's own cell-average-vs-point-value gap
+        HxxJ = Hxx + Txxx*dxx + Txxy*dyy
+        HxyJ = Hxy + Txxy*dxx + Txyy*dyy
+        HyyJ = Hyy + Txyy*dxx + Tyyy*dyy
+        moment_j = moment_j + 0.5_DOUBLE*(HxxJ*m2_cache_xx(id_elem) &
+          + 2.0_DOUBLE*HxyJ*m2_cache_xy(id_elem) + HyyJ*m2_cache_yy(id_elem))
+
+        do ic = 1, nc_in
+          rhs(:, ic) = rhs(:, ic) + weight*basis*moment_j(ic)
+        end do
+      end do
+      deallocate(neigh)
+
+      call lu_factor_lapack(n_basis, mat, ipiv)
+      call lu_solve_mat_lapack(n_basis, mat, ipiv, nc_in, rhs)
+
+      ! Match grad_cell's OWN vertex-to-cell weighting exactly (see this
+      ! subroutine's header on grad_oi_v) instead of assuming a plain
+      ! sub_elem_volume blend.
+      if (use_weno_blend) then
+        vweight = 1.0_DOUBLE / (eps_weight_num + grad_oi_v(iv)**weno_power)
+      else
+        vweight = 1.0_DOUBLE
+      end if
+
+      do j = 1, mesh%vert(iv)%n_sub_elems_neigh
+        id_sub_elem = mesh%vert(iv)%sub_elem_neigh(j)
+        id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+        sub_elem_volume = mesh%sub_elem(id_sub_elem)%volume * vweight
+        bias_num_x(:, id_elem) = bias_num_x(:, id_elem) + sub_elem_volume*rhs(2, :)
+        bias_num_y(:, id_elem) = bias_num_y(:, id_elem) + sub_elem_volume*rhs(3, :)
+        bias_den(id_elem) = bias_den(id_elem) + sub_elem_volume
+      end do
+    end do
+
+    do i = 1, mesh%n_elems
+      if (bias_den(i) <= 0.0_DOUBLE) cycle
+      grad_cell(1:nc_in, i) = grad_cell(1:nc_in, i) - bias_num_x(:, i)/bias_den(i)
+      grad_cell(nc_in+1:2*nc_in, i) = grad_cell(nc_in+1:2*nc_in, i) - bias_num_y(:, i)/bias_den(i)
+    end do
+
+    ! (3) cell-blend curvature: even with each vertex's own grad exactly
+    ! unbiased, blending several corner samples of a CURVED (quadratic)
+    ! gradient field does not equal its value at the cell centroid --
+    ! correct using the touching vertices' own Tv, blended the same way,
+    ! and the DISCRETE second moment of their positions about the cell
+    ! centroid (not a quadrature moment).
+    block
+      real(kind=DOUBLE), dimension(:, :), allocatable :: m2d_num_xx, m2d_num_xy, m2d_num_yy
+      real(kind=DOUBLE), dimension(:), allocatable :: m2d_den
+      real(kind=DOUBLE), dimension(:, :), allocatable :: t_num_xxx, t_num_xxy, t_num_xyy, t_num_yyy
+      allocate(m2d_num_xx(1, mesh%n_elems), m2d_num_xy(1, mesh%n_elems), m2d_num_yy(1, mesh%n_elems))
+      allocate(m2d_den(mesh%n_elems))
+      allocate(t_num_xxx(nc_in, mesh%n_elems), t_num_xxy(nc_in, mesh%n_elems))
+      allocate(t_num_xyy(nc_in, mesh%n_elems), t_num_yyy(nc_in, mesh%n_elems))
+      m2d_num_xx = 0.0_DOUBLE; m2d_num_xy = 0.0_DOUBLE; m2d_num_yy = 0.0_DOUBLE; m2d_den = 0.0_DOUBLE
+      t_num_xxx = 0.0_DOUBLE; t_num_xxy = 0.0_DOUBLE; t_num_xyy = 0.0_DOUBLE; t_num_yyy = 0.0_DOUBLE
+      do iv = 1, mesh%n_vert
+        if (mesh%vert(iv)%is_bound) cycle
+        if (.not. valid_third_v(iv)) cycle
+        do ic = 1, nc_in
+          Txxx(ic) = third_v(ic, iv)
+          Txxy(ic) = (third_v(3*nc_in+ic, iv) + third_v(9*nc_in+ic, iv) + third_v(nc_in+ic, iv)) / 3.0_DOUBLE
+          Txyy(ic) = (third_v(4*nc_in+ic, iv) + third_v(10*nc_in+ic, iv) + third_v(12*nc_in+ic, iv)) / 3.0_DOUBLE
+          Tyyy(ic) = third_v(13*nc_in+ic, iv)
+        end do
+        ! Same grad_cell-consistent weight as the bias scatter above --
+        ! this loop redistributes grad's OWN per-vertex samples, so it
+        ! must match grad's own blend too, not third_v's.
+        if (use_weno_blend) then
+          vweight = 1.0_DOUBLE / (eps_weight_num + grad_oi_v(iv)**weno_power)
+        else
+          vweight = 1.0_DOUBLE
+        end if
+
+        do j = 1, mesh%vert(iv)%n_sub_elems_neigh
+          id_sub_elem = mesh%vert(iv)%sub_elem_neigh(j)
+          id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+          sub_elem_volume = mesh%sub_elem(id_sub_elem)%volume * vweight
+          dvx = mesh%vert(iv)%coord(1) - mesh%elem(id_elem)%coord(1)
+          dvy = mesh%vert(iv)%coord(2) - mesh%elem(id_elem)%coord(2)
+          m2d_num_xx(1,id_elem) = m2d_num_xx(1,id_elem) + sub_elem_volume*dvx*dvx
+          m2d_num_xy(1,id_elem) = m2d_num_xy(1,id_elem) + sub_elem_volume*dvx*dvy
+          m2d_num_yy(1,id_elem) = m2d_num_yy(1,id_elem) + sub_elem_volume*dvy*dvy
+          m2d_den(id_elem) = m2d_den(id_elem) + sub_elem_volume
+          t_num_xxx(:,id_elem) = t_num_xxx(:,id_elem) + sub_elem_volume*Txxx
+          t_num_xxy(:,id_elem) = t_num_xxy(:,id_elem) + sub_elem_volume*Txxy
+          t_num_xyy(:,id_elem) = t_num_xyy(:,id_elem) + sub_elem_volume*Txyy
+          t_num_yyy(:,id_elem) = t_num_yyy(:,id_elem) + sub_elem_volume*Tyyy
+        end do
+      end do
+      do i = 1, mesh%n_elems
+        if (m2d_den(i) <= 0.0_DOUBLE) cycle
+        block
+          real(kind=DOUBLE) :: M2xx, M2xy, M2yy
+          real(kind=DOUBLE), dimension(nc_in) :: Tx1, Tx2, Tx3, Tx4, extra_x, extra_y
+          M2xx = m2d_num_xx(1,i)/m2d_den(i); M2xy = m2d_num_xy(1,i)/m2d_den(i); M2yy = m2d_num_yy(1,i)/m2d_den(i)
+          Tx1 = t_num_xxx(:,i)/m2d_den(i); Tx2 = t_num_xxy(:,i)/m2d_den(i)
+          Tx3 = t_num_xyy(:,i)/m2d_den(i); Tx4 = t_num_yyy(:,i)/m2d_den(i)
+          extra_x = 0.5_DOUBLE*(Tx1*M2xx + 2.0_DOUBLE*Tx2*M2xy + Tx3*M2yy)
+          extra_y = 0.5_DOUBLE*(Tx2*M2xx + 2.0_DOUBLE*Tx3*M2xy + Tx4*M2yy)
+          grad_cell(1:nc_in, i) = grad_cell(1:nc_in, i) - extra_x
+          grad_cell(nc_in+1:2*nc_in, i) = grad_cell(nc_in+1:2*nc_in, i) - extra_y
+        end block
+      end do
+    end block
+
+    deallocate(Hxx, Hxy, Hyy, Txxx, Txxy, Txyy, Tyyy, HxxJ, HxyJ, HyyJ, moment_j)
+    deallocate(bias_num_x, bias_num_y, bias_den)
+  end subroutine apply_grad_bias_correction
 end module arbitrary_high_order_module
