@@ -70,6 +70,19 @@ target_link_libraries(rbf PUBLIC core)
 set_target_properties(rbf PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mod/rbf)
 target_include_directories(rbf PUBLIC ${CMAKE_BINARY_DIR}/mod/rbf)
 
+# ── ALE library ────────────────────────────────────────────────────────────────
+# Self-contained: its own local multi_point-style nodal Riemann solver and
+# mesh-motion helpers, independent of ns/lagrange (only links core), so it
+# can never affect subfvns/subfvlagrange.
+add_library(ale STATIC
+  src/ale/ale_global_data_module.F90
+  src/ale/ale_rbf_module.F90
+  src/ale/ale_module.F90
+)
+target_link_libraries(ale PUBLIC core)
+set_target_properties(ale PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mod/ale)
+target_include_directories(ale PUBLIC ${CMAKE_BINARY_DIR}/mod/ale)
+
 # ── High-order Euler library ──────────────────────────────────────────────────
 add_library(euler_ho STATIC
   src/euler_ho/euler_ho_module.F90
@@ -100,6 +113,7 @@ add_executable(subfvgreshoconv   src/ns/ns_gresho_convergence_main.F90)
 add_executable(subfvrbf          src/rbf/rbf_main.F90)
 add_executable(subfveulerho      src/euler_ho/euler_ho_main.F90)
 add_executable(subfvahotest      src/arbitrary_high_order/arbitrary_high_order_main.F90)
+add_executable(subfvale          src/ale/ale_main.F90)
 
 target_link_libraries(subfvns          ns)
 target_link_libraries(subfvshear       ns)
@@ -109,8 +123,9 @@ target_link_libraries(subfvgreshoconv  ns)
 target_link_libraries(subfvrbf         rbf)
 target_link_libraries(subfveulerho     euler_ho)
 target_link_libraries(subfvahotest     arbitrary_high_order)
+target_link_libraries(subfvale         ale)
 
-install(TARGETS subfvns subfvshear subfvacoustic subfvlagrange subfvgreshoconv subfvrbf
+install(TARGETS subfvns subfvshear subfvacoustic subfvlagrange subfvgreshoconv subfvrbf subfvale
   RUNTIME DESTINATION bin
 )
 
