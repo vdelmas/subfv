@@ -16,6 +16,7 @@ module euler_ho_module
   use arbitrary_high_order_module, only: compute_next_order_derivative, &
     compute_next_order_derivative_cweno, apply_grad_bias_correction, &
     aho_module_use_weno_blend => use_weno_blend, &
+    aho_module_use_green_gauss => use_green_gauss, &
     aho_module_use_cweno_center => use_cweno_center, &
     aho_module_cweno_center_weight => cweno_center_weight, &
     aho_module_eps_weight_num => eps_weight_num, &
@@ -78,6 +79,19 @@ module euler_ho_module
   ! but built from aho's nodal-derivative machinery instead of a
   ! cell-centered polynomial fit.
   logical, public :: use_weno_blend           = .true.
+  ! Selects the per-vertex nodal fit compute_next_order_derivative uses
+  ! (arbitrary_high_order_module's own use_green_gauss flag, set from this
+  ! one in aho_reconstruction, exactly like use_weno_blend): .false.
+  ! (default) is the weighted least-squares fit ("aho ls", the original,
+  ! fully-validated path); .true. is the Green-Gauss divergence-theorem
+  ! fit ("aho gg", 2026-09-17), roughly 4x cheaper per call once its own
+  ! geometry-only fit matrix is cached (see that module's ensure_green_
+  ! gauss_mat_cache), reaches the same order 2/3 as aho ls on the vortex,
+  ! and reuses apply_grad_bias_correction unchanged for order 4 -- but its
+  ! own oscillation indicator is a gradient-norm term only (no residual
+  ! counterpart), not yet validated on non-axis-aligned discontinuities
+  ! the way aho ls's combined indicator has been.
+  logical, public :: use_green_gauss          = .false.
   ! CWENO-style central candidate (2026-09-15): at use_weno_blend=.true.
   ! only, folds a large-weight plain/linear candidate into the SAME
   ! nonlinear blend at EVERY recursion level (grad, hess, third). Verified
@@ -210,7 +224,7 @@ contains
       init, sol_uniform, x1drp, sol_w_1drp_l, sol_w_1drp_r, &
       u_bg_vortex, v_bg_vortex, &
       gamma_gas, order, cfl, tmax, n_sol_vtu, &
-      compute_error, error_2d, use_aho_reconstruction, use_weno_blend, &
+      compute_error, error_2d, use_aho_reconstruction, use_weno_blend, use_green_gauss, &
       use_cweno_center, cweno_center_weight, use_grad_bias_correction, flux_scheme, &
       eps_weight_num, eps_weight_num_deep, weno_power, grad_norm_derate
     open(newunit=funit, file=trim(adjustl(filename)))
@@ -1111,6 +1125,7 @@ contains
     ! (WENO or linear per use_weno_blend, uniformly at every level) when
     ! use_cweno_center=.false.
     aho_module_use_weno_blend = use_weno_blend
+    aho_module_use_green_gauss = use_green_gauss
     aho_module_use_cweno_center = use_cweno_center
     aho_module_cweno_center_weight = cweno_center_weight
     aho_module_eps_weight_num = eps_weight_num

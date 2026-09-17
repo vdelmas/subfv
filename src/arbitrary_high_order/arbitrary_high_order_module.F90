@@ -54,6 +54,8 @@ module arbitrary_high_order_module
   public :: compute_derivative_hierarchy_timed
   public :: compute_derivative_hierarchy_overlap_timed
   public :: apply_grad_bias_correction
+  public :: test_green_gauss_nodal
+  public :: test_green_gauss_vortex
 
   ! WENO-indicator regularization. eps_weno (used elsewhere, unchanged)
   ! is just enough to avoid a literal division by zero when a candidate's
@@ -180,6 +182,18 @@ module arbitrary_high_order_module
   ! else, including arbitrary_high_order_main's own standalone tests.
   logical, public :: use_weno_blend = .true.
 
+  ! Selects the per-vertex nodal fit compute_next_order_derivative uses at
+  ! every recursion level: .false. (default) is the weighted
+  ! least-squares fit (compute_nodal_derivative_at_vertex, "aho ls"); .true.
+  ! is the Green-Gauss divergence-theorem fit
+  ! (compute_nodal_derivative_at_vertex_green_gauss, "aho gg", 2026-09-17)
+  ! -- see accumulate_weno_contribution/rescue_zero_weight_cell, which
+  ! branch on this flag. Everything downstream (the WENO scatter,
+  ! apply_grad_bias_correction) is unchanged either way: both nodal fits
+  ! produce the same (dphi_v, oi_v) shape and are consumed identically.
+  ! Set by euler_ho_module's use_green_gauss namelist flag.
+  logical, public :: use_green_gauss = .false.
+
   ! CWENO-style central-candidate experiment (2026-09-15, per the user's
   ! request): classical CWENO (Semplice & Visconti 2020, the same
   ! reference already cited above for the OI fix) doesn't just blend
@@ -220,6 +234,26 @@ module arbitrary_high_order_module
   ! measurably slowed down an order-4 run (found 2026-09-16).
   integer(kind=ENTIER), save :: m2_cache_n_elems = -1
   real(kind=DOUBLE), dimension(:), allocatable, save :: m2_cache_xx, m2_cache_xy, m2_cache_yy
+
+  ! Per-vertex Green-Gauss fit matrix, ALREADY INVERTED (mat in
+  ! compute_nodal_derivative_at_vertex_green_gauss): purely a function of
+  ! mesh geometry (sub-face areas/normals/dx to the vertex), never of phi,
+  ! so it is identical at every recursion level (grad/hess/third) and
+  ! every call for a given vertex -- cached once per distinct mesh
+  ! (same n_elems-fingerprint convention as the caches above) instead of
+  ! rebuilt AND inverted from scratch on every single call. Also stores
+  ! the analytic-inverse switch from an LAPACK SVD pseudo-inverse to a
+  ! closed-form one (see invert_green_gauss_mat's header) -- caching alone
+  ! already removes the per-call cost since geometry doesn't change, but
+  ! the closed-form inverse is also used when the cache is (re)built, so
+  ! even the one-time build is fast. boundary_2d is baked into the cached
+  ! matrix (see invert_green_gauss_mat): row/column 3 is zeroed there
+  ! rather than on every use, so a 2D run's cached inverse already has
+  ! grad_true(3,:)=0 built in.
+  integer(kind=ENTIER), save :: gg_mat_cache_n_vert = -1
+  logical, save :: gg_mat_cache_boundary_2d = .false.
+  real(kind=DOUBLE), dimension(:, :, :), allocatable, save :: gg_mat_inv_cache
+  logical, dimension(:), allocatable, save :: gg_mat_valid_cache
 
   type :: derivative_field_type
     real(kind=DOUBLE), dimension(:, :), allocatable :: val ! (d**order, n_elems)
@@ -542,8 +576,20 @@ contains
     do j = 1, mesh%elem(id_elem)%n_vert
       id_vert = mesh%elem(id_elem)%vert(j)
       id_sub_elem = mesh%elem(id_elem)%sub_elem(j)
-      call compute_nodal_derivative_at_vertex(mesh, d, nc_in, boundary_2d, &
-        id_vert, phi, dphi_v, valid, oi_v)
+      ! Same switch as accumulate_weno_contribution. Note: under
+      ! use_green_gauss this is currently a no-op for a fully-boundary
+      ! cell -- compute_nodal_derivative_at_vertex_green_gauss always
+      ! returns valid=.false. at a boundary vertex (no one-sided estimate
+      ! implemented for that fit yet), so such a cell is correctly left
+      ! at weno_den=0 (handled as dphi=0 by the caller) rather than
+      ! silently borrowing an LS estimate.
+      if (use_green_gauss) then
+        call compute_nodal_derivative_at_vertex_green_gauss(mesh, d, nc_in, boundary_2d, &
+          id_vert, phi, dphi_v, valid, oi_v)
+      else
+        call compute_nodal_derivative_at_vertex(mesh, d, nc_in, boundary_2d, &
+          id_vert, phi, dphi_v, valid, oi_v)
+      end if
       if (.not. valid) cycle ! see compute_nodal_derivative_at_vertex's header
       sub_elem_volume = mesh%sub_elem(id_sub_elem)%volume
       if (use_weno_blend) then
@@ -1018,8 +1064,16 @@ contains
     real(kind=DOUBLE) :: oi_v, eps_here
     integer(kind=ENTIER) :: deriv_order_eff
 
-    call compute_nodal_derivative_at_vertex(mesh, d, nc_in, boundary_2d, &
-      id_vert, phi, dphi_v, valid, oi_v)
+    ! Switch between the two nodal fits right here: everything downstream
+    ! (the WENO scatter, the cache bookkeeping) is already agnostic to
+    ! which one produced (dphi_v, oi_v) -- see use_green_gauss's header.
+    if (use_green_gauss) then
+      call compute_nodal_derivative_at_vertex_green_gauss(mesh, d, nc_in, boundary_2d, &
+        id_vert, phi, dphi_v, valid, oi_v)
+    else
+      call compute_nodal_derivative_at_vertex(mesh, d, nc_in, boundary_2d, &
+        id_vert, phi, dphi_v, valid, oi_v)
+    end if
     dphi_v_cache(:, id_vert) = dphi_v
     valid_cache(id_vert) = valid
     oi_cache(id_vert) = oi_v
@@ -1352,6 +1406,599 @@ contains
       end do
     end do
   end subroutine compute_nodal_derivative_at_vertex
+
+  ! Builds gg_mat_inv_cache (per-vertex, ALREADY INVERTED Green-Gauss fit
+  ! matrix) once per distinct mesh/boundary_2d combination -- a no-op if
+  ! already built. PERFORMANCE FIX (2026-09-17, per the user): profiling
+  ! found the Green-Gauss variant measurably SLOWER than the LS path it was
+  ! meant to speed up, traced to mat being rebuilt AND inverted from scratch
+  ! on every single call -- once per vertex per recursion level
+  ! (grad/hess/third) per RK stage in a real solver -- when it depends only
+  ! on mesh geometry, never on phi, and so only ever needs computing once
+  ! for the life of a static mesh. Fix: cache the inverse here.
+  !
+  ! Always uses pseudo_inverse_inplace_lapack (SVD), deliberately, even
+  ! though an SVD is intrinsically more expensive than a closed-form
+  ! (e.g. adjugate/cofactor) 3x3 inverse: an earlier version of this cache
+  ! used a fast analytic inverse for the well-posed (non-boundary_2d) case
+  ! and only fell back to the SVD for the boundary_2d case (where mat's
+  ! z-column is identically zero -- every neighbor shares the vertex's own
+  ! z-coordinate on a thin extruded mesh -- making mat singular by
+  ! construction). Per the user's own observation: once this is cached and
+  ! built only ONCE per vertex for the whole run, the inversion method's
+  ! own cost stops mattering at all -- it is no longer in the hot path --
+  ! so the extra correctness risk of a hand-derived analytic inverse (its
+  ! own singularity threshold, edge cases on a degenerate 3D element) buys
+  ! nothing. The SVD's robustness (small/zero singular values truncated to
+  ! zero contribution, correct for both the singular boundary_2d case and
+  ! any near-degenerate 3D one) is used unconditionally instead.
+  subroutine ensure_green_gauss_mat_cache(mesh, boundary_2d)
+    use linear_solver_module, only: pseudo_inverse_inplace_lapack
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    logical, intent(in) :: boundary_2d
+
+    integer(kind=ENTIER) :: v, i, j, a, b
+    integer(kind=ENTIER) :: id_sub_elem, id_elem, id_sub_face
+    real(kind=DOUBLE), dimension(3) :: dx, norm
+    real(kind=DOUBLE), dimension(3, 3) :: mat, mat_inv
+
+    ! NB: .eqv. binds LOOSER than .and. in Fortran, so this must be
+    ! parenthesized explicitly -- `A .and. B .eqv. C` parses as
+    ! `(A .and. B) .eqv. C`, not `A .and. (B .eqv. C)`. Without the
+    ! parentheses below, a mesh with a genuinely different n_vert but
+    ! boundary_2d=.false. (matching gg_mat_cache_boundary_2d's default
+    ! initial value) evaluated to a false-positive "already built" and
+    ! returned without ever allocating the cache (found 2026-09-17 via a
+    ! segfault on the first 3D-mesh test: gg_mat_cache_n_vert=-1,
+    ! mesh%n_vert=8405, both boundary_2d flags .false., so
+    ! (-1==8405 .and. .false.) .eqv. .false. -> .false..eqv..false. ->
+    ! .true., i.e. treated as cached when nothing had been built at all).
+    if (gg_mat_cache_n_vert == mesh%n_vert .and. (gg_mat_cache_boundary_2d .eqv. boundary_2d)) return
+
+    if (allocated(gg_mat_inv_cache))  deallocate(gg_mat_inv_cache)
+    if (allocated(gg_mat_valid_cache)) deallocate(gg_mat_valid_cache)
+    allocate(gg_mat_inv_cache(3, 3, mesh%n_vert))
+    allocate(gg_mat_valid_cache(mesh%n_vert))
+
+    do v = 1, mesh%n_vert
+      if (mesh%vert(v)%is_bound) then
+        gg_mat_valid_cache(v) = .false.
+        gg_mat_inv_cache(:, :, v) = 0.0_DOUBLE
+        cycle
+      end if
+      gg_mat_valid_cache(v) = .true.
+
+      mat = 0.0_DOUBLE
+      do i = 1, mesh%vert(v)%n_sub_elems_neigh
+        id_sub_elem = mesh%vert(v)%sub_elem_neigh(i)
+        id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+        dx = mesh%elem(id_elem)%coord - mesh%vert(v)%coord
+
+        do j = 1, mesh%sub_elem(id_sub_elem)%n_sub_faces
+          id_sub_face = mesh%sub_elem(id_sub_elem)%sub_face(j)
+          if (mesh%sub_face(id_sub_face)%left_elem_neigh == id_elem) then
+            norm = mesh%sub_face(id_sub_face)%norm
+          else
+            norm = -mesh%sub_face(id_sub_face)%norm
+          end if
+          do a = 1, 3
+            do b = 1, 3
+              mat(a, b) = mat(a, b) &
+                + mesh%sub_face(id_sub_face)%area * norm(a) * dx(b)
+            end do
+          end do
+        end do
+      end do
+
+      ! mat's third column is identically zero for a boundary_2d run (every
+      ! neighbor shares the vertex's own z-coordinate on a thin single-z-
+      ! layer mesh), making mat singular by construction; a genuinely 3D
+      ! mat is normally well-posed but the SVD handles a near-degenerate
+      ! element just as correctly. Same pseudo-inverse call either way --
+      ! see this routine's header for why not branching on a fast
+      ! closed-form inverse for the well-posed case is the right call once
+      ! this is cached.
+      mat_inv = mat
+      call pseudo_inverse_inplace_lapack(3_ENTIER, mat_inv)
+      if (boundary_2d) mat_inv(3, :) = 0.0_DOUBLE ! bake in the post-hoc zeroing the caller used to do
+      gg_mat_inv_cache(:, :, v) = mat_inv
+    end do
+
+    gg_mat_cache_n_vert = mesh%n_vert
+    gg_mat_cache_boundary_2d = boundary_2d
+  end subroutine ensure_green_gauss_mat_cache
+
+  ! Alternative to compute_nodal_derivative_at_vertex above ("aho ls"): instead
+  ! of a weighted least-squares affine fit over gathered neighbor cells, use a
+  ! discrete Green-Gauss / divergence-theorem sum over the vertex's own dual
+  ! control volume (the median-dual sub_elem/sub_face decomposition already
+  ! computed by mesh_geometry_module), corrected by the inverse of the local
+  ! geometric moment matrix so the result is exact for a linear field on any
+  ! (including skewed/irregular) stencil -- "aho green gauss".
+  !
+  ! Derivation of the correction matrix: for phi linear, phi(x) = phi(x_p) +
+  ! A.(x-x_p), Green-Gauss over the (closed, interior) dual cell gives
+  !   grad_raw = sum_f A_f * n_f * phi(cell_f)
+  !            = phi(x_p) * sum_f(A_f*n_f)  +  sum_f A_f*n_f*(A.(x_elem_f-x_p))
+  ! The first term vanishes for an interior vertex (sum_f A_f*n_f = 0 over a
+  ! closed surface, i.e. Green-Gauss applied to a constant field) -- see the
+  ! commented-out Bp handling near the end of this routine for the boundary
+  ! case, where the dual cell is NOT closed and this term does not vanish;
+  ! boundary vertices are instead excluded (valid=.false.) below, matching how
+  ! compute_nodal_derivative_at_vertex above already excludes vertices it
+  ! cannot resolve, rather than attempting the Bp projection correction.
+  ! The second term is mat.A with mat = sum_f A_f*(n_f (x) (x_elem_f-x_p)), so
+  ! grad_raw = mat.A and the true gradient is recovered as A = mat^-1.grad_raw.
+  ! mat depends only on the vertex's local geometry (not on phi's rank or
+  ! values), so the SAME 3x3 mat/mat^-1 is reused unchanged at every
+  ! recursion order (grad->hess, hess->third, ...): the extra "carried"
+  ! indices of a higher-order phi are just extra independent right-hand-side
+  ! columns, contracted with mat^-1 on the same (newly-added) index -- see
+  ! compute_nodal_derivative_at_vertex's own nc_in for the identical pattern.
+  !
+  ! mat can be singular or ill-conditioned (e.g. a near-planar/degenerate
+  ! local stencil, or a boundary_2d run where the z-direction never varies).
+  ! PERFORMANCE (2026-09-17, per the user, after timing this variant
+  ! measurably SLOWER than the LS path it was meant to speed up -- see
+  ! ensure_green_gauss_mat_cache's header for the root cause and fix):
+  ! mat/its inverse depend only on mesh geometry, so they are now built and
+  ! inverted ONCE per vertex (cached in gg_mat_inv_cache) rather than
+  ! recomputed from scratch, LAPACK call included, on every single call --
+  ! this routine now just gathers grad_raw (phi-dependent, so NOT cacheable)
+  ! and looks up the cached inverse. See ensure_green_gauss_mat_cache for
+  ! the inversion itself (unconditionally the LAPACK SVD pseudo-inverse,
+  ! paid once per vertex, not per call -- see that routine's header for
+  ! why not a faster closed-form inverse once this is cached).
+  !
+  ! WIRED IN 2026-09-17: use_green_gauss (accumulate_weno_contribution/
+  ! rescue_zero_weight_cell) routes compute_next_order_derivative's
+  ! existing grad->hess->third chain through this routine instead of
+  ! compute_nodal_derivative_at_vertex, with no separate driver routine
+  ! needed -- the WENO scatter and apply_grad_bias_correction downstream
+  ! are unchanged either way. oi_v is a real (if partial) oscillation
+  ! indicator as of the same date: a gradient-norm term only, no
+  ! residual-based counterpart -- see the OI_v computation below.
+  subroutine compute_nodal_derivative_at_vertex_green_gauss(mesh, d, nc_in, &
+      boundary_2d, id_vert, phi, dphi_v, valid, oi_v)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: d, nc_in, id_vert
+    logical, intent(in) :: boundary_2d
+    real(kind=DOUBLE), dimension(nc_in, mesh%n_elems), intent(in) :: phi
+    real(kind=DOUBLE), dimension(nc_in*d), intent(out) :: dphi_v
+    logical, intent(out) :: valid
+    real(kind=DOUBLE), intent(out) :: oi_v
+
+    integer(kind=ENTIER) :: i, j, i1, a
+    integer(kind=ENTIER) :: id_sub_elem, id_elem, id_sub_face
+    real(kind=DOUBLE), dimension(3) :: norm
+    real(kind=DOUBLE), dimension(3, nc_in) :: grad_raw, grad_true
+
+    oi_v = 0.0_DOUBLE
+    dphi_v = 0.0_DOUBLE
+
+    call ensure_green_gauss_mat_cache(mesh, boundary_2d)
+
+    valid = gg_mat_valid_cache(id_vert)
+    if (.not. valid) return
+
+    grad_raw = 0.0_DOUBLE
+
+    do i = 1, mesh%vert(id_vert)%n_sub_elems_neigh
+      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(i)
+      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+
+      do j = 1, mesh%sub_elem(id_sub_elem)%n_sub_faces
+        id_sub_face = mesh%sub_elem(id_sub_elem)%sub_face(j)
+        ! sub_face%norm points from left_elem_neigh to right_elem_neigh (same
+        ! convention as the parent face%norm it is built from, see
+        ! mesh_geometry_module's compute_face_norm/compute_subface_norm);
+        ! flip it to point OUTWARD from this sub_elem's own cell.
+        if (mesh%sub_face(id_sub_face)%left_elem_neigh == id_elem) then
+          norm = mesh%sub_face(id_sub_face)%norm
+        else
+          norm = -mesh%sub_face(id_sub_face)%norm
+        end if
+
+        do a = 1, 3
+          do i1 = 1, nc_in
+            grad_raw(a, i1) = grad_raw(a, i1) &
+              + mesh%sub_face(id_sub_face)%area * norm(a) * phi(i1, id_elem)
+          end do
+        end do
+      end do
+    end do
+
+    grad_true = matmul(gg_mat_inv_cache(:, :, id_vert), grad_raw)
+
+    ! Gradient-norm oscillation indicator, same formula and calibration
+    ! (eps_weight_num, grad_norm_derate) as compute_nodal_derivative_at_
+    ! vertex's own OI_v^grad term (see that routine's header for the full
+    ! derivation: beta=h_local*|grad|^2/phi_scale^2 vanishes for a smooth,
+    ! converged gradient as h_local shrinks, but diverges like 1/h_local
+    ! at a real discontinuity). No residual-based OI_v^resid counterpart
+    ! here (2026-09-17): Green-Gauss does not explicitly fit an affine
+    ! model the way the LS path does, so there is no natural "residual
+    ! against the fit" to compute without extra machinery; per this
+    ! session's own finding that OI_v^resid contributes nothing extra on
+    ! axis-aligned cases anyway (Section~\ref{sec:results-disc}), the
+    ! gradient-norm term alone is a reasonable first cut, not yet
+    ! validated on non-axis-aligned discontinuities (DMR/cylinder-style)
+    ! the way the combined LS indicator has been.
+    block
+      real(kind=DOUBLE), dimension(3) :: dxn, dminn, dmaxn, spreadn
+      real(kind=DOUBLE) :: h_local, phi_scale2, weight_sum
+      real(kind=DOUBLE), dimension(nc_in) :: phi_sq_sum
+      integer(kind=ENTIER) :: n_cand, kk, id_e
+
+      n_cand = merge(2_ENTIER, 3_ENTIER, boundary_2d)
+      dminn(1:n_cand) = huge(1.0_DOUBLE)
+      dmaxn(1:n_cand) = -huge(1.0_DOUBLE)
+      weight_sum = 0.0_DOUBLE
+      phi_sq_sum = 0.0_DOUBLE
+      do kk = 1, size(mesh%vert(id_vert)%elem_neigh)
+        id_e = mesh%vert(id_vert)%elem_neigh(kk)
+        dxn = mesh%elem(id_e)%coord - mesh%vert(id_vert)%coord
+        do a = 1, n_cand
+          dminn(a) = min(dminn(a), dxn(a))
+          dmaxn(a) = max(dmaxn(a), dxn(a))
+        end do
+        weight_sum = weight_sum + 1.0_DOUBLE
+        phi_sq_sum = phi_sq_sum + phi(:, id_e)**2
+      end do
+      spreadn(1:n_cand) = dmaxn(1:n_cand) - dminn(1:n_cand)
+      h_local = maxval(spreadn(1:n_cand))
+      phi_scale2 = maxval(phi_sq_sum) / max(weight_sum, 1.0e-300_DOUBLE)
+      oi_v = (h_local * sum(grad_true(1:n_cand, :)**2) / max(phi_scale2, 1.0e-300_DOUBLE)) &
+        / grad_norm_derate
+    end block
+
+    ! Same "direction slow-varying, carried-component fast-varying" flat
+    ! layout as compute_nodal_derivative_at_vertex's own dphi_v.
+    do a = 1, d
+      do i1 = 1, nc_in
+        dphi_v((a-1)*nc_in + i1) = grad_true(a, i1)
+      end do
+    end do
+
+    ! --- Boundary closure correction (not used, see valid=.false. above) ---
+    ! For a boundary vertex the dual cell's own sub_faces don't close (the
+    ! domain boundary itself isn't one of them), so the phi(x_p)*Bp term in
+    ! the linear-field derivation above does NOT vanish and grad_raw picks up
+    ! a spurious component along Bp = sum_f A_f*n_f taken over exactly the
+    ! boundary sub_faces that would be needed to close the volume. One fix
+    ! (used in the original prototype this is adapted from) is to project
+    ! that component back out after solving, per carried component i1:
+    !   grad_true(:,i1) = grad_true(:,i1) &
+    !     - dot_product(grad_true(:,i1), Bp)/dot_product(Bp, Bp) * Bp
+    ! with Bp accumulated alongside mat/grad_raw above (see the commented-out
+    ! lines in the loop). Left as a comment rather than implemented: simply
+    ! excluding boundary vertices (valid=.false.) matches how
+    ! compute_nodal_derivative_at_vertex already handles vertices it cannot
+    ! resolve, and avoids carrying this extra correction (and its own
+    ! interaction with mat's pseudo-inverse) through the not-yet-designed
+    ! recombination step.
+  end subroutine compute_nodal_derivative_at_vertex_green_gauss
+
+  ! Classic exactness/accuracy test for compute_nodal_derivative_at_vertex_
+  ! green_gauss, degree by degree: build a polynomial phi of degree k whose
+  ! exact derivative of order k is a KNOWN constant tensor, feed the mesh's
+  ! own cell centroids into the appropriate exact lower-order derivative
+  ! field, call the routine at every non-boundary vertex, and compare
+  ! against the known constant. Prints max/RMS error over all valid
+  ! (non-boundary) vertices for degree 1 (grad), 2 (hess, fed the exact
+  ! linear gradient field), and 3 (third, fed the exact linear Hessian
+  ! field) in turn.
+  subroutine test_green_gauss_nodal(mesh, boundary_2d)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    logical, intent(in) :: boundary_2d
+
+    real(kind=DOUBLE), dimension(3) :: v1, v3, x0, dx
+    real(kind=DOUBLE), dimension(3, 3) :: h2
+    real(kind=DOUBLE), dimension(:, :), allocatable :: phi1, phi2, phi3
+    real(kind=DOUBLE), dimension(:), allocatable :: dphi_v
+    real(kind=DOUBLE) :: err, max_err, rms_err
+    integer(kind=ENTIER) :: i, id_vert, n_valid, a, i1
+    logical :: valid
+    real(kind=DOUBLE) :: oi_v, s
+
+    x0 = 0.0_DOUBLE
+    v1 = [1.3_DOUBLE, -0.7_DOUBLE, 0.5_DOUBLE]
+    v3 = [1.3_DOUBLE, -0.7_DOUBLE, 0.5_DOUBLE]
+    h2 = reshape([2.0_DOUBLE, 0.3_DOUBLE, -0.1_DOUBLE, &
+                  0.3_DOUBLE, -1.5_DOUBLE, 0.2_DOUBLE, &
+                  -0.1_DOUBLE, 0.2_DOUBLE, 0.8_DOUBLE], [3, 3])
+    if (boundary_2d) then
+      v1(3) = 0.0_DOUBLE
+      v3(3) = 0.0_DOUBLE
+      h2(3, :) = 0.0_DOUBLE
+      h2(:, 3) = 0.0_DOUBLE
+    end if
+
+    ! --- Degree 1: phi1 = v1.(x-x0), exact grad = v1 (constant) ---
+    allocate(phi1(1, mesh%n_elems), dphi_v(3))
+    do i = 1, mesh%n_elems
+      phi1(1, i) = dot_product(v1, mesh%elem(i)%coord - x0)
+    end do
+
+    max_err = 0.0_DOUBLE
+    rms_err = 0.0_DOUBLE
+    n_valid = 0
+    do id_vert = 1, mesh%n_vert
+      if (mesh%vert(id_vert)%is_ghost) cycle
+      call compute_nodal_derivative_at_vertex_green_gauss(mesh, 3_ENTIER, &
+        1_ENTIER, boundary_2d, id_vert, phi1, dphi_v, valid, oi_v)
+      if (.not. valid) cycle
+      n_valid = n_valid + 1
+      err = norm2(dphi_v - v1)
+      max_err = max(max_err, err)
+      rms_err = rms_err + err**2
+    end do
+    rms_err = sqrt(rms_err / max(n_valid, 1))
+    print *, 'green_gauss degree=1 (grad of linear): n_valid=', n_valid, &
+      ' max_err=', max_err, ' rms_err=', rms_err
+    deallocate(phi1, dphi_v)
+
+    ! --- Degree 2: phi2 = 1/2 (x-x0).H2.(x-x0), exact grad = H2.(x-x0), ---
+    ! --- exact hess = H2 (constant) ---
+    allocate(phi2(3, mesh%n_elems), dphi_v(9))
+    do i = 1, mesh%n_elems
+      dx = mesh%elem(i)%coord - x0
+      phi2(:, i) = matmul(h2, dx)
+    end do
+
+    max_err = 0.0_DOUBLE
+    rms_err = 0.0_DOUBLE
+    n_valid = 0
+    do id_vert = 1, mesh%n_vert
+      if (mesh%vert(id_vert)%is_ghost) cycle
+      call compute_nodal_derivative_at_vertex_green_gauss(mesh, 3_ENTIER, &
+        3_ENTIER, boundary_2d, id_vert, phi2, dphi_v, valid, oi_v)
+      if (.not. valid) cycle
+      n_valid = n_valid + 1
+      err = 0.0_DOUBLE
+      do a = 1, 3
+        do i1 = 1, 3
+          err = err + (dphi_v((a-1)*3+i1) - h2(a, i1))**2
+        end do
+      end do
+      err = sqrt(err)
+      max_err = max(max_err, err)
+      rms_err = rms_err + err**2
+    end do
+    rms_err = sqrt(rms_err / max(n_valid, 1))
+    print *, 'green_gauss degree=2 (hess, from exact grad field): n_valid=', &
+      n_valid, ' max_err=', max_err, ' rms_err=', rms_err
+    deallocate(phi2, dphi_v)
+
+    ! --- Degree 3: phi3 = 1/6 (v3.(x-x0))^3, exact hess = (v3.(x-x0))*v3(x)v3, ---
+    ! --- exact third = v3(x)v3(x)v3 (constant, fully symmetric) ---
+    allocate(phi3(9, mesh%n_elems), dphi_v(27))
+    do i = 1, mesh%n_elems
+      dx = mesh%elem(i)%coord - x0
+      s = dot_product(v3, dx)
+      do a = 1, 3
+        do i1 = 1, 3
+          phi3((a-1)*3+i1, i) = s * v3(a) * v3(i1)
+        end do
+      end do
+    end do
+
+    max_err = 0.0_DOUBLE
+    rms_err = 0.0_DOUBLE
+    n_valid = 0
+    do id_vert = 1, mesh%n_vert
+      if (mesh%vert(id_vert)%is_ghost) cycle
+      call compute_nodal_derivative_at_vertex_green_gauss(mesh, 3_ENTIER, &
+        9_ENTIER, boundary_2d, id_vert, phi3, dphi_v, valid, oi_v)
+      if (.not. valid) cycle
+      n_valid = n_valid + 1
+      err = 0.0_DOUBLE
+      do a = 1, 3
+        do i1 = 1, 9
+          err = err + (dphi_v((a-1)*9+i1) &
+            - v3(a)*v3(1+(i1-1)/3)*v3(1+mod(i1-1, 3)))**2
+        end do
+      end do
+      err = sqrt(err)
+      max_err = max(max_err, err)
+      rms_err = rms_err + err**2
+    end do
+    rms_err = sqrt(rms_err / max(n_valid, 1))
+    print *, 'green_gauss degree=3 (third, from exact hess field): n_valid=', &
+      n_valid, ' max_err=', max_err, ' rms_err=', rms_err
+    deallocate(phi3, dphi_v)
+
+    ! --- Degree-mismatch accuracy check: grad (order=1 call) of the SAME
+    ! quadratic phi2q = 1/2 (x-x0).H2.(x-x0) used as the degree-2 input
+    ! above. Unlike the degree-1 exactness test, this is NOT exact (the
+    ! scheme is only linear-exact) -- report max/RMS error here so the
+    ! caller can compare it across a mesh-refinement sequence and confirm
+    ! the error actually shrinks at the expected rate (not just small on
+    ! one mesh by coincidence).
+    allocate(phi1(1, mesh%n_elems), dphi_v(3))
+    do i = 1, mesh%n_elems
+      dx = mesh%elem(i)%coord - x0
+      phi1(1, i) = 0.5_DOUBLE * dot_product(dx, matmul(h2, dx))
+    end do
+
+    max_err = 0.0_DOUBLE
+    rms_err = 0.0_DOUBLE
+    n_valid = 0
+    do id_vert = 1, mesh%n_vert
+      if (mesh%vert(id_vert)%is_ghost) cycle
+      call compute_nodal_derivative_at_vertex_green_gauss(mesh, 3_ENTIER, &
+        1_ENTIER, boundary_2d, id_vert, phi1, dphi_v, valid, oi_v)
+      if (.not. valid) cycle
+      n_valid = n_valid + 1
+      err = norm2(dphi_v - matmul(h2, mesh%vert(id_vert)%coord - x0))
+      max_err = max(max_err, err)
+      rms_err = rms_err + err**2
+    end do
+    rms_err = sqrt(rms_err / max(n_valid, 1))
+    print *, 'green_gauss degree-mismatch (grad of quadratic, order=1 call): &
+      &n_valid=', n_valid, ' max_err=', max_err, ' rms_err=', rms_err
+    deallocate(phi1, dphi_v)
+  end subroutine test_green_gauss_nodal
+
+  ! Same idea as test_green_gauss_nodal's degree-mismatch check, but on the
+  ! REAL (non-polynomial) stationary isentropic vortex density profile used
+  ! throughout this paper (domain [-10,10]^2, beta=5, gamma=1.4, t=0 --
+  ! stationary, no need to advance in time), compared against its exact
+  ! analytic grad/hess/third (closed form, generated+verified symbolically).
+  ! Static test only (no RK3, no flux, no WENO): isolates whether Step 1
+  ! (this Green-Gauss nodal operator alone) gets the right order on smooth,
+  ! non-polynomial data -- NOT the same claim as the paper's own vortex
+  ! L2(rho) convergence table, which measures the full solver (Step1 +
+  ! recombination + WENO + RK3); that combined test needs the still-unbuilt
+  ! nodal-to-cell recombination step and is out of scope here.
+  subroutine test_green_gauss_vortex(mesh, boundary_2d)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    logical, intent(in) :: boundary_2d
+
+    real(kind=DOUBLE), dimension(:, :), allocatable :: phi1, phi2, phi3
+    real(kind=DOUBLE), dimension(:), allocatable :: dphi_v
+    real(kind=DOUBLE) :: err, max_err, rms_err
+    real(kind=DOUBLE) :: rho_v, gx, gy, hxx, hxy, hyy, txxx, txxy, txyy, tyyy
+    real(kind=DOUBLE) :: xv, yv
+    integer(kind=ENTIER) :: i, id_vert, n_valid, a, i1
+    logical :: valid
+    real(kind=DOUBLE) :: oi_v
+
+    ! --- Degree 1: grad(rho) at every cell centroid, exact vs analytic gx,gy ---
+    allocate(phi1(1, mesh%n_elems), dphi_v(3))
+    do i = 1, mesh%n_elems
+      call vortex_ref(mesh%elem(i)%coord(1), mesh%elem(i)%coord(2), &
+        rho_v, gx, gy, hxx, hxy, hyy, txxx, txxy, txyy, tyyy)
+      phi1(1, i) = rho_v
+    end do
+
+    max_err = 0.0_DOUBLE
+    rms_err = 0.0_DOUBLE
+    n_valid = 0
+    do id_vert = 1, mesh%n_vert
+      if (mesh%vert(id_vert)%is_ghost) cycle
+      call compute_nodal_derivative_at_vertex_green_gauss(mesh, 3_ENTIER, &
+        1_ENTIER, boundary_2d, id_vert, phi1, dphi_v, valid, oi_v)
+      if (.not. valid) cycle
+      xv = mesh%vert(id_vert)%coord(1); yv = mesh%vert(id_vert)%coord(2)
+      call vortex_ref(xv, yv, rho_v, gx, gy, hxx, hxy, hyy, txxx, txxy, txyy, tyyy)
+      n_valid = n_valid + 1
+      err = norm2(dphi_v - [gx, gy, 0.0_DOUBLE])
+      max_err = max(max_err, err)
+      rms_err = rms_err + err**2
+    end do
+    rms_err = sqrt(rms_err / max(n_valid, 1))
+    print *, 'green_gauss vortex order=1 (grad of rho): n_valid=', n_valid, &
+      ' max_err=', max_err, ' rms_err=', rms_err
+    deallocate(phi1, dphi_v)
+
+    ! --- Degree 2: hess(rho), fed the EXACT analytic grad field ---
+    allocate(phi2(3, mesh%n_elems), dphi_v(9))
+    do i = 1, mesh%n_elems
+      call vortex_ref(mesh%elem(i)%coord(1), mesh%elem(i)%coord(2), &
+        rho_v, gx, gy, hxx, hxy, hyy, txxx, txxy, txyy, tyyy)
+      phi2(:, i) = [gx, gy, 0.0_DOUBLE]
+    end do
+
+    max_err = 0.0_DOUBLE
+    rms_err = 0.0_DOUBLE
+    n_valid = 0
+    do id_vert = 1, mesh%n_vert
+      if (mesh%vert(id_vert)%is_ghost) cycle
+      call compute_nodal_derivative_at_vertex_green_gauss(mesh, 3_ENTIER, &
+        3_ENTIER, boundary_2d, id_vert, phi2, dphi_v, valid, oi_v)
+      if (.not. valid) cycle
+      xv = mesh%vert(id_vert)%coord(1); yv = mesh%vert(id_vert)%coord(2)
+      call vortex_ref(xv, yv, rho_v, gx, gy, hxx, hxy, hyy, txxx, txxy, txyy, tyyy)
+      n_valid = n_valid + 1
+      ! true Hess = [[hxx,hxy,0],[hxy,hyy,0],[0,0,0]], layout (a-1)*3+i1
+      err = (dphi_v(1)-hxx)**2 + (dphi_v(2)-hxy)**2 + dphi_v(3)**2 &
+          + (dphi_v(4)-hxy)**2 + (dphi_v(5)-hyy)**2 + dphi_v(6)**2 &
+          + dphi_v(7)**2 + dphi_v(8)**2 + dphi_v(9)**2
+      err = sqrt(err)
+      max_err = max(max_err, err)
+      rms_err = rms_err + err**2
+    end do
+    rms_err = sqrt(rms_err / max(n_valid, 1))
+    print *, 'green_gauss vortex order=2 (hess, from exact grad field): &
+      &n_valid=', n_valid, ' max_err=', max_err, ' rms_err=', rms_err
+    deallocate(phi2, dphi_v)
+
+    ! --- Degree 3: third(rho), fed the EXACT analytic hess field ---
+    allocate(phi3(9, mesh%n_elems), dphi_v(27))
+    do i = 1, mesh%n_elems
+      call vortex_ref(mesh%elem(i)%coord(1), mesh%elem(i)%coord(2), &
+        rho_v, gx, gy, hxx, hxy, hyy, txxx, txxy, txyy, tyyy)
+      ! Hess flattened (a-1)*3+i1, z-row/col zero
+      phi3(:, i) = [hxx, hxy, 0.0_DOUBLE, hxy, hyy, 0.0_DOUBLE, &
+                    0.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE]
+    end do
+
+    max_err = 0.0_DOUBLE
+    rms_err = 0.0_DOUBLE
+    n_valid = 0
+    do id_vert = 1, mesh%n_vert
+      if (mesh%vert(id_vert)%is_ghost) cycle
+      call compute_nodal_derivative_at_vertex_green_gauss(mesh, 3_ENTIER, &
+        9_ENTIER, boundary_2d, id_vert, phi3, dphi_v, valid, oi_v)
+      if (.not. valid) cycle
+      xv = mesh%vert(id_vert)%coord(1); yv = mesh%vert(id_vert)%coord(2)
+      call vortex_ref(xv, yv, rho_v, gx, gy, hxx, hxy, hyy, txxx, txxy, txyy, tyyy)
+      n_valid = n_valid + 1
+      ! true third tensor: fully symmetric in (x,y) only, zero if any index
+      ! is z. dphi_v((a-1)*9 + (a2-1)*3+i1): a=direction of new (3rd)
+      ! derivative, a2/i1 = the Hess indices carried from the previous step.
+      err = 0.0_DOUBLE
+      err = err + (dphi_v(1)-txxx)**2 + (dphi_v(2)-txxy)**2 + dphi_v(3)**2
+      err = err + (dphi_v(4)-txxy)**2 + (dphi_v(5)-txyy)**2 + dphi_v(6)**2
+      err = err + dphi_v(7)**2 + dphi_v(8)**2 + dphi_v(9)**2
+      err = err + (dphi_v(10)-txxy)**2 + (dphi_v(11)-txyy)**2 + dphi_v(12)**2
+      err = err + (dphi_v(13)-txyy)**2 + (dphi_v(14)-tyyy)**2 + dphi_v(15)**2
+      err = err + dphi_v(16)**2 + dphi_v(17)**2 + dphi_v(18)**2
+      err = err + dphi_v(19)**2 + dphi_v(20)**2 + dphi_v(21)**2
+      err = err + dphi_v(22)**2 + dphi_v(23)**2 + dphi_v(24)**2
+      err = err + dphi_v(25)**2 + dphi_v(26)**2 + dphi_v(27)**2
+      err = sqrt(err)
+      max_err = max(max_err, err)
+      rms_err = rms_err + err**2
+    end do
+    rms_err = sqrt(rms_err / max(n_valid, 1))
+    print *, 'green_gauss vortex order=3 (third, from exact hess field): &
+      &n_valid=', n_valid, ' max_err=', max_err, ' rms_err=', rms_err
+    deallocate(phi3, dphi_v)
+  end subroutine test_green_gauss_vortex
+
+  ! Exact analytic rho and its grad/hess/third (x,y components only -- the
+  ! vortex is z-invariant) for the stationary (t=0) isentropic vortex used
+  ! throughout this paper (vortex_prim in euler_ho_module: beta=5,
+  ! gamma=1.4, domain-centred, no background advection velocity at t=0).
+  ! Generated via sympy (diff + cse) from the exact same closed-form
+  ! rho=(1-K*exp(1-r2))**2.5 used there, K=(gamma-1)*beta^2/(8*gamma*pi^2) --
+  ! not re-derived by hand, to avoid transcription error in the third
+  ! derivatives' otherwise-unwieldy algebra.
+  pure subroutine vortex_ref(x, y, rho_v, gx, gy, hxx, hxy, hyy, &
+      txxx, txxy, txyy, tyyy)
+    implicit none
+    real(kind=DOUBLE), intent(in) :: x, y
+    real(kind=DOUBLE), intent(out) :: rho_v, gx, gy, hxx, hxy, hyy
+    real(kind=DOUBLE), intent(out) :: txxx, txxy, txyy, tyyy
+
+    real(kind=DOUBLE) :: cse0, cse1, cse2, cse3, cse4, cse5, cse6, cse7, &
+      cse8, cse9, cse10, cse11, cse12, cse13, cse14, cse15, cse16, cse17, &
+      cse18, cse19, cse20, cse21
+
+    include "vortex_ref_cse.inc"
+  end subroutine vortex_ref
+
+  ! Builds neigh_cache_start/neigh_cache_list (CSR) by calling
 
   ! Builds neigh_cache_start/neigh_cache_list (CSR) by calling
   ! gather_ls_neighbors once per vertex -- the one-time cost that used to
