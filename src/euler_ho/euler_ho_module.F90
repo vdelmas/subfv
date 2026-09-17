@@ -14,10 +14,14 @@ module euler_ho_module
   use mesh_module
   use quadrature_module
   use arbitrary_high_order_module, only: compute_next_order_derivative, &
-    compute_next_order_derivative_cweno, &
+    compute_next_order_derivative_cweno, apply_grad_bias_correction, &
     aho_module_use_weno_blend => use_weno_blend, &
     aho_module_use_cweno_center => use_cweno_center, &
-    aho_module_cweno_center_weight => cweno_center_weight
+    aho_module_cweno_center_weight => cweno_center_weight, &
+    aho_module_eps_weight_num => eps_weight_num, &
+    aho_module_eps_weight_num_deep => eps_weight_num_deep, &
+    aho_module_weno_power => weno_power, &
+    aho_module_grad_norm_derate => grad_norm_derate
   use mpi_module, only: mpi_send_recv_type, mpi_memory_exchange
   implicit none
   private
@@ -31,6 +35,28 @@ module euler_ho_module
   character(len=255), public :: meshfile_path = ''
   character(len=255), public :: meshfile      = ''
   real(kind=DOUBLE),  public :: gamma_gas     = 1.4_DOUBLE
+  ! Per-cell ratio of specific heats, for multi-material cases (e.g. a
+  ! helium bubble in air). Allocated and default-filled with gamma_gas by
+  ! init_sol; specific init cases (e.g. shock_bubble, init=6) overwrite it
+  ! per-cell from a geometric material criterion. Every physics function
+  ! that used to read the module-global scalar gamma_gas directly now
+  ! takes the relevant cell(s)' gamma_arr value(s) as an explicit argument
+  ! instead, mirroring src/lagrange/lagrange_module.F90's gamma_arr/gl/gr
+  ! pattern (gamma_gas itself is kept only as the uniform-fill default and
+  ! for the single-material analytic vortex state, vortex_prim).
+  real(kind=DOUBLE), dimension(:), allocatable, public :: gamma_arr
+  ! Multi-material gamma TRANSPORT (Abgrall 1996 quasi-conservative
+  ! approach): rho*Gamma, Gamma = 1/(gamma-1), is carried as sol's 6th
+  ! component (see sol's declaration in init_sol for the full rationale),
+  ! evolved by euler_ho_main's ordinary RK3/MPI-exchange machinery
+  ! together with the 5 physical equations -- no separate bookkeeping.
+  ! Advecting Gamma itself (rather than gamma directly) avoids spurious
+  ! pressure oscillations at a material interface, a well-known pitfall of
+  ! the naive approach. gamma_arr is re-derived from sol(6,:)/sol(1,:) via
+  ! sync_gamma_arr, called once per RK stage with that stage's own sol.
+  ! For a single-material run, Gamma is uniform everywhere so this
+  ! reduces to a no-op and gamma_arr stays exactly gamma_gas, as before --
+  ! zero behaviour change.
   real(kind=DOUBLE),  public :: cfl           = 0.4_DOUBLE
   real(kind=DOUBLE),  public :: tmax          = 1.0_DOUBLE
   integer(kind=ENTIER), public :: order       = 1     ! 1, 2, 3, or 4 (aho only; see ls_reconstruction)
@@ -70,6 +96,33 @@ module euler_ho_module
   ! arbitrary-high-order memory for the full writeup.
   logical, public :: use_cweno_center          = .false.
   real(kind=DOUBLE), public :: cweno_center_weight = 1000.0_DOUBLE
+  ! At order=4 only: corrects the grad step's own O(h^2) affine-fit bias
+  ! in place, using the per-vertex nodal Hessian/third-derivative tensors
+  ! already computed as intermediates while building hess/third (see
+  ! arbitrary_high_order_module's apply_grad_bias_correction for the full
+  ! derivation) -- no extra neighbors, no higher-degree fit, same 4-point
+  ! stencil throughout. Verified on the synthetic cubic field: reduces
+  ! grad's error by ~4-6x under the current WENO scheme (would reach
+  ! machine precision under a plain linear blend, where hess/third are
+  ! themselves already exact); the residual gap under WENO tracks how far
+  ! hess/third themselves still are from exact (see eps_weight_num_deep).
+  ! Only implemented for boundary_2d=.true.; a .false. mesh silently gets
+  ! no correction (apply_grad_bias_correction is a documented no-op
+  ! there), not yet extended to genuine 3D.
+  logical, public :: use_grad_bias_correction  = .true.
+  ! Runtime-settable mirrors of arbitrary_high_order_module's own
+  ! eps_weight_num/eps_weight_num_deep/weno_power/grad_norm_derate
+  ! (2026-09-17, made settable there too -- see that module's own
+  ! comments for what each controls, including why eps_weight_num's
+  ! default was raised 1e-6 -> 1e-2 the same day). Defaults match the
+  ! module's defaults exactly; exposed here, and propagated into the aho
+  ! module inside aho_reconstruction exactly like use_weno_blend/
+  ! use_cweno_center already are, so an input_data.f can sweep OI/epsilon
+  ! calibration without a rebuild.
+  real(kind=DOUBLE), public :: eps_weight_num      = 1.0e-2_DOUBLE
+  real(kind=DOUBLE), public :: eps_weight_num_deep = 1.0_DOUBLE
+  integer(kind=ENTIER), public :: weno_power       = 1
+  real(kind=DOUBLE), public :: grad_norm_derate    = 1.0e4_DOUBLE
   ! Numerical flux at each face quadrature point: 'rusanov' (local
   ! Lax-Friedrichs, the original default) or 'three_wave' (an HLLC-family,
   ! 3-wave approximate Riemann solver -- same algorithm as
@@ -104,6 +157,9 @@ module euler_ho_module
   !   0 = uniform (sol_uniform: primitive w)
   !   1 = Sod 1D (x1drp, sol_w_1drp_l, sol_w_1drp_r: primitive)
   !   2 = isentropic vortex (beta=5, centre at origin at t=0, moves with (u_bg,v_bg))
+  !   6 = shock-bubble interaction (Haas & Sturtevant 1987 JFM 181; see
+  !       init_sol's case(6) for the full geometry/state -- multi-material,
+  !       sets gamma_arr per-cell)
   real(kind=DOUBLE), public :: u_bg_vortex  = 0.0_DOUBLE  ! background x-velocity
   real(kind=DOUBLE), public :: v_bg_vortex  = 0.0_DOUBLE  ! background y-velocity
   integer(kind=ENTIER), public :: init         = 0
@@ -117,6 +173,7 @@ module euler_ho_module
   public :: compute_prim
   public :: compute_rhs
   public :: compute_dt
+  public :: sync_gamma_arr
   public :: compute_error_vortex
   public :: test_reconstruction_exactness
   public :: compute_cell_moments
@@ -154,7 +211,8 @@ contains
       u_bg_vortex, v_bg_vortex, &
       gamma_gas, order, cfl, tmax, n_sol_vtu, &
       compute_error, error_2d, use_aho_reconstruction, use_weno_blend, &
-      use_cweno_center, cweno_center_weight, flux_scheme
+      use_cweno_center, cweno_center_weight, use_grad_bias_correction, flux_scheme, &
+      eps_weight_num, eps_weight_num_deep, weno_power, grad_norm_derate
     open(newunit=funit, file=trim(adjustl(filename)))
     read(nml=INPUT_PARAM, unit=funit)
     close(funit)
@@ -194,11 +252,32 @@ contains
   ! ----------------------------------------------------------------
   subroutine init_sol(mesh, sol)
     type(mesh_type), intent(in)    :: mesh
-    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(out) :: sol
+    ! sol(1:5,:) = [rho, rho*u, rho*v, rho*w, rho*E] as before; sol(6,:) =
+    ! rho*Gamma, Gamma = 1/(gamma-1), the multi-material gamma-transport
+    ! variable (Abgrall 1996 quasi-conservative approach -- advecting
+    ! Gamma itself, rather than gamma directly, avoids spurious pressure
+    ! oscillations at a material interface). Folded into sol (rather than
+    ! kept as a separate parallel array) so it rides through euler_ho_main's
+    ! existing RK3/MPI-exchange machinery for free, with no separate
+    ! bookkeeping to keep in sync -- a real bug from an earlier, separate-
+    ! array version (module-level state going stale mid-RK-step, found by
+    ! subfv-c1, 2026-09-16) is structurally impossible this way. Every
+    ! function that only knows the physical 5-equation system (conserv_to_
+    ! primit, reconstruct, three_wave/two_wave/rusanov, cs, euler_flux)
+    ! takes an explicit sol(1:5,i)/wL(1:5)/wR(1:5) slice; gamma_arr is
+    ! re-derived from sol(6,i) via sync_gamma_arr after every RK stage
+    ! (see euler_ho_main.F90). For a single-material run, Gamma is uniform
+    ! everywhere so this is a no-op and gamma_arr stays exactly gamma_gas,
+    ! as before -- zero behaviour change.
+    real(kind=DOUBLE), dimension(6, mesh%n_elems), intent(out) :: sol
 
     integer(kind=ENTIER) :: i
     real(kind=DOUBLE), dimension(5) :: w
     real(kind=DOUBLE), dimension(3) :: xc
+    real(kind=DOUBLE) :: rb
+
+    if (.not. allocated(gamma_arr)) allocate(gamma_arr(mesh%n_elems))
+    gamma_arr = gamma_gas
 
     do i = 1, mesh%n_elems
       xc = mesh%elem(i)%coord
@@ -219,10 +298,51 @@ contains
         w = woodward_colella_state(xc(1))
       case (2)   ! isentropic vortex: high-order cell average via volume quadrature
         call vortex_cell_average(mesh, i, 0.0_DOUBLE, w)
+      case (6)   ! Shock-bubble interaction (Haas & Sturtevant 1987, JFM 181;
+                 ! also Quirk & Karni 1996 JFM 318, Razmi et al. 2019 JAFM
+                 ! 12(2) 631-645). Ms=1.22 planar shock in air hits a
+                 ! cylindrical He+28%air bubble. Full domain 500x89mm (not
+                 ! symmetry-reduced): shock initially at x=400mm, bubble
+                 ! centred at (350mm,44.5mm), radius 25mm. The post-shock
+                 ! block (x>400mm) set here is ALSO imposed continuously at
+                 ! the right boundary via a 'freestream' BC (see
+                 ! input_data.f / bc_val) since the shock propagates left,
+                 ! away from that edge, over the run -- the IC and the BC
+                 ! must both carry the same post-shock state for
+                 ! consistency at t=0+.
+        block
+          real(kind=DOUBLE), parameter :: xc_bub    = 0.350_DOUBLE
+          real(kind=DOUBLE), parameter :: yc_bub    = 0.0445_DOUBLE
+          real(kind=DOUBLE), parameter :: r_bub     = 0.025_DOUBLE
+          real(kind=DOUBLE), parameter :: x_shock   = 0.400_DOUBLE
+          real(kind=DOUBLE), parameter :: gamma_air = 1.4_DOUBLE
+          ! He contaminated 28% by mass with air (Haas & Sturtevant):
+          ! effective gamma and density ratio vs. ambient air.
+          real(kind=DOUBLE), parameter :: gamma_bub = 1.648_DOUBLE
+          real(kind=DOUBLE), parameter :: rho_bub   = 0.287_DOUBLE / 1.578_DOUBLE
+          ! Post-shock air state from the normal-shock relations for
+          ! gamma=1.4, Ms=1.22 (rho2/rho1, p2/p1, and u2 via the standard
+          ! shock-jump formulas); shock moves in -x, so u2 < 0.
+          real(kind=DOUBLE), parameter :: rho_post  = 1.376364_DOUBLE
+          real(kind=DOUBLE), parameter :: p_post    = 1.569800_DOUBLE
+          real(kind=DOUBLE), parameter :: vx_post   = -0.394729_DOUBLE
+          rb = sqrt((xc(1) - xc_bub)**2 + (xc(2) - yc_bub)**2)
+          if (xc(1) > x_shock) then
+            gamma_arr(i) = gamma_air
+            w = [rho_post, vx_post, 0.0_DOUBLE, 0.0_DOUBLE, p_post]
+          else if (rb <= r_bub) then
+            gamma_arr(i) = gamma_bub
+            w = [rho_bub, 0.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 1.0_DOUBLE]
+          else
+            gamma_arr(i) = gamma_air
+            w = [1.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 1.0_DOUBLE]
+          end if
+        end block
       case default
         w = sol_uniform
       end select
-      sol(:, i) = primit_to_conserv(w)
+      sol(1:5, i) = primit_to_conserv(w, gamma_arr(i))
+      sol(6, i)   = sol(1, i) / (gamma_arr(i) - 1.0_DOUBLE)
     end do
   end subroutine init_sol
 
@@ -231,22 +351,42 @@ contains
   ! ----------------------------------------------------------------
   subroutine compute_prim(mesh, sol, prim)
     type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: sol
+    real(kind=DOUBLE), dimension(6, mesh%n_elems), intent(in)  :: sol
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(out) :: prim
     integer(kind=ENTIER) :: i
     do i = 1, mesh%n_elems
-      prim(:, i) = conserv_to_primit(sol(:, i))
+      prim(:, i) = conserv_to_primit(sol(1:5, i), gamma_arr(i))
     end do
   end subroutine compute_prim
+
+  ! ----------------------------------------------------------------
+  ! Recompute gamma_arr(i) = 1 + sol(1,i)/sol(6,i) (rho/(rho*Gamma), i.e.
+  ! 1+1/Gamma) from the given RK-stage's own sol -- both the density and
+  ! the just-transported Gamma field come from the SAME stage array (e.g.
+  ! sol1), which is what keeps this correctly synchronised stage-by-stage
+  ! (see sol's declaration in init_sol for why this used to be a separate,
+  ! easy-to-desync array). Call after every RK-stage state update, before
+  ! the next compute_prim/compute_rhs call reads gamma_arr for its flux
+  ! gL/gR -- mirrors how sol's own ghost cells get refreshed via
+  ! mpi_memory_exchange after each stage (see euler_ho_main.F90).
+  ! ----------------------------------------------------------------
+  subroutine sync_gamma_arr(mesh, sol)
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(6, mesh%n_elems), intent(in) :: sol
+    integer(kind=ENTIER) :: i
+    do i = 1, mesh%n_elems
+      gamma_arr(i) = 1.0_DOUBLE + sol(1, i) / sol(6, i)
+    end do
+  end subroutine sync_gamma_arr
 
   ! ----------------------------------------------------------------
   ! RHS: -1/V * sum_faces(int_face F·n dA), using face quadrature
   ! ----------------------------------------------------------------
   subroutine compute_rhs(mesh, sol, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
     type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: sol
+    real(kind=DOUBLE), dimension(6, mesh%n_elems), intent(in)  :: sol
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: prim
-    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(out) :: rhs
+    real(kind=DOUBLE), dimension(6, mesh%n_elems), intent(out) :: rhs
     real(kind=DOUBLE), dimension(mesh%n_elems),    intent(out) :: sum_lambda
     ! Current stage's time, for a time-dependent BC (e.g. 'dmr_top'). Not
     ! tracked per-RK-substage (all 3 SSP-RK3 stages of one step reuse the
@@ -297,7 +437,8 @@ contains
     sum_lambda = 0.0_DOUBLE
     call face_flux_loop(mesh, sol, prim, grad, hess, rhs, sum_lambda, t, third)
 
-    ! Divide by cell volume
+    ! Divide by cell volume (all 6 components, including the gamma-
+    ! transport one)
     block
       integer(kind=ENTIER) :: i
       do i = 1, mesh%n_elems
@@ -458,8 +599,8 @@ contains
           end if
         end do
 
-        w_ls  = reconstruct(prim, grad_ls,  hess_ls,  i, xq, xc_vec)
-        w_aho = reconstruct(prim, grad_aho, hess_aho, i, xq, xc_vec)
+        w_ls  = reconstruct(prim, grad_ls,  hess_ls,  i, xq, xc_vec, gamma_gas)
+        w_aho = reconstruct(prim, grad_aho, hess_aho, i, xq, xc_vec, gamma_gas)
 
         err_ls  = max(err_ls,  maxval(abs(w_ls  - wexact)))
         err_aho = max(err_aho, maxval(abs(w_aho - wexact)))
@@ -479,7 +620,7 @@ contains
   ! ----------------------------------------------------------------
   subroutine compute_error_vortex(mesh, sol, t, h, l2err)
     type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(6, mesh%n_elems), intent(in) :: sol
     real(kind=DOUBLE), intent(in) :: t
     real(kind=DOUBLE), intent(out) :: h, l2err
 
@@ -535,7 +676,7 @@ contains
         end if
       end do
 
-      wsol = conserv_to_primit(sol(:, i))
+      wsol = conserv_to_primit(sol(1:5, i), gamma_arr(i))
       ! Use z-face area as 2D cell area so h = sqrt(avg_area) = h_2D
       ! independent of dz. Fallback to vol^(2/3) if no z-face was found.
       if (found_zface .and. area_q > 0.0_DOUBLE) then
@@ -935,6 +1076,19 @@ contains
     real(kind=DOUBLE), dimension(:, :), allocatable :: grad_flat, hess_flat, third_flat
     integer(kind=ENTIER) :: e, v, dir1, dir2, dir3
     logical :: do_exchange
+    ! Per-vertex nodal Hessian/third-derivative estimates (before WENO
+    ! scatter into cells), needed by apply_grad_bias_correction -- see
+    ! use_grad_bias_correction's header.
+    real(kind=DOUBLE), dimension(:, :), allocatable :: hess_v, third_v
+    logical, dimension(:), allocatable :: valid_hess_v, valid_third_v
+    ! Per-vertex oscillation indicator from the GRADIENT-level call,
+    ! needed by apply_grad_bias_correction so its own vertex-to-cell
+    ! scatter matches grad_flat's actual WENO weighting -- see that
+    ! subroutine's header. Zero-filled (-> uniform weight) when
+    ! use_cweno_center=.true., since compute_next_order_derivative_cweno
+    ! does not expose an oi_v_out (that path is retired/off by default;
+    ! not fixed here).
+    real(kind=DOUBLE), dimension(:), allocatable :: grad_oi_v
 
     do_exchange = present(num_procs)
     if (do_exchange) do_exchange = num_procs > 1
@@ -959,34 +1113,53 @@ contains
     aho_module_use_weno_blend = use_weno_blend
     aho_module_use_cweno_center = use_cweno_center
     aho_module_cweno_center_weight = cweno_center_weight
+    aho_module_eps_weight_num = eps_weight_num
+    aho_module_eps_weight_num_deep = eps_weight_num_deep
+    aho_module_weno_power = weno_power
+    aho_module_grad_norm_derate = grad_norm_derate
 
     allocate(grad_flat(15, mesh%n_elems))
+    allocate(grad_oi_v(mesh%n_vert))
+    grad_oi_v = 0.0_DOUBLE
     if (use_cweno_center) then
       call compute_next_order_derivative_cweno(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, &
         prim, grad_flat)
     else
       call compute_next_order_derivative(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, &
-        prim, grad_flat, deriv_order=1_ENTIER)
+        prim, grad_flat, deriv_order=1_ENTIER, oi_v_out=grad_oi_v)
     end if
 
     if (do_exchange) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 15_ENTIER, grad_flat)
 
-    do e = 1, mesh%n_elems
-      do dir1 = 1, 3
-        do v = 1, 5
-          grad(v, dir1, e) = grad_flat((dir1-1)*5 + v, e)
-        end do
-      end do
-    end do
-
+    ! grad_flat is unpacked into `grad` further below, AFTER the order-4
+    ! bias correction (if any) has had a chance to correct it in place --
+    ! see use_grad_bias_correction's header.
     if (order >= 3 .and. allocated(hess)) then
       allocate(hess_flat(45, mesh%n_elems))
       if (use_cweno_center) then
         call compute_next_order_derivative_cweno(mesh, 3_ENTIER, 15_ENTIER, boundary_2d, &
           grad_flat, hess_flat)
       else
-        call compute_next_order_derivative(mesh, 3_ENTIER, 15_ENTIER, boundary_2d, &
-          grad_flat, hess_flat, deriv_order=2_ENTIER)
+        block
+          real(kind=DOUBLE), dimension(:, :), allocatable :: hess_v_local
+          logical, dimension(:), allocatable :: valid_hess_v_local
+          logical :: need_hess_v
+          need_hess_v = (order >= 4 .and. present(third) .and. use_grad_bias_correction)
+          if (need_hess_v) then
+            call compute_next_order_derivative(mesh, 3_ENTIER, 15_ENTIER, boundary_2d, &
+              grad_flat, hess_flat, deriv_order=2_ENTIER, &
+              dphi_v_out=hess_v_local, valid_v_out=valid_hess_v_local)
+            if (allocated(hess_v)) deallocate(hess_v)
+            if (allocated(valid_hess_v)) deallocate(valid_hess_v)
+            allocate(hess_v(size(hess_v_local,1), size(hess_v_local,2)))
+            allocate(valid_hess_v(size(valid_hess_v_local)))
+            hess_v = hess_v_local
+            valid_hess_v = valid_hess_v_local
+          else
+            call compute_next_order_derivative(mesh, 3_ENTIER, 15_ENTIER, boundary_2d, &
+              grad_flat, hess_flat, deriv_order=2_ENTIER)
+          end if
+        end block
       end if
       if (do_exchange) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 45_ENTIER, hess_flat)
 
@@ -1007,8 +1180,31 @@ contains
             call compute_next_order_derivative_cweno(mesh, 3_ENTIER, 45_ENTIER, boundary_2d, &
               hess_flat, third_flat)
           else
-            call compute_next_order_derivative(mesh, 3_ENTIER, 45_ENTIER, boundary_2d, &
-              hess_flat, third_flat, deriv_order=3_ENTIER)
+            if (use_grad_bias_correction) then
+              block
+                real(kind=DOUBLE), dimension(:, :), allocatable :: third_v_local
+                logical, dimension(:), allocatable :: valid_third_v_local
+                call compute_next_order_derivative(mesh, 3_ENTIER, 45_ENTIER, boundary_2d, &
+                  hess_flat, third_flat, deriv_order=3_ENTIER, &
+                  dphi_v_out=third_v_local, valid_v_out=valid_third_v_local)
+                if (allocated(third_v)) deallocate(third_v)
+                if (allocated(valid_third_v)) deallocate(valid_third_v)
+                allocate(third_v(size(third_v_local,1), size(third_v_local,2)))
+                allocate(valid_third_v(size(valid_third_v_local)))
+                third_v = third_v_local
+                valid_third_v = valid_third_v_local
+              end block
+              ! Correct grad_flat IN PLACE using the per-vertex nodal
+              ! hess_v/third_v just computed above -- see
+              ! apply_grad_bias_correction's header for the full
+              ! derivation. Only implemented/safe for boundary_2d; a
+              ! .false. call is a documented no-op.
+              call apply_grad_bias_correction(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, &
+                grad_flat, hess_v, third_v, valid_hess_v, valid_third_v, grad_oi_v)
+            else
+              call compute_next_order_derivative(mesh, 3_ENTIER, 45_ENTIER, boundary_2d, &
+                hess_flat, third_flat, deriv_order=3_ENTIER)
+            end if
           end if
           if (do_exchange) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 135_ENTIER, third_flat)
 
@@ -1027,11 +1223,26 @@ contains
           deallocate(third_flat)
         end if
       end if
-
       deallocate(hess_flat)
     end if
 
+    ! grad's own unpacking, deferred until here (regardless of order) so
+    ! the order-4 bias correction above (if it ran) has already updated
+    ! grad_flat in place.
+    do e = 1, mesh%n_elems
+      do dir1 = 1, 3
+        do v = 1, 5
+          grad(v, dir1, e) = grad_flat((dir1-1)*5 + v, e)
+        end do
+      end do
+    end do
+
     deallocate(grad_flat)
+    if (allocated(grad_oi_v)) deallocate(grad_oi_v)
+    if (allocated(hess_v)) deallocate(hess_v)
+    if (allocated(valid_hess_v)) deallocate(valid_hess_v)
+    if (allocated(third_v)) deallocate(third_v)
+    if (allocated(valid_third_v)) deallocate(valid_third_v)
   end subroutine aho_reconstruction
 
   ! Solves ATA_in * x = rhs_in (ATA_in = A^T W A, a Gram/normal matrix,
@@ -1194,10 +1405,11 @@ contains
   ! Main face flux loop
   subroutine face_flux_loop(mesh, sol, prim, grad, hess, rhs, sum_lambda, t, third)
     type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: sol, prim
+    real(kind=DOUBLE), dimension(6, mesh%n_elems), intent(in)  :: sol
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: prim
     real(kind=DOUBLE), dimension(5, 3, mesh%n_elems), intent(in) :: grad
     real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(in) :: hess
-    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(inout) :: rhs
+    real(kind=DOUBLE), dimension(6, mesh%n_elems), intent(inout) :: rhs
     real(kind=DOUBLE), dimension(mesh%n_elems),    intent(inout) :: sum_lambda
     real(kind=DOUBLE), intent(in) :: t
     real(kind=DOUBLE), dimension(:, :, :, :, :), allocatable, intent(in), optional :: third
@@ -1210,7 +1422,13 @@ contains
     real(kind=DOUBLE), dimension(1)    :: qwts_single
     real(kind=DOUBLE) :: qwt
     real(kind=DOUBLE), dimension(5) :: wL, wR, flux
-    real(kind=DOUBLE) :: lambda
+    real(kind=DOUBLE) :: lambda, gL, gR
+    ! Passive-scalar flux for the gamma-transport variable sol(6,:) =
+    ! rho*Gamma (see gamma_arr's declaration): upwinded by the sign of the
+    ! mass flux (flux(1)) already computed below -- same convention as a
+    ! species mass fraction in a Godunov scheme, the material identity
+    ! moves with the local mass flux.
+    real(kind=DOUBLE) :: flux_rgm1, Gl_rgm1, Gr_rgm1
     logical :: is_zface, use_face_quad
 
     do iface = 1, mesh%n_faces
@@ -1220,6 +1438,20 @@ contains
 
       ! Skip ghost-owned faces
       if (mesh%elem(il)%is_ghost) cycle
+
+      ! Ghost/boundary cells (ir <= 0) have no gamma_arr entry of their
+      ! own -- assume the same material as the interior cell il. Correct
+      ! for a wall/outflow/freestream BC where the boundary does not
+      ! coincide with a material interface (the case for every BC used so
+      ! far, including shock_bubble's right-edge post-shock inflow, which
+      ! is pure air on both sides); would need a per-BC gamma if a future
+      ! case put a material interface directly on a domain boundary.
+      gL = gamma_arr(il)
+      if (ir > 0) then
+        gR = gamma_arr(ir)
+      else
+        gR = gL
+      end if
 
       n_fvert = mesh%face(iface)%n_vert
 
@@ -1300,9 +1532,9 @@ contains
           qwt   = qwts_single(q)
         end if
 
-        wL = reconstruct(prim, grad, hess, il, xface, mesh%elem(il)%coord, third)
+        wL = reconstruct(prim, grad, hess, il, xface, mesh%elem(il)%coord, gL, third)
         if (ir > 0) then
-          wR = reconstruct(prim, grad, hess, ir, xface, mesh%elem(ir)%coord, third)
+          wR = reconstruct(prim, grad, hess, ir, xface, mesh%elem(ir)%coord, gR, third)
         else
           ! Boundary: reconstruct left then apply BC
           wR = ghost_prim(xface, norm, wL, -ir, t)
@@ -1313,16 +1545,35 @@ contains
         ! declaration for why this is an integer compare, not a string one.
         select case (flux_scheme_id)
         case (FLUX_THREE_WAVE)
-          flux = three_wave_flux(wL, wR, norm) * qwt
+          flux = three_wave_flux(wL, wR, norm, gL, gR) * qwt
         case (FLUX_TWO_WAVE)
-          flux = two_wave_flux(wL, wR, norm) * qwt
+          flux = two_wave_flux(wL, wR, norm, gL, gR) * qwt
         case default
-          flux = rusanov(wL, wR, norm) * qwt
+          flux = rusanov(wL, wR, norm, gL, gR) * qwt
         end select
-        lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
-                     abs(dot_product(wR(2:4), norm)) + cs(wR)) * qwt
+        lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL, gL), &
+                     abs(dot_product(wR(2:4), norm)) + cs(wR, gR)) * qwt
 
-        rhs(:, il)  = rhs(:, il)  - flux
+        ! Gamma-transport passive-scalar flux: upwind Gamma = sol(6,:)/
+        ! sol(1,:) (rho*Gamma/rho) by the sign of the mass flux flux(1)
+        ! just computed above (the same mass flux that already carries
+        ! rhs(1,:)'s continuity equation). Ghost/boundary (ir<=0) reuses
+        ! Gl_rgm1, matching the existing gR=gL "same material as interior
+        ! neighbour" convention used for gL/gR just above.
+        Gl_rgm1 = sol(6, il) / sol(1, il)
+        if (ir > 0) then
+          Gr_rgm1 = sol(6, ir) / sol(1, ir)
+        else
+          Gr_rgm1 = Gl_rgm1
+        end if
+        if (flux(1) >= 0.0_DOUBLE) then
+          flux_rgm1 = flux(1) * Gl_rgm1
+        else
+          flux_rgm1 = flux(1) * Gr_rgm1
+        end if
+
+        rhs(1:5, il) = rhs(1:5, il) - flux
+        rhs(6, il)   = rhs(6, il)   - flux_rgm1
         sum_lambda(il) = sum_lambda(il) + lambda
         if (ir > 0) then
           ! Fortran's .and. does not guarantee short-circuit evaluation
@@ -1334,7 +1585,8 @@ contains
           ! crashing in every optimized build up to now). Nest the checks
           ! instead so ir's sign always gates the array access.
           if (.not. mesh%elem(ir)%is_ghost) then
-            rhs(:, ir)     = rhs(:, ir)     + flux
+            rhs(1:5, ir) = rhs(1:5, ir) + flux
+            rhs(6, ir)   = rhs(6, ir)   + flux_rgm1
             sum_lambda(ir) = sum_lambda(ir) + lambda
           end if
         end if
@@ -1347,8 +1599,9 @@ contains
   ! Returns .true. if w_cand is a physically acceptable reconstruction
   ! relative to the reference state w_ref.
   ! Rejects: negative rho or p; velocity more than 20x the reference speed + c.
-  pure function physical_state(w_cand, w_ref) result(ok)
+  pure function physical_state(w_cand, w_ref, g) result(ok)
     real(kind=DOUBLE), dimension(5), intent(in) :: w_cand, w_ref
+    real(kind=DOUBLE), intent(in) :: g
     logical :: ok
     real(kind=DOUBLE) :: spd_ref, spd_cand, c_ref
 
@@ -1359,7 +1612,7 @@ contains
     ! Velocity magnitude check
     spd_ref  = w_ref(2)**2  + w_ref(3)**2  + w_ref(4)**2
     spd_cand = w_cand(2)**2 + w_cand(3)**2 + w_cand(4)**2
-    c_ref    = gamma_gas * w_ref(5) / max(w_ref(1), 1.0e-16_DOUBLE)
+    c_ref    = g * w_ref(5) / max(w_ref(1), 1.0e-16_DOUBLE)
     if (spd_cand > 400.0_DOUBLE * (spd_ref + c_ref)) return   ! 20x speed limit
 
     ok = .true.
@@ -1448,12 +1701,15 @@ contains
   ! order-4 cubic term) is optional, allocatable-but-absent-when-unused
   ! exactly like `hess` already is, so every existing call site that only
   ! ever ran at order<=3 compiles and behaves unchanged without passing it.
-  function reconstruct(prim, grad, hess, i, xq, xc, third) result(w)
+  function reconstruct(prim, grad, hess, i, xq, xc, g, third) result(w)
     real(kind=DOUBLE), dimension(:, :),          intent(in) :: prim    ! (5, n_elems)
     real(kind=DOUBLE), dimension(:, :, :),       intent(in) :: grad    ! (5, 3, n_elems)
     real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(in) :: hess
     integer(kind=ENTIER), intent(in) :: i
     real(kind=DOUBLE), dimension(3), intent(in) :: xq, xc
+    ! Owning cell i's ratio of specific heats -- only used to bound
+    ! physical_state's reference sound speed, see gamma_arr's declaration.
+    real(kind=DOUBLE), intent(in) :: g
     real(kind=DOUBLE), dimension(:, :, :, :, :), allocatable, intent(in), optional :: third
     real(kind=DOUBLE), dimension(5) :: w
 
@@ -1466,7 +1722,7 @@ contains
 
     if (order >= 2) then
       w_try = w + matmul(grad(:, :, i), dx)
-      if (physical_state(w_try, w)) w = w_try
+      if (physical_state(w_try, w, g)) w = w_try
     end if
 
     if (order >= 3 .and. allocated(hess)) then
@@ -1488,7 +1744,7 @@ contains
             * (dx(j) * dx(k) - cell_moment(j, k, i))
         end do
       end do
-      if (physical_state(w_try, prim(:, i))) w = w_try
+      if (physical_state(w_try, prim(:, i), g)) w = w_try
     end if
 
     if (order >= 4 .and. present(third)) then
@@ -1519,7 +1775,7 @@ contains
             end do
           end do
         end do
-        if (physical_state(w_try, w_prev)) w = w_try
+        if (physical_state(w_try, w_prev, g)) w = w_try
       end if
     end if
 
@@ -1575,8 +1831,9 @@ contains
   ! Euler physics
   ! ================================================================
 
-  pure function conserv_to_primit(u) result(w)
+  pure function conserv_to_primit(u, g) result(w)
     real(kind=DOUBLE), dimension(5), intent(in) :: u
+    real(kind=DOUBLE), intent(in) :: g
     real(kind=DOUBLE), dimension(5) :: w
     real(kind=DOUBLE) :: rho_inv, ke
     rho_inv = 1.0_DOUBLE / max(u(1), 1.0e-16_DOUBLE)
@@ -1585,11 +1842,12 @@ contains
     w(3) = u(3) * rho_inv
     w(4) = u(4) * rho_inv
     ke   = 0.5_DOUBLE * (w(2)**2 + w(3)**2 + w(4)**2)
-    w(5) = (gamma_gas - 1.0_DOUBLE) * (u(5) - u(1) * ke)
+    w(5) = (g - 1.0_DOUBLE) * (u(5) - u(1) * ke)
   end function conserv_to_primit
 
-  pure function primit_to_conserv(w) result(u)
+  pure function primit_to_conserv(w, g) result(u)
     real(kind=DOUBLE), dimension(5), intent(in) :: w
+    real(kind=DOUBLE), intent(in) :: g
     real(kind=DOUBLE), dimension(5) :: u
     real(kind=DOUBLE) :: ke
     ke   = 0.5_DOUBLE * (w(2)**2 + w(3)**2 + w(4)**2)
@@ -1597,26 +1855,28 @@ contains
     u(2) = w(1) * w(2)
     u(3) = w(1) * w(3)
     u(4) = w(1) * w(4)
-    u(5) = w(1) * (ke + w(5) / ((gamma_gas - 1.0_DOUBLE) * w(1)))
+    u(5) = w(1) * (ke + w(5) / ((g - 1.0_DOUBLE) * w(1)))
   end function primit_to_conserv
 
   ! Sound speed from primitive state
-  pure function cs(w) result(c)
+  pure function cs(w, g) result(c)
     real(kind=DOUBLE), dimension(5), intent(in) :: w
+    real(kind=DOUBLE), intent(in) :: g
     real(kind=DOUBLE) :: c
-    c = sqrt(max(gamma_gas * w(5) / max(w(1), 1.0e-16_DOUBLE), 0.0_DOUBLE))
+    c = sqrt(max(g * w(5) / max(w(1), 1.0e-16_DOUBLE), 0.0_DOUBLE))
   end function cs
 
   ! Euler flux F(w)·n in conservative variables
-  pure function euler_flux(w, n) result(F)
+  pure function euler_flux(w, n, g) result(F)
     real(kind=DOUBLE), dimension(5), intent(in) :: w
     real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), intent(in) :: g
     real(kind=DOUBLE), dimension(5) :: F
     real(kind=DOUBLE) :: vn, rho, p, e
 
     rho = w(1); p = w(5)
     vn  = w(2)*n(1) + w(3)*n(2) + w(4)*n(3)
-    e   = p / ((gamma_gas - 1.0_DOUBLE) * rho) + 0.5_DOUBLE*(w(2)**2+w(3)**2+w(4)**2)
+    e   = p / ((g - 1.0_DOUBLE) * rho) + 0.5_DOUBLE*(w(2)**2+w(3)**2+w(4)**2)
 
     F(1) = rho * vn
     F(2) = rho * w(2) * vn + p * n(1)
@@ -1626,31 +1886,34 @@ contains
   end function euler_flux
 
   ! Rusanov (local Lax-Friedrichs) numerical flux per unit area
-  pure function rusanov(wL, wR, n) result(F)
+  pure function rusanov(wL, wR, n, gL, gR) result(F)
     real(kind=DOUBLE), dimension(5), intent(in) :: wL, wR
     real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), intent(in) :: gL, gR
     real(kind=DOUBLE), dimension(5) :: F
     real(kind=DOUBLE) :: lam, vnL, vnR
 
     vnL = wL(2)*n(1) + wL(3)*n(2) + wL(4)*n(3)
     vnR = wR(2)*n(1) + wR(3)*n(2) + wR(4)*n(3)
-    lam = max(abs(vnL) + cs(wL), abs(vnR) + cs(wR))
+    lam = max(abs(vnL) + cs(wL, gL), abs(vnR) + cs(wR, gR))
 
-    F = 0.5_DOUBLE * (euler_flux(wL, n) + euler_flux(wR, n)) &
-      - 0.5_DOUBLE * lam * (primit_to_conserv(wR) - primit_to_conserv(wL))
+    F = 0.5_DOUBLE * (euler_flux(wL, n, gL) + euler_flux(wR, n, gR)) &
+      - 0.5_DOUBLE * lam * (primit_to_conserv(wR, gR) - primit_to_conserv(wL, gL))
   end function rusanov
 
   ! Three-wave (HLLC-family) approximate Riemann solver: resolves left,
   ! contact and right waves separately instead of Rusanov's single-speed
   ! dissipation, so it captures a contact discontinuity with much less
-  ! smearing. Ported from ns_euler_rs_module's three_wave (same algorithm,
-  ! a flux-difference form of HLLC -- Toro, "Riemann Solvers and Numerical
-  ! Methods for Fluid Dynamics", ch. 10) rather than linked, so this
-  ! solver keeps its own dependency footprint (core + quadrature_module +
-  ! arbitrary_high_order_module only).
-  pure function three_wave_flux(wL, wR, n) result(F)
+  ! smearing. Same algorithm as ns_euler_rs_module's three_wave (a
+  ! flux-difference form of HLLC -- Toro, "Riemann Solvers and Numerical
+  ! Methods for Fluid Dynamics", ch. 10), kept as its own local copy here
+  ! (rather than a shared routine with optional gl/gr) so this solver's
+  ! gamma_arr multi-material support never touches ns_euler_rs_module or
+  ! any other consumer of it.
+  pure function three_wave_flux(wL, wR, n, gL, gR) result(F)
     real(kind=DOUBLE), dimension(5), intent(in) :: wL, wR
     real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), intent(in) :: gL, gR
     real(kind=DOUBLE), dimension(5) :: F
 
     real(kind=DOUBLE), dimension(5) :: uL, uR, fL, fR, uL_star, uR_star
@@ -1659,10 +1922,10 @@ contains
     real(kind=DOUBLE) :: rhoL_star, rhoR_star, pL_star, pR_star, sL_wave, sR_wave
 
     rhoL = wL(1); vnL = dot_product(wL(2:4), n); pL = wL(5)
-    uL = primit_to_conserv(wL); eL = uL(5)/rhoL; aL = cs(wL)
+    uL = primit_to_conserv(wL, gL); eL = uL(5)/rhoL; aL = cs(wL, gL)
 
     rhoR = wR(1); vnR = dot_product(wR(2:4), n); pR = wR(5)
-    uR = primit_to_conserv(wR); eR = uR(5)/rhoR; aR = cs(wR)
+    uR = primit_to_conserv(wR, gR); eR = uR(5)/rhoR; aR = cs(wR, gR)
 
     fL(1)   = vnL*uL(1)
     fL(2:4) = vnL*uL(2:4) + pL*n
@@ -1700,11 +1963,12 @@ contains
   ! Two-wave (HLL-family) approximate Riemann solver: a single intermediate
   ! star state between the left and right acoustic waves (no separate
   ! contact wave), so it is more dissipative than three_wave at a contact
-  ! but cheaper. Ported from ns_euler_rs_module's two_wave, same rationale
-  ! as three_wave_flux (self-contained, not linked).
-  pure function two_wave_flux(wL, wR, n) result(F)
+  ! but cheaper. Same algorithm as ns_euler_rs_module's two_wave, kept as
+  ! its own local copy for the same reason as three_wave_flux above.
+  pure function two_wave_flux(wL, wR, n, gL, gR) result(F)
     real(kind=DOUBLE), dimension(5), intent(in) :: wL, wR
     real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), intent(in) :: gL, gR
     real(kind=DOUBLE), dimension(5) :: F
 
     real(kind=DOUBLE), dimension(5) :: uL, uR, fL, fR, u_star
@@ -1712,10 +1976,10 @@ contains
     real(kind=DOUBLE) :: lambdaL, lambdaR, sL_wave, sR_wave
 
     rhoL = wL(1); vnL = dot_product(wL(2:4), n); pL = wL(5)
-    aL = cs(wL); uL = primit_to_conserv(wL)
+    aL = cs(wL, gL); uL = primit_to_conserv(wL, gL)
 
     rhoR = wR(1); vnR = dot_product(wR(2:4), n); pR = wR(5)
-    aR = cs(wR); uR = primit_to_conserv(wR)
+    aR = cs(wR, gR); uR = primit_to_conserv(wR, gR)
 
     fL(1)   = vnL*uL(1)
     fL(2:4) = vnL*uL(2:4) + pL*n

@@ -20,6 +20,11 @@ program euler_ho_main
   type(mesh_type) :: mesh
   type(mpi_send_recv_type) :: mpi_send_recv
 
+  ! sol/sol1/sol2/rhs are 6-wide: components 1:5 are the usual
+  ! [rho,rho*u,rho*v,rho*w,rho*E], component 6 is the gamma-transport
+  ! variable rho*Gamma (Gamma=1/(gamma-1), see euler_ho_module's gamma_arr
+  ! declaration) -- it rides through the exact same RK3/MPI-exchange
+  ! arithmetic as the 5 physical equations, no separate bookkeeping.
   real(kind=DOUBLE), allocatable :: sol(:, :), sol1(:, :), sol2(:, :)
   real(kind=DOUBLE), allocatable :: prim(:, :), rhs(:, :)
   real(kind=DOUBLE), allocatable :: sum_lambda(:)
@@ -47,8 +52,8 @@ program euler_ho_main
   call compute_geometry_mesh(mesh, .true., boundary_2d)
   if (order >= 3) call compute_cell_moments(mesh)
 
-  allocate(sol(5, mesh%n_elems), sol1(5, mesh%n_elems), sol2(5, mesh%n_elems))
-  allocate(prim(5, mesh%n_elems), rhs(5, mesh%n_elems))
+  allocate(sol(6, mesh%n_elems), sol1(6, mesh%n_elems), sol2(6, mesh%n_elems))
+  allocate(prim(5, mesh%n_elems), rhs(6, mesh%n_elems))
   allocate(sum_lambda(mesh%n_elems))
 
   call init_sol(mesh, sol)
@@ -56,7 +61,7 @@ program euler_ho_main
   ! independently (each rank knows its own ghost cells' geometry), so this
   ! exchange is a no-op for t=0 -- it matters starting at RK stage 1 below,
   ! see the comment there.
-  if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5_ENTIER, sol)
+  if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 6_ENTIER, sol)
 
   ! Initial output
   i_sol_vtu = 0
@@ -94,20 +99,23 @@ program euler_ho_main
     ! comparing a 6-rank order-1 vortex run against its serial reference:
     ! L2(rho) differed by 14% at h=0.25, where an MPI-transparent scheme
     ! must match to roundoff.
-    if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5_ENTIER, sol1)
+    if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 6_ENTIER, sol1)
+    call sync_gamma_arr(mesh, sol1)
 
     ! SSP-RK3 stage 2: u2 = 3/4*u0 + 1/4*(u1 + dt*L(u1))
     call compute_prim(mesh, sol1, prim)
     call compute_rhs(mesh, sol1, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
     sol2 = 0.75_DOUBLE * sol + 0.25_DOUBLE * (sol1 + dt * rhs)
-    if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5_ENTIER, sol2)
+    if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 6_ENTIER, sol2)
+    call sync_gamma_arr(mesh, sol2)
 
     ! SSP-RK3 stage 3: u^{n+1} = 1/3*u0 + 2/3*(u2 + dt*L(u2))
     call compute_prim(mesh, sol2, prim)
     call compute_rhs(mesh, sol2, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
     sol  = (1.0_DOUBLE/3.0_DOUBLE) * sol &
          + (2.0_DOUBLE/3.0_DOUBLE) * (sol2 + dt * rhs)
-    if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5_ENTIER, sol)
+    if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 6_ENTIER, sol)
+    call sync_gamma_arr(mesh, sol)
 
     t    = t + dt
     iter = iter + 1
@@ -144,14 +152,14 @@ program euler_ho_main
 contains
 
   subroutine write_vtu(mesh, sol, me, idx)
-    use euler_ho_module, only: compute_prim
+    use euler_ho_module, only: compute_prim, gamma_arr
     type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(6, mesh%n_elems), intent(in) :: sol
     integer, intent(in) :: me, idx
     integer(kind=ENTIER) :: fn_v, fn_pv
     character(len=255) :: fname
-    real(kind=DOUBLE), allocatable :: prim_loc(:, :), rho(:), ux(:), uy(:), uz(:), p(:), temp(:)
-    real(kind=DOUBLE), allocatable :: centroid(:, :)
+    real(kind=DOUBLE), allocatable :: prim_loc(:, :), rho(:), p(:), temp(:)
+    real(kind=DOUBLE), allocatable :: centroid(:, :), velocity(:, :)
     real(kind=DOUBLE), parameter :: r_gas = 287.0_DOUBLE ! air, for T = p/(rho*R)
     integer(kind=ENTIER) :: i
 
@@ -160,14 +168,11 @@ contains
     allocate(prim_loc(5, mesh%n_elems))
     call compute_prim(mesh, sol, prim_loc)
 
-    allocate(rho(mesh%n_elems), ux(mesh%n_elems), uy(mesh%n_elems))
-    allocate(uz(mesh%n_elems), p(mesh%n_elems), temp(mesh%n_elems))
-    allocate(centroid(3, mesh%n_elems))
+    allocate(rho(mesh%n_elems), p(mesh%n_elems), temp(mesh%n_elems))
+    allocate(centroid(3, mesh%n_elems), velocity(3, mesh%n_elems))
     do i = 1, mesh%n_elems
       rho(i) = prim_loc(1, i)
-      ux(i)  = prim_loc(2, i)
-      uy(i)  = prim_loc(3, i)
-      uz(i)  = prim_loc(4, i)
+      velocity(:, i) = prim_loc(2:4, i)
       p(i)   = prim_loc(5, i)
       temp(i) = p(i) / (max(rho(i), 1.0e-16_DOUBLE) * r_gas)
       centroid(:, i) = mesh%elem(i)%coord
@@ -176,16 +181,15 @@ contains
     call open_file_vtu(mesh, trim(adjustl(fname)), fn_v, fn_pv)
     call write_file_vtu_start_cell_data(mesh, trim(adjustl(fname)), fn_v, fn_pv)
     call write_file_vtu_cell_scalar(mesh, trim(adjustl(fname)), fn_v, fn_pv, rho, 'rho')
-    call write_file_vtu_cell_scalar(mesh, trim(adjustl(fname)), fn_v, fn_pv, ux,  'u')
-    call write_file_vtu_cell_scalar(mesh, trim(adjustl(fname)), fn_v, fn_pv, uy,  'v')
-    call write_file_vtu_cell_scalar(mesh, trim(adjustl(fname)), fn_v, fn_pv, uz,  'w')
+    call write_file_vtu_cell_vector(mesh, trim(adjustl(fname)), fn_v, fn_pv, velocity, 'velocity')
     call write_file_vtu_cell_scalar(mesh, trim(adjustl(fname)), fn_v, fn_pv, p,   'p')
     call write_file_vtu_cell_scalar(mesh, trim(adjustl(fname)), fn_v, fn_pv, temp, 'T')
+    call write_file_vtu_cell_scalar(mesh, trim(adjustl(fname)), fn_v, fn_pv, gamma_arr, 'gamma')
     call write_file_vtu_cell_vector(mesh, trim(adjustl(fname)), fn_v, fn_pv, centroid, 'Centroid')
     call write_file_vtu_end_cell_data(mesh, trim(adjustl(fname)), fn_v, fn_pv)
     call close_file_vtu(mesh, trim(adjustl(fname)), fn_v, fn_pv)
 
-    deallocate(prim_loc, rho, ux, uy, uz, p, temp, centroid)
+    deallocate(prim_loc, rho, p, temp, centroid, velocity)
   end subroutine write_vtu
 
 end program euler_ho_main
