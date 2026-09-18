@@ -709,7 +709,7 @@ contains
   end subroutine compute_rhs_lagrange_classic_iso
 
   subroutine compute_rhs_lagrange_sidil(mesh, sol, vp, dt, rhs, &
-      n_bc, bc_type, bc_val, b2d, mass, method, b2d_h, gamma_arr, vp_is_imposed)
+      n_bc, bc_type, bc_val, b2d, mass, method, b2d_h, gamma_arr, vp_is_imposed, h_p_arr)
     use linear_solver_module, only: lu_solve, print_mat, inverse_3_by_3
     implicit none
 
@@ -726,6 +726,7 @@ contains
     real(kind=DOUBLE), dimension(5, n_bc) :: bc_val
     logical, intent(in) :: b2d
     real(kind=DOUBLE), intent(in) :: b2d_h
+    real(kind=DOUBLE), dimension(mesh%n_vert), intent(out), optional :: h_p_arr
 
     integer(kind=ENTIER) :: i, j, id_elem, id_face, id_sub_face
     integer(kind=ENTIER) :: id_sub_elem
@@ -746,9 +747,12 @@ contains
     do i=1, mesh%n_vert
 
       if (.not. vp_is_imposed(i)) then
-        call compute_nodal_velocity_sidil(mesh, i, sol, vp(:, i), method, b2d, b2d_h, gamma_arr)
+        call compute_nodal_velocity_sidil(mesh, i, sol, vp(:, i), method, b2d, b2d_h, gamma_arr, &
+          n_bc, bc_type, bc_val)
       end if
-      call compute_nodal_pressure_sidil(mesh, i, sol, pp, method, b2d, b2d_h, gamma_arr)
+      call compute_nodal_pressure_sidil(mesh, i, sol, pp, method, b2d, b2d_h, gamma_arr, &
+        n_bc, bc_type, bc_val)
+      if (present(h_p_arr)) h_p_arr(i) = compute_length(mesh, i, method, b2d, b2d_h)
 
       a_p = 0.0_DOUBLE
       do j=1, mesh%vert(i)%n_sub_elems_neigh
@@ -1233,7 +1237,8 @@ contains
     w(5) = w(1)**gamma
   end subroutine sol_isentropic_vortex
 
-  subroutine compute_nodal_velocity_sidil(mesh, id_vert, sol, vp, method, b2d, b2d_h, gamma_arr)
+  subroutine compute_nodal_velocity_sidil(mesh, id_vert, sol, vp, method, b2d, b2d_h, gamma_arr, &
+      n_bc, bc_type, bc_val)
     use lagrange_global_data_module, only : boundary_2d
     use linear_solver_module
     implicit none
@@ -1245,12 +1250,15 @@ contains
     real(kind=DOUBLE), intent(in) :: b2d_h
     logical, intent(in) :: b2d
     real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
+    integer(kind=ENTIER), intent(in), optional :: n_bc
+    character(len=255), dimension(:), intent(in), optional :: bc_type
+    real(kind=DOUBLE), dimension(:, :), intent(in), optional :: bc_val
 
     integer(kind=ENTIER) :: j, k, le, re
     integer(kind=ENTIER) :: id_sub_elem, id_elem
     integer(kind=ENTIER) :: id_sub_face, id_face
     real(kind=DOUBLE) :: rho_p, a_p, h_p
-    real(kind=DOUBLE), dimension(3) :: grad_p, Bp
+    real(kind=DOUBLE), dimension(3) :: grad_p, Bp, v_target
     real(kind=DOUBLE), dimension(5) :: sol_w, sol_l, sol_r
     real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r
     real(kind=DOUBLE), dimension(3,3) :: mat
@@ -1282,15 +1290,41 @@ contains
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
       id_face = mesh%sub_face(id_sub_face)%mesh_face
+      ! In boundary_2d, z-normal "cap" faces (top/bottom of the single
+      ! prism/hex layer) carry no physical wall, exactly like in
+      ! boundary_normal/corner_normal above -- but unlike those, this loop
+      ! never excluded them. If the fluid ever picks up even a tiny
+      ! out-of-plane z-velocity (numerical noise, since nothing in this
+      ! scheme forces it to stay exactly 0 the way vp_z is forced to for
+      ! the grid velocity), the cap-face mirror flips its sign, and the
+      ! resulting jump gets weighted by the cap's *full 2D footprint area*
+      ! (large, ~1e-4) instead of a lateral face's thin sliver (~1e-7) --
+      ! turning a negligible z-velocity into a wildly amplified spurious
+      ! grad_p/div_v contribution. Confirmed empirically: an interior
+      ! vertex with genuinely uniform, at-rest neighboring cells still blew
+      ! up to div_v~500 purely from this effect.
+      if (b2d .and. abs(mesh%face(id_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE) cycle
       le = mesh%face(id_face)%left_neigh
       re = mesh%face(id_face)%right_neigh
       sol_l = sol(:, le)
       if( re > 0 ) then
         sol_r = sol(:, re)
       else
+        ! Generic boundary mirror targets zero normal velocity (a static
+        ! wall). A piston BC moves with an imposed velocity instead: its
+        ! mirror must target that velocity's normal component, not zero,
+        ! or the reconstructed boundary state (and hence grad_p, which
+        ! depends on it through the kinetic-energy term in pressure())
+        ! silently assumes the piston isn't moving at all.
+        v_target = 0.0_DOUBLE
+        if (present(n_bc) .and. re < 0) then
+          if (-re <= n_bc) then
+            if (trim(bc_type(-re)) == 'piston') v_target = bc_val(2:4, -re)
+          end if
+        end if
         sol_r = sol(:, le)
-        sol_r(2:4) = sol_r(2:4) - 2.0_DOUBLE*dot_product(sol_r(2:4), &
-          mesh%face(id_face)%norm)*mesh%face(id_face)%norm
+        sol_r(2:4) = sol_l(2:4) + 2.0_DOUBLE*(dot_product(v_target, mesh%face(id_face)%norm) &
+          - dot_product(sol_l(2:4), mesh%face(id_face)%norm))*mesh%face(id_face)%norm
       end if
       sol_w_l = lag_to_primit(sol_l, gamma_arr(le))
       sol_w_r = lag_to_primit(sol_r, gamma_arr(le))
@@ -1301,16 +1335,28 @@ contains
     grad_p = grad_p / mesh%vert(id_vert)%volume
 
     if( mesh%vert(id_vert)%is_bound ) then
-      Bp = boundary_normal(mesh, id_vert)
+      Bp = boundary_normal(mesh, id_vert, b2d)
       Bp = Bp/norm2(Bp)
       grad_p = grad_p - dot_product(grad_p, Bp)*Bp
     end if
 
     h_p = compute_length(mesh, id_vert, method, b2d, b2d_h)
     vp = vp - 0.5_DOUBLE*h_p/(rho_p*a_p)*grad_p
+
+    ! The correction above only ever adds a tangential contribution (grad_p
+    ! was already projected against Bp), but vp's base value -- the
+    ! volume-weighted average of the neighboring cells' velocities, before
+    ! any correction -- was never projected: a general flow field has no
+    ! reason for that average to be tangential to the wall already, so the
+    ! final vp used to move the boundary node could still carry a spurious
+    ! wall-normal (penetrating) component.
+    if( mesh%vert(id_vert)%is_bound ) then
+      vp = vp - dot_product(vp, Bp)*Bp
+    end if
   end subroutine compute_nodal_velocity_sidil
 
-  subroutine compute_nodal_pressure_sidil(mesh, id_vert, sol, pp, method, b2d, b2d_h, gamma_arr)
+  subroutine compute_nodal_pressure_sidil(mesh, id_vert, sol, pp, method, b2d, b2d_h, gamma_arr, &
+      n_bc, bc_type, bc_val)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -1320,11 +1366,15 @@ contains
     real(kind=DOUBLE), intent(in) :: b2d_h
     logical :: b2d
     real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
+    integer(kind=ENTIER), intent(in), optional :: n_bc
+    character(len=255), dimension(:), intent(in), optional :: bc_type
+    real(kind=DOUBLE), dimension(:, :), intent(in), optional :: bc_val
 
     integer(kind=ENTIER) :: j, id_elem, id_sub_elem, le, re
     integer(kind=ENTIER) :: id_face, id_sub_face
     real(kind=DOUBLE), dimension(5) :: sol_w
     real(kind=DOUBLE) :: rho_p, a_p, h_p, div_v
+    real(kind=DOUBLE), dimension(3) :: v_target
     real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, sol_l, sol_r
 
     pp = 0.0_DOUBLE
@@ -1350,15 +1400,24 @@ contains
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
       id_face = mesh%sub_face(id_sub_face)%mesh_face
+      ! See the identical exclusion + comment in compute_nodal_velocity_sidil.
+      if (b2d .and. abs(mesh%face(id_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE) cycle
       le = mesh%face(id_face)%left_neigh
       re = mesh%face(id_face)%right_neigh
       sol_l = sol(:, le)
       if( re > 0 ) then
         sol_r = sol(:, re)
       else
+        ! Same piston-vs-static-wall mirror fix as compute_nodal_velocity_sidil.
+        v_target = 0.0_DOUBLE
+        if (present(n_bc) .and. re < 0) then
+          if (-re <= n_bc) then
+            if (trim(bc_type(-re)) == 'piston') v_target = bc_val(2:4, -re)
+          end if
+        end if
         sol_r = sol(:, le)
-        sol_r(2:4) = sol_r(2:4) - 2.0_DOUBLE*dot_product(sol_r(2:4), &
-          mesh%face(id_face)%norm)*mesh%face(id_face)%norm
+        sol_r(2:4) = sol_l(2:4) + 2.0_DOUBLE*(dot_product(v_target, mesh%face(id_face)%norm) &
+          - dot_product(sol_l(2:4), mesh%face(id_face)%norm))*mesh%face(id_face)%norm
       end if
       sol_w_l = lag_to_primit(sol_l, gamma_arr(le))
       sol_w_r = lag_to_primit(sol_r, gamma_arr(le))
@@ -1388,33 +1447,77 @@ contains
     integer(kind=ENTIER) :: j, k
     integer(kind=ENTIER) :: id_sub_elem, id_sub_face
     integer(kind=ENTIER) :: id_elem, id_face
-    real(kind=DOUBLE) :: area_sum
+    real(kind=DOUBLE) :: area_sum, vol_2d, length_scale, coeff
 
     area_sum = 0.0_DOUBLE
     do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
       id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
       id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
-      area_sum = area_sum + norm2(corner_normal(mesh, id_sub_elem))
+      if( b2d ) then
+        ! The lateral faces' area scales with the (purely numerical, not
+        ! physical) extrusion thickness -- only the z-normal "cap" faces
+        ! (top/bottom of the single layer) carry a genuine 2D footprint
+        ! area, independent of that thickness. Sum it as a plain scalar
+        ! area (not corner_normal's vector-summed normal, which mixes
+        ! several differently-oriented faces): each sub_elem contributes
+        ! its footprint area once (top and bottom caps have equal area, so
+        ! either one alone already represents it -- summing both would
+        ! just double-count the same physical quantity).
+        do k=1, mesh%sub_elem(id_sub_elem)%n_sub_faces
+          id_sub_face = mesh%sub_elem(id_sub_elem)%sub_face(k)
+          id_face = mesh%sub_face(id_sub_face)%mesh_face
+          if( abs(mesh%face(id_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE ) then
+            area_sum = area_sum + mesh%sub_face(id_sub_face)%area
+            exit
+          end if
+        end do
+      else
+        area_sum = area_sum + norm2(corner_normal(mesh, id_sub_elem, b2d))
+      end if
     end do
 
-    if( method == 0 ) then
-      h_p = 0.0_DOUBLE*mesh%vert(id_vert)%volume/area_sum
-    else if( method == 1) then
-      h_p = 1.0_DOUBLE*mesh%vert(id_vert)%volume/area_sum
-    else if( method == 2) then
-      h_p = 2.0_DOUBLE*mesh%vert(id_vert)%volume/area_sum
-    else if( method == 3) then
-      h_p = 4.0_DOUBLE*mesh%vert(id_vert)%volume/area_sum
-    else if( method == 4) then
-      h_p = 8.0_DOUBLE*mesh%vert(id_vert)%volume/area_sum
+    if( b2d ) then
+      ! mesh%vert(...)%volume is a genuine 3D volume (physical 2D area
+      ! times the artificial extrusion thickness): dividing by b2d_h (the
+      ! same thickness, set by the user to match the mesh's actual
+      ! extrusion) recovers the physical 2D area. area_sum is now itself a
+      ! physical area (see above), so sqrt(area_sum) is the length scale to
+      ! divide by, keeping h_p homogeneous to a length either way.
+      vol_2d = mesh%vert(id_vert)%volume / b2d_h
+      length_scale = sqrt(area_sum)
+    else
+      vol_2d = mesh%vert(id_vert)%volume
+      length_scale = area_sum
     end if
+
+    if( method == 0 ) then
+      coeff = 0.0_DOUBLE
+    else if( method == 1) then
+      coeff = 1.0_DOUBLE
+    else if( method == 2) then
+      coeff = 2.0_DOUBLE
+    else if( method == 3) then
+      coeff = 4.0_DOUBLE
+    else if( method == 4) then
+      coeff = 8.0_DOUBLE
+    end if
+    h_p = coeff*vol_2d/length_scale
   end function compute_length
 
-  function boundary_normal(mesh, id_vert) result(Bp)
+  function boundary_normal(mesh, id_vert, boundary_2d) result(Bp)
+    ! boundary_2d is passed in explicitly (matching every other routine in
+    ! this file, e.g. compute_nodal_velocity_sidil's b2d argument) rather
+    ! than pulled from lagrange_global_data_module: lagrange_main.F90
+    ! declares its OWN local boundary_2d (read from the namelist, default
+    ! .true.), which shadows the module's own (unrelated, always-.FALSE.
+    ! default, never assigned) variable of the same name -- using the
+    ! module one here silently always saw .FALSE., regardless of the actual
+    ! run's boundary_2d setting.
     implicit none
 
     type(mesh_type), intent(in) :: mesh
     integer(kind=ENTIER), intent(in) :: id_vert
+    logical, intent(in) :: boundary_2d
 
     real(kind=DOUBLE), dimension(3) :: Bp
     integer(kind=ENTIER) :: j
@@ -1425,18 +1528,37 @@ contains
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
       id_face = mesh%sub_face(id_sub_face)%mesh_face
       if( mesh%face(id_face)%right_neigh <= 0 ) then
-        Bp = Bp &
-          + mesh%sub_face(id_sub_face)%area*mesh%face(id_face)%norm
+        ! In boundary_2d, the mesh is a single prism/hex layer: the z-normal
+        ! "cap" faces (top/bottom of that one layer) are also boundary
+        ! faces (right_neigh<=0) but carry no physical wall -- including
+        ! them here mixes a spurious z-component into Bp, corrupting the
+        ! wall-tangential projection for every genuinely 2D lateral wall.
+        if (.not. (boundary_2d .and. abs(mesh%face(id_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE)) then
+          Bp = Bp &
+            + mesh%sub_face(id_sub_face)%area*mesh%face(id_face)%norm
+        end if
       end if
     end do
   end function boundary_normal
 
-  function corner_normal(mesh, id_sub_elem) result(norm)
-    use lagrange_global_data_module, only: boundary_2d
+  function corner_normal(mesh, id_sub_elem, boundary_2d) result(norm)
+    ! boundary_2d passed in explicitly -- same reasoning as boundary_normal
+    ! above: lagrange_global_data_module's own boundary_2d is a dead,
+    ! always-.FALSE. variable, shadowed everywhere else by lagrange_main's
+    ! local one (the one actually read from the namelist and threaded as
+    ! the b2d argument). Pulling it from the module here silently disabled
+    ! the entire z-cap-face exclusion below (.not. .FALSE. .or. ... is
+    ! always true), so area_sum in compute_length mixed in the z-normal cap
+    ! faces' area alongside the genuine lateral faces -- those scale with
+    ! the artificial extrusion thickness (h_extrude, e.g. 1e-4) completely
+    ! differently than the physical 2D geometry, corrupting the nodal
+    ! characteristic length h_p for every method that goes through
+    ! compute_length (the "classic" and "sidil" schemes).
     implicit none
 
     type(mesh_type), intent(in) :: mesh
     integer(kind=ENTIER), intent(in) :: id_sub_elem
+    logical, intent(in) :: boundary_2d
     real(kind=DOUBLE), dimension(3) :: norm
 
     integer(kind=ENTIER) :: j, id_sub_face, id_face
