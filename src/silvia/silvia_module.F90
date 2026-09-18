@@ -67,6 +67,7 @@ module silvia_module
   integer, dimension(:), allocatable :: bc_T_id
   integer, dimension(:), allocatable :: bc_euler_id
 
+  integer(kind=ENTIER), dimension(mnbc) :: bc_type_id = BC_EULER_WALL
   ! Scheme integer IDs
   integer, parameter :: SCHEME_MULTI_POINT          = 1  ! "multi_point"
   integer, parameter :: SCHEME_MULTI_POINT_ISO      = 2  ! "multi_point_iso"
@@ -455,6 +456,7 @@ contains
     real(kind=DOUBLE), intent(in) :: t
 
     integer(kind=ENTIER) :: iface, il, ir, iv, k, n_fvert, n_qpts, q
+    integer(kind=ENTIER) :: iloop
     real(kind=DOUBLE), dimension(3) :: norm, xface
     real(kind=DOUBLE), dimension(:, :), allocatable :: face_coords, qpts
     real(kind=DOUBLE), dimension(:),    allocatable :: qwts
@@ -492,12 +494,14 @@ contains
         wL = prim(:, il)
         if (ir > 0) then
           wR = prim(:, ir)
+          if (mesh%elem(ir)%is_ghost) then
+            print*, 'found ghost!'
+          end if
         else
           ! Boundary: reconstruct left then apply BC
+          ! here is outflowsupersonic
           wR = wL
-          ! if (mesh%elem(ir)%is_ghost) then
-          !   print*, 'found ghost!'
-          ! end if
+          
           !wR = ghost_prim(xface, norm, wL, -ir, t)
         end if
 
@@ -508,7 +512,17 @@ contains
         ! case (FLUX_THREE_WAVE)
         !   flux = three_wave_flux(wL, wR, norm) * qwts(q)
         ! case (FLUX_TWO_WAVE)
-        flux = two_wave_flux(wL, wR, norm) * qwts(q)
+        ! flux = two_wave_flux(wL, wR, norm) * qwts(q)
+        flux = rusanov(wL, wR, norm) * qwts(q)
+        
+        do iloop = 1,5
+          if (abs(flux(iloop))>1e10) then
+            print*, 'face between ', iL, 'and ', iR, '- flux=',flux
+            print*, 'centers are', mesh%elem(il)%coord, ' and', mesh%elem(ir)%coord 
+            print*, 'face coords', mesh%face(iface)%coord
+            exit
+          end if
+        end do
         ! case default
         !   flux = rusanov(wL, wR, norm) * qwts(q)
         ! end select
@@ -517,15 +531,86 @@ contains
 
         rhs(:, il)  = rhs(:, il)  - flux
         sum_lambda(il) = sum_lambda(il) + lambda
-        !if (ir > 0 .and. .not. mesh%elem(ir)%is_ghost) then
+        if (ir > 0) then
           rhs(:, ir)     = rhs(:, ir)     + flux
           sum_lambda(ir) = sum_lambda(ir) + lambda
-        !end if
+        end if
       end do
 
       deallocate(qpts, qwts)
     end do
   end subroutine face_flux_loop
+
+  ! Ghost cell primitive state for boundary condition
+  ! function ghost_prim(xf, norm, wL, id_bc, t) result(wR)
+  !   real(kind=DOUBLE), dimension(3), intent(in) :: xf, norm
+  !   real(kind=DOUBLE), dimension(5), intent(in) :: wL
+  !   integer(kind=ENTIER), intent(in) :: id_bc
+  !   real(kind=DOUBLE), intent(in) :: t
+  !   real(kind=DOUBLE), dimension(5) :: wR
+
+  !   real(kind=DOUBLE) :: vn
+
+  !   if (id_bc < 1 .or. id_bc > n_bc) then
+  !     ! Default: slip wall (mirror normal velocity)
+  !     wR    = wL
+  !     vn    = dot_product(wL(2:4), norm)
+  !     wR(2) = wL(2) - 2.0_DOUBLE * vn * norm(1)
+  !     wR(3) = wL(3) - 2.0_DOUBLE * vn * norm(2)
+  !     wR(4) = wL(4) - 2.0_DOUBLE * vn * norm(3)
+  !     return
+  !   end if
+
+  !   ! bc_type_id resolved once in read_params -- see its declaration.
+  !   select case (bc_type_id(id_bc))
+  !   case (BC_EULER_FREESTREAM)
+  !     wR = bc_val(:, id_bc)
+  !   case (BC_EULER_OUTFLOWSUPERSONIC)
+  !     ! Zero-gradient extrapolation: valid where every characteristic
+  !     ! leaves the domain (locally supersonic outflow).
+  !     wR = wL
+  !   case default
+  !     ! BC_WALL (also the fallback for blank/unrecognized bc_type,
+  !     ! matching the old string select case's behavior)
+  !     wR    = wL
+  !     vn    = dot_product(wL(2:4), norm)
+  !     wR(2) = wL(2) - 2.0_DOUBLE * vn * norm(1)
+  !     wR(3) = wL(3) - 2.0_DOUBLE * vn * norm(2)
+  !     wR(4) = wL(4) - 2.0_DOUBLE * vn * norm(3)
+  !   end select
+  ! end function ghost_prim
+
+  pure function euler_flux(w, n) result(F)
+    real(kind=DOUBLE), dimension(5), intent(in) :: w
+    real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), dimension(5) :: F
+    real(kind=DOUBLE) :: vn, rho, p, e
+
+    rho = w(1); p = w(5)
+    vn  = w(2)*n(1) + w(3)*n(2) + w(4)*n(3)
+    e   = p / ((gamma - 1.0_DOUBLE) * rho) + 0.5_DOUBLE*(w(2)**2+w(3)**2+w(4)**2)
+
+    F(1) = rho * vn
+    F(2) = rho * w(2) * vn + p * n(1)
+    F(3) = rho * w(3) * vn + p * n(2)
+    F(4) = rho * w(4) * vn + p * n(3)
+    F(5) = rho * e * vn + p * vn
+  end function euler_flux
+
+  ! Rusanov (local Lax-Friedrichs) numerical flux per unit area
+  pure function rusanov(wL, wR, n) result(F)
+    real(kind=DOUBLE), dimension(5), intent(in) :: wL, wR
+    real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), dimension(5) :: F
+    real(kind=DOUBLE) :: lam, vnL, vnR
+
+    vnL = wL(2)*n(1) + wL(3)*n(2) + wL(4)*n(3)
+    vnR = wR(2)*n(1) + wR(3)*n(2) + wR(4)*n(3)
+    lam = max(abs(vnL) + cs(wL), abs(vnR) + cs(wR))
+
+    F = 0.5_DOUBLE * (euler_flux(wL, n) + euler_flux(wR, n)) &
+      - 0.5_DOUBLE * lam * (primit_to_conserv(wR) - primit_to_conserv(wL))
+  end function rusanov
 
   pure function two_wave_flux(wL, wR, n) result(F)
     real(kind=DOUBLE), dimension(5), intent(in) :: wL, wR
