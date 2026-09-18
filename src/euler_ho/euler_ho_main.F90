@@ -25,8 +25,9 @@ program euler_ho_main
   ! variable rho*Gamma (Gamma=1/(gamma-1), see euler_ho_module's gamma_arr
   ! declaration) -- it rides through the exact same RK3/MPI-exchange
   ! arithmetic as the 5 physical equations, no separate bookkeeping.
-  real(kind=DOUBLE), allocatable :: sol(:, :), sol1(:, :), sol2(:, :)
+  real(kind=DOUBLE), allocatable :: sol(:, :), sol1(:, :), sol2(:, :), sol3(:, :)
   real(kind=DOUBLE), allocatable :: prim(:, :), rhs(:, :)
+  real(kind=DOUBLE), allocatable :: k1(:, :), k2(:, :), k3(:, :), k4(:, :)
   real(kind=DOUBLE), allocatable :: sum_lambda(:)
 
   real(kind=DOUBLE) :: t, dt, h_err, l2err
@@ -55,6 +56,10 @@ program euler_ho_main
   allocate(sol(6, mesh%n_elems), sol1(6, mesh%n_elems), sol2(6, mesh%n_elems))
   allocate(prim(5, mesh%n_elems), rhs(6, mesh%n_elems))
   allocate(sum_lambda(mesh%n_elems))
+  if (use_rk4) then
+    allocate(sol3(6, mesh%n_elems))
+    allocate(k1(6, mesh%n_elems), k2(6, mesh%n_elems), k3(6, mesh%n_elems), k4(6, mesh%n_elems))
+  end if
 
   call init_sol(mesh, sol)
   ! Ghost cells get an analytically-correct sol from init_sol on every rank
@@ -81,6 +86,44 @@ program euler_ho_main
   do while (t < tmax)
     if (t + dt > tmax) dt = tmax - t
 
+    if (use_rk4) then
+      ! Classical (non-SSP) 4-stage RK4, genuinely 4th-order in time --
+      ! added 2026-09-18 per the user, to rule out SSP-RK3's own O(dt^3)
+      ! temporal error as the reason order 4's spatial accuracy doesn't
+      ! separate from order 3 on some benchmarks. Same time-dependent-BC
+      ! simplification as SSP-RK3 below (every stage's compute_rhs uses
+      ! the step's start time t, not each stage's own t/t+dt/2/t+dt).
+      !   k1 = L(u0);          k2 = L(u0+dt/2*k1); k3 = L(u0+dt/2*k2)
+      !   k4 = L(u0+dt*k3);    u^{n+1} = u0 + dt/6*(k1+2k2+2k3+k4)
+      call compute_prim(mesh, sol, prim)
+      call compute_rhs(mesh, sol, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+      dt = min(dt, compute_dt(mesh, sum_lambda))
+      k1 = rhs
+      sol1 = sol + 0.5_DOUBLE * dt * k1
+      if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 6_ENTIER, sol1)
+      call sync_gamma_arr(mesh, sol1)
+
+      call compute_prim(mesh, sol1, prim)
+      call compute_rhs(mesh, sol1, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+      k2 = rhs
+      sol2 = sol + 0.5_DOUBLE * dt * k2
+      if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 6_ENTIER, sol2)
+      call sync_gamma_arr(mesh, sol2)
+
+      call compute_prim(mesh, sol2, prim)
+      call compute_rhs(mesh, sol2, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+      k3 = rhs
+      sol3 = sol + dt * k3
+      if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 6_ENTIER, sol3)
+      call sync_gamma_arr(mesh, sol3)
+
+      call compute_prim(mesh, sol3, prim)
+      call compute_rhs(mesh, sol3, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+      k4 = rhs
+      sol = sol + (dt / 6.0_DOUBLE) * (k1 + 2.0_DOUBLE * k2 + 2.0_DOUBLE * k3 + k4)
+      if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 6_ENTIER, sol)
+      call sync_gamma_arr(mesh, sol)
+    else
     ! SSP-RK3 stage 1: u1 = u0 + dt * L(u0). A time-dependent BC uses the
     ! step's start time t for all 3 stages below (not exact substage
     ! timing t, t+dt, t+dt/2 -- see compute_rhs).
@@ -116,6 +159,7 @@ program euler_ho_main
          + (2.0_DOUBLE/3.0_DOUBLE) * (sol2 + dt * rhs)
     if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 6_ENTIER, sol)
     call sync_gamma_arr(mesh, sol)
+    end if
 
     t    = t + dt
     iter = iter + 1
@@ -152,7 +196,9 @@ program euler_ho_main
 contains
 
   subroutine write_vtu(mesh, sol, me, idx)
-    use euler_ho_module, only: compute_prim, gamma_arr
+    use euler_ho_module, only: compute_prim, gamma_arr, boundary_2d
+    use arbitrary_high_order_module, only: compute_next_order_derivative, &
+      aho_module_use_green_gauss => use_green_gauss
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(6, mesh%n_elems), intent(in) :: sol
     integer, intent(in) :: me, idx
@@ -161,7 +207,21 @@ contains
     real(kind=DOUBLE), allocatable :: prim_loc(:, :), rho(:), p(:), temp(:)
     real(kind=DOUBLE), allocatable :: centroid(:, :), velocity(:, :)
     real(kind=DOUBLE), parameter :: r_gas = 287.0_DOUBLE ! air, for T = p/(rho*R)
-    integer(kind=ENTIER) :: i
+    integer(kind=ENTIER) :: i, iv
+    ! Density-gradient diagnostic output (2026-09-18, per the user): lets
+    ! a schlieren-style render just ColorBy this field instead of running
+    ! ParaView's own Gradient filter, which was found very expensive at
+    ! scale on these meshes. Computed fresh at output time with a direct
+    ! call to compute_next_order_derivative, independent of whatever
+    ! reconstruction the run itself used for its own RK stages -- always
+    ! forced to the Green-Gauss nodal fit (cheap, no LS solve) regardless
+    ! of this run's own use_green_gauss setting, since this is a one-shot
+    ! diagnostic, not part of the flux computation. dphi_v_out/valid_v_out
+    ! expose the same per-vertex pass at no extra cost.
+    logical :: saved_use_gg
+    real(kind=DOUBLE), allocatable :: dphi_cell(:, :), dphi_v(:, :)
+    logical, allocatable :: valid_v(:)
+    real(kind=DOUBLE), allocatable :: grad_rho_cell(:, :), grad_rho_vert(:, :)
 
     write(fname, '(a,i0)') 'output_', idx
 
@@ -178,6 +238,40 @@ contains
       centroid(:, i) = mesh%elem(i)%coord
     end do
 
+    saved_use_gg = aho_module_use_green_gauss
+    aho_module_use_green_gauss = .true.
+    allocate(dphi_cell(15, mesh%n_elems))
+    call compute_next_order_derivative(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, &
+      prim_loc, dphi_cell, deriv_order=1_ENTIER, &
+      dphi_v_out=dphi_v, valid_v_out=valid_v)
+    aho_module_use_green_gauss = saved_use_gg
+
+    ! prim's variable 1 is rho; dphi(:,e) is laid out (dir-1)*5+v, so
+    ! indices 1/6/11 are d(rho)/dx, d(rho)/dy, d(rho)/dz (same convention
+    ! as euler_ho_module's own grad_flat).
+    allocate(grad_rho_cell(3, mesh%n_elems))
+    grad_rho_cell(1, :) = dphi_cell(1, :)
+    grad_rho_cell(2, :) = dphi_cell(6, :)
+    grad_rho_cell(3, :) = dphi_cell(11, :)
+
+    ! Boundary vertices are skipped entirely by compute_next_order_
+    ! derivative's own accumulation loop (mesh%vert%is_bound, see that
+    ! subroutine), leaving dphi_v_cache/valid_cache at whatever
+    ! uninitialised allocate() gave them there -- valid_v(iv) is NOT
+    ! trustworthy on its own for those. Check is_bound directly first
+    ! (always well-defined) and only then fall back to valid_v for a
+    ! genuinely-interior-but-degenerate stencil.
+    allocate(grad_rho_vert(3, mesh%n_vert))
+    do iv = 1, mesh%n_vert
+      if (mesh%vert(iv)%is_bound .or. .not. valid_v(iv)) then
+        grad_rho_vert(:, iv) = 0.0_DOUBLE
+      else
+        grad_rho_vert(1, iv) = dphi_v(1, iv)
+        grad_rho_vert(2, iv) = dphi_v(6, iv)
+        grad_rho_vert(3, iv) = dphi_v(11, iv)
+      end if
+    end do
+
     call open_file_vtu(mesh, trim(adjustl(fname)), fn_v, fn_pv)
     call write_file_vtu_start_cell_data(mesh, trim(adjustl(fname)), fn_v, fn_pv)
     call write_file_vtu_cell_scalar(mesh, trim(adjustl(fname)), fn_v, fn_pv, rho, 'rho')
@@ -186,10 +280,15 @@ contains
     call write_file_vtu_cell_scalar(mesh, trim(adjustl(fname)), fn_v, fn_pv, temp, 'T')
     call write_file_vtu_cell_scalar(mesh, trim(adjustl(fname)), fn_v, fn_pv, gamma_arr, 'gamma')
     call write_file_vtu_cell_vector(mesh, trim(adjustl(fname)), fn_v, fn_pv, centroid, 'Centroid')
+    call write_file_vtu_cell_vector(mesh, trim(adjustl(fname)), fn_v, fn_pv, grad_rho_cell, 'grad_rho_cell')
     call write_file_vtu_end_cell_data(mesh, trim(adjustl(fname)), fn_v, fn_pv)
+    call write_file_vtu_start_vert_data(mesh, trim(adjustl(fname)), fn_v, fn_pv)
+    call write_file_vtu_vert_vector(mesh, trim(adjustl(fname)), fn_v, fn_pv, grad_rho_vert, 'grad_rho_vert')
+    call write_file_vtu_end_vert_data(mesh, trim(adjustl(fname)), fn_v, fn_pv)
     call close_file_vtu(mesh, trim(adjustl(fname)), fn_v, fn_pv)
 
     deallocate(prim_loc, rho, p, temp, centroid, velocity)
+    deallocate(dphi_cell, dphi_v, valid_v, grad_rho_cell, grad_rho_vert)
   end subroutine write_vtu
 
 end program euler_ho_main
