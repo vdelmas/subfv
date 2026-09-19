@@ -51,7 +51,8 @@ module arbitrary_high_order_module
 
   ! Per-cell second geometric moment, used by apply_grad_bias_correction: pure mesh geometry, cached once.
   integer(kind=ENTIER), save :: m2_cache_n_elems = -1
-  real(kind=DOUBLE), dimension(:), allocatable, save :: m2_cache_xx, m2_cache_xy, m2_cache_yy
+  real(kind=DOUBLE), dimension(:), allocatable, save :: m2_cache_xx, m2_cache_yy, m2_cache_zz
+  real(kind=DOUBLE), dimension(:), allocatable, save :: m2_cache_xy, m2_cache_xz, m2_cache_yz
 
   ! Per-vertex Green-Gauss fit matrix, already inverted: pure geometry, cached once per mesh (boundary_2d baked in).
   integer(kind=ENTIER), save :: gg_mat_cache_n_vert = -1
@@ -1415,14 +1416,18 @@ contains
     integer(kind=ENTIER) :: i, kv, n_v
     real(kind=DOUBLE), dimension(:, :), allocatable :: vcoords, pq
     real(kind=DOUBLE), dimension(:), allocatable :: wq
-    real(kind=DOUBLE) :: xc, yc
+    real(kind=DOUBLE) :: xc, yc, zc
 
     if (m2_cache_n_elems == mesh%n_elems) return
 
     if (allocated(m2_cache_xx)) deallocate(m2_cache_xx)
-    if (allocated(m2_cache_xy)) deallocate(m2_cache_xy)
     if (allocated(m2_cache_yy)) deallocate(m2_cache_yy)
-    allocate(m2_cache_xx(mesh%n_elems), m2_cache_xy(mesh%n_elems), m2_cache_yy(mesh%n_elems))
+    if (allocated(m2_cache_zz)) deallocate(m2_cache_zz)
+    if (allocated(m2_cache_xy)) deallocate(m2_cache_xy)
+    if (allocated(m2_cache_xz)) deallocate(m2_cache_xz)
+    if (allocated(m2_cache_yz)) deallocate(m2_cache_yz)
+    allocate(m2_cache_xx(mesh%n_elems), m2_cache_yy(mesh%n_elems), m2_cache_zz(mesh%n_elems))
+    allocate(m2_cache_xy(mesh%n_elems), m2_cache_xz(mesh%n_elems), m2_cache_yz(mesh%n_elems))
 
     do i = 1, mesh%n_elems
       n_v = mesh%elem(i)%n_vert
@@ -1431,10 +1436,13 @@ contains
         vcoords(:, kv) = mesh%vert(mesh%elem(i)%vert(kv))%coord
       end do
       call volume_quad_pts(n_v, vcoords, 5_ENTIER, pq, wq)
-      xc = mesh%elem(i)%coord(1); yc = mesh%elem(i)%coord(2)
+      xc = mesh%elem(i)%coord(1); yc = mesh%elem(i)%coord(2); zc = mesh%elem(i)%coord(3)
       m2_cache_xx(i) = sum(wq*(pq(1,:)-xc)**2) / sum(wq)
-      m2_cache_xy(i) = sum(wq*(pq(1,:)-xc)*(pq(2,:)-yc)) / sum(wq)
       m2_cache_yy(i) = sum(wq*(pq(2,:)-yc)**2) / sum(wq)
+      m2_cache_zz(i) = sum(wq*(pq(3,:)-zc)**2) / sum(wq)
+      m2_cache_xy(i) = sum(wq*(pq(1,:)-xc)*(pq(2,:)-yc)) / sum(wq)
+      m2_cache_xz(i) = sum(wq*(pq(1,:)-xc)*(pq(3,:)-zc)) / sum(wq)
+      m2_cache_yz(i) = sum(wq*(pq(2,:)-yc)*(pq(3,:)-zc)) / sum(wq)
       deallocate(vcoords, pq, wq)
     end do
 
@@ -1455,7 +1463,17 @@ contains
     call add_sort_unique_int(neigh, n_neigh, mesh%vert(id_vert)%elem_neigh)
   end subroutine gather_ls_neighbors
 
-  ! Corrects the grad step's own O(h^2) bias against a cubic field in place, using each vertex's nodal Hessian/third tensor and per-cell second moment; only implemented for boundary_2d=.true.
+  ! Corrects the grad step's own O(h^2) bias against a cubic field in place, using each
+  ! vertex's nodal Hessian/third tensor and per-cell second moment. Handles both
+  ! boundary_2d=.true. (2 active directions x,y) and genuinely-3D meshes (3 active
+  ! directions x,y,z) through one unified formula: the basis size (3 or 4) is the only
+  ! branch, everything else is the full 3D tensor contraction, which degenerates exactly
+  ! to the 2D case when z-related H/T components are zero (as they are for boundary_2d).
+  ! hess_v/third_v flat layout: index (0-based, in units of nc_in) for a component whose
+  ! derivative directions are taken in order (dir1,dir2[,dir3]) is
+  ! (dir3-1)*9+(dir2-1)*3+(dir1-1) (third_v) or (dir2-1)*3+(dir1-1) (hess_v), 1=x,2=y,3=z;
+  ! symmetric components are averaged over every valid ordering (verified numerically
+  ! against manufactured cubic fields with fully distinct coefficients).
   subroutine apply_grad_bias_correction(mesh, d, nc_in, boundary_2d, grad_cell, &
       hess_v, third_v, valid_hess_v, valid_third_v, grad_oi_v)
     use linear_solver_module, only: lu_factor_lapack, lu_solve_mat_lapack
@@ -1471,84 +1489,110 @@ contains
     ! Per-vertex OI from the gradient-level call, used to match grad_cell's own vertex-to-cell WENO weight exactly.
     real(kind=DOUBLE), dimension(mesh%n_vert), intent(in) :: grad_oi_v
 
-    integer(kind=ENTIER) :: iv, j, id_elem, id_sub_elem, kv, n_v, ic, i
-    integer(kind=ENTIER) :: n_neigh, n_basis
+    integer(kind=ENTIER) :: iv, j, id_elem, id_sub_elem, ic, i
+    integer(kind=ENTIER) :: n_neigh, n_basis, n_cand
     integer(kind=ENTIER), dimension(:), allocatable :: neigh
-    real(kind=DOUBLE), dimension(3, 3) :: mat
-    real(kind=DOUBLE), dimension(3, nc_in) :: rhs
-    real(kind=DOUBLE), dimension(3) :: basis
-    integer(kind=ENTIER), dimension(3) :: ipiv
+    real(kind=DOUBLE), dimension(4, 4) :: mat
+    real(kind=DOUBLE), dimension(4, nc_in) :: rhs
+    real(kind=DOUBLE), dimension(4) :: basis
+    integer(kind=ENTIER), dimension(4) :: ipiv
     real(kind=DOUBLE), dimension(3) :: dx_v
-    real(kind=DOUBLE) :: weight, dxx, dyy, sub_elem_volume, dvx, dvy, vweight
-    real(kind=DOUBLE), dimension(:), allocatable :: Hxx, Hxy, Hyy, Txxx, Txxy, Txyy, Tyyy
-    real(kind=DOUBLE), dimension(:), allocatable :: HxxJ, HxyJ, HyyJ, moment_j
-    real(kind=DOUBLE), dimension(:, :), allocatable :: bias_num_x, bias_num_y
+    real(kind=DOUBLE) :: weight, dxx, dyy, dzz, sub_elem_volume, dvx, dvy, dvz, vweight
+    real(kind=DOUBLE), dimension(:), allocatable :: Hxx, Hyy, Hzz, Hxy, Hxz, Hyz
+    real(kind=DOUBLE), dimension(:), allocatable :: Txxx, Tyyy, Tzzz, Txxy, Txxz, Txyy, Tyyz, Txzz, Tyzz, Txyz
+    real(kind=DOUBLE), dimension(:), allocatable :: HxxJ, HyyJ, HzzJ, HxyJ, HxzJ, HyzJ, moment_j
+    real(kind=DOUBLE), dimension(:, :), allocatable :: bias_num_x, bias_num_y, bias_num_z
     real(kind=DOUBLE), dimension(:), allocatable :: bias_den
-    real(kind=DOUBLE), dimension(:, :), allocatable :: m2d_num_xx, m2d_num_xy, m2d_num_yy
-    real(kind=DOUBLE), dimension(:), allocatable :: m2d_den
-    real(kind=DOUBLE), dimension(:, :), allocatable :: t_num_xxx, t_num_xxy, t_num_xyy, t_num_yyy
-    real(kind=DOUBLE) :: M2xx, M2xy, M2yy
-    real(kind=DOUBLE), dimension(:), allocatable :: Tx1, Tx2, Tx3, Tx4, extra_x, extra_y
-
-    if (.not. boundary_2d) return
+    real(kind=DOUBLE), dimension(:), allocatable :: m2d_num_xx, m2d_num_yy, m2d_num_zz
+    real(kind=DOUBLE), dimension(:), allocatable :: m2d_num_xy, m2d_num_xz, m2d_num_yz, m2d_den
+    real(kind=DOUBLE), dimension(:, :), allocatable :: t_num_xxx, t_num_yyy, t_num_zzz, t_num_xxy, t_num_xxz
+    real(kind=DOUBLE), dimension(:, :), allocatable :: t_num_xyy, t_num_yyz, t_num_xzz, t_num_yzz, t_num_xyz
+    real(kind=DOUBLE) :: M2xx, M2yy, M2zz, M2xy, M2xz, M2yz
+    real(kind=DOUBLE), dimension(:), allocatable :: Tx1, Tx2, Tx3, Tx4, Tx5, Tx6, Tx7, Tx8, Tx9, Tx10
+    real(kind=DOUBLE), dimension(:), allocatable :: extra_x, extra_y, extra_z
 
     call ensure_m2_cache(mesh)
     call ensure_neighbor_cache(mesh)
 
-    allocate(Hxx(nc_in), Hxy(nc_in), Hyy(nc_in), Txxx(nc_in), Txxy(nc_in), Txyy(nc_in), Tyyy(nc_in))
-    allocate(HxxJ(nc_in), HxyJ(nc_in), HyyJ(nc_in), moment_j(nc_in))
-    allocate(bias_num_x(nc_in, mesh%n_elems), bias_num_y(nc_in, mesh%n_elems), bias_den(mesh%n_elems))
-    allocate(Tx1(nc_in), Tx2(nc_in), Tx3(nc_in), Tx4(nc_in), extra_x(nc_in), extra_y(nc_in))
-    bias_num_x = 0.0_DOUBLE; bias_num_y = 0.0_DOUBLE; bias_den = 0.0_DOUBLE
+    n_cand = merge(2_ENTIER, 3_ENTIER, boundary_2d)
+    n_basis = 1 + n_cand
 
-    n_basis = 3 ! 1, dx, dy -- same affine basis as the Step-1 fit
+    allocate(Hxx(nc_in), Hyy(nc_in), Hzz(nc_in), Hxy(nc_in), Hxz(nc_in), Hyz(nc_in))
+    allocate(Txxx(nc_in), Tyyy(nc_in), Tzzz(nc_in), Txxy(nc_in), Txxz(nc_in))
+    allocate(Txyy(nc_in), Tyyz(nc_in), Txzz(nc_in), Tyzz(nc_in), Txyz(nc_in))
+    allocate(HxxJ(nc_in), HyyJ(nc_in), HzzJ(nc_in), HxyJ(nc_in), HxzJ(nc_in), HyzJ(nc_in), moment_j(nc_in))
+    allocate(bias_num_x(nc_in, mesh%n_elems), bias_num_y(nc_in, mesh%n_elems), bias_num_z(nc_in, mesh%n_elems))
+    allocate(bias_den(mesh%n_elems))
+    bias_num_x = 0.0_DOUBLE; bias_num_y = 0.0_DOUBLE; bias_num_z = 0.0_DOUBLE; bias_den = 0.0_DOUBLE
+
     do iv = 1, mesh%n_vert
       if (mesh%vert(iv)%is_bound) cycle
       if (.not. valid_hess_v(iv) .or. .not. valid_third_v(iv)) cycle
 
       do ic = 1, nc_in
-        Hxx(ic) = hess_v(ic, iv)                                    ! (dir1,dir2)=(1,1)
-        Hxy(ic) = 0.5_DOUBLE*(hess_v(2*nc_in+ic, iv) + hess_v(nc_in+ic, iv)) ! (1,2)&(2,1) avg
-        Hyy(ic) = hess_v(3*nc_in+ic, iv)                             ! (2,2)  [nc_in*d=3*nc_in]
-        Txxx(ic) = third_v(ic, iv)                                   ! (1,1,1)
-        Txxy(ic) = (third_v(3*nc_in+ic, iv) + third_v(9*nc_in+ic, iv) &
-          + third_v(nc_in+ic, iv)) / 3.0_DOUBLE                      ! (1,1,2)&(1,2,1)&(2,1,1)
-        Txyy(ic) = (third_v(4*nc_in+ic, iv) + third_v(10*nc_in+ic, iv) &
-          + third_v(12*nc_in+ic, iv)) / 3.0_DOUBLE                   ! (2,2,1)&(2,1,2)&(1,2,2)
-        Tyyy(ic) = third_v(13*nc_in+ic, iv)                          ! (2,2,2) [nc_in*d*d=9*nc_in]
+        Hxx(ic) = hess_v(0*nc_in+ic, iv)
+        Hyy(ic) = hess_v(4*nc_in+ic, iv)
+        Hzz(ic) = hess_v(8*nc_in+ic, iv)
+        Hxy(ic) = 0.5_DOUBLE*(hess_v(1*nc_in+ic, iv) + hess_v(3*nc_in+ic, iv))
+        Hxz(ic) = 0.5_DOUBLE*(hess_v(2*nc_in+ic, iv) + hess_v(6*nc_in+ic, iv))
+        Hyz(ic) = 0.5_DOUBLE*(hess_v(5*nc_in+ic, iv) + hess_v(7*nc_in+ic, iv))
+        Txxx(ic) = third_v(0*nc_in+ic, iv)
+        Tyyy(ic) = third_v(13*nc_in+ic, iv)
+        Tzzz(ic) = third_v(26*nc_in+ic, iv)
+        Txxy(ic) = (third_v(1*nc_in+ic, iv) + third_v(3*nc_in+ic, iv) + third_v(9*nc_in+ic, iv)) / 3.0_DOUBLE
+        Txxz(ic) = (third_v(2*nc_in+ic, iv) + third_v(6*nc_in+ic, iv) + third_v(18*nc_in+ic, iv)) / 3.0_DOUBLE
+        Txyy(ic) = (third_v(4*nc_in+ic, iv) + third_v(10*nc_in+ic, iv) + third_v(12*nc_in+ic, iv)) / 3.0_DOUBLE
+        Tyyz(ic) = (third_v(14*nc_in+ic, iv) + third_v(16*nc_in+ic, iv) + third_v(22*nc_in+ic, iv)) / 3.0_DOUBLE
+        Txzz(ic) = (third_v(8*nc_in+ic, iv) + third_v(20*nc_in+ic, iv) + third_v(24*nc_in+ic, iv)) / 3.0_DOUBLE
+        Tyzz(ic) = (third_v(17*nc_in+ic, iv) + third_v(23*nc_in+ic, iv) + third_v(25*nc_in+ic, iv)) / 3.0_DOUBLE
+        Txyz(ic) = (third_v(5*nc_in+ic, iv) + third_v(7*nc_in+ic, iv) + third_v(11*nc_in+ic, iv) &
+          + third_v(15*nc_in+ic, iv) + third_v(19*nc_in+ic, iv) + third_v(21*nc_in+ic, iv)) / 6.0_DOUBLE
       end do
 
       n_neigh = neigh_cache_start(iv+1) - neigh_cache_start(iv)
       allocate(neigh(n_neigh))
       neigh = neigh_cache_list(neigh_cache_start(iv):neigh_cache_start(iv+1)-1)
-      mat = 0.0_DOUBLE; rhs = 0.0_DOUBLE
+      mat(1:n_basis, 1:n_basis) = 0.0_DOUBLE
+      rhs(1:n_basis, :) = 0.0_DOUBLE
       do j = 1, n_neigh
         id_elem = neigh(j)
         dx_v = mesh%elem(id_elem)%coord - mesh%vert(iv)%coord
         weight = 1.0_DOUBLE / max(dot_product(dx_v, dx_v), 1.0e-24_DOUBLE)
-        dxx = dx_v(1); dyy = dx_v(2)
+        dxx = dx_v(1); dyy = dx_v(2); dzz = dx_v(3)
         basis(1) = 1.0_DOUBLE; basis(2) = dxx; basis(3) = dyy
-        mat = mat + weight * spread(basis, 2, 3) * spread(basis, 1, 3)
+        if (n_basis == 4) basis(4) = dzz
+        mat(1:n_basis, 1:n_basis) = mat(1:n_basis, 1:n_basis) &
+          + weight * spread(basis(1:n_basis), 2, n_basis) * spread(basis(1:n_basis), 1, n_basis)
 
-        ! (1) vertex's own Taylor terms beyond affine
-        moment_j = 0.5_DOUBLE*(Hxx*dxx**2 + 2.0_DOUBLE*Hxy*dxx*dyy + Hyy*dyy**2) &
-          + (Txxx*dxx**3 + 3.0_DOUBLE*Txxy*dxx**2*dyy + 3.0_DOUBLE*Txyy*dxx*dyy**2 + Tyyy*dyy**3)/6.0_DOUBLE
+        ! (1) vertex's own Taylor terms beyond affine (full 3D; z-terms vanish
+        ! identically when boundary_2d, since dzz=0 for every neighbor there).
+        moment_j = 0.5_DOUBLE*(Hxx*dxx**2 + Hyy*dyy**2 + Hzz*dzz**2 &
+          + 2.0_DOUBLE*Hxy*dxx*dyy + 2.0_DOUBLE*Hxz*dxx*dzz + 2.0_DOUBLE*Hyz*dyy*dzz) &
+          + (Txxx*dxx**3 + Tyyy*dyy**3 + Tzzz*dzz**3 &
+             + 3.0_DOUBLE*Txxy*dxx**2*dyy + 3.0_DOUBLE*Txxz*dxx**2*dzz &
+             + 3.0_DOUBLE*Txyy*dxx*dyy**2 + 3.0_DOUBLE*Tyyz*dyy**2*dzz &
+             + 3.0_DOUBLE*Txzz*dxx*dzz**2 + 3.0_DOUBLE*Tyzz*dyy*dzz**2 &
+             + 6.0_DOUBLE*Txyz*dxx*dyy*dzz) / 6.0_DOUBLE
 
         ! (2) this neighbor's own cell-average-vs-point-value gap
-        HxxJ = Hxx + Txxx*dxx + Txxy*dyy
-        HxyJ = Hxy + Txxy*dxx + Txyy*dyy
-        HyyJ = Hyy + Txyy*dxx + Tyyy*dyy
-        moment_j = moment_j + 0.5_DOUBLE*(HxxJ*m2_cache_xx(id_elem) &
-          + 2.0_DOUBLE*HxyJ*m2_cache_xy(id_elem) + HyyJ*m2_cache_yy(id_elem))
+        HxxJ = Hxx + Txxx*dxx + Txxy*dyy + Txxz*dzz
+        HyyJ = Hyy + Txyy*dxx + Tyyy*dyy + Tyyz*dzz
+        HzzJ = Hzz + Txzz*dxx + Tyzz*dyy + Tzzz*dzz
+        HxyJ = Hxy + Txxy*dxx + Txyy*dyy + Txyz*dzz
+        HxzJ = Hxz + Txxz*dxx + Txyz*dyy + Txzz*dzz
+        HyzJ = Hyz + Txyz*dxx + Tyyz*dyy + Tyzz*dzz
+        moment_j = moment_j + 0.5_DOUBLE*(HxxJ*m2_cache_xx(id_elem) + HyyJ*m2_cache_yy(id_elem) &
+          + HzzJ*m2_cache_zz(id_elem) + 2.0_DOUBLE*HxyJ*m2_cache_xy(id_elem) &
+          + 2.0_DOUBLE*HxzJ*m2_cache_xz(id_elem) + 2.0_DOUBLE*HyzJ*m2_cache_yz(id_elem))
 
         do ic = 1, nc_in
-          rhs(:, ic) = rhs(:, ic) + weight*basis*moment_j(ic)
+          rhs(1:n_basis, ic) = rhs(1:n_basis, ic) + weight*basis(1:n_basis)*moment_j(ic)
         end do
       end do
       deallocate(neigh)
 
-      call lu_factor_lapack(n_basis, mat, ipiv)
-      call lu_solve_mat_lapack(n_basis, mat, ipiv, nc_in, rhs)
+      call lu_factor_lapack(n_basis, mat(1:n_basis, 1:n_basis), ipiv(1:n_basis))
+      call lu_solve_mat_lapack(n_basis, mat(1:n_basis, 1:n_basis), ipiv(1:n_basis), nc_in, rhs(1:n_basis, :))
 
       ! Match grad_cell's own vertex-to-cell weighting exactly.
       if (use_weno_blend) then
@@ -1563,6 +1607,7 @@ contains
         sub_elem_volume = mesh%sub_elem(id_sub_elem)%volume * vweight
         bias_num_x(:, id_elem) = bias_num_x(:, id_elem) + sub_elem_volume*rhs(2, :)
         bias_num_y(:, id_elem) = bias_num_y(:, id_elem) + sub_elem_volume*rhs(3, :)
+        if (n_basis == 4) bias_num_z(:, id_elem) = bias_num_z(:, id_elem) + sub_elem_volume*rhs(4, :)
         bias_den(id_elem) = bias_den(id_elem) + sub_elem_volume
       end do
     end do
@@ -1571,23 +1616,39 @@ contains
       if (bias_den(i) <= 0.0_DOUBLE) cycle
       grad_cell(1:nc_in, i) = grad_cell(1:nc_in, i) - bias_num_x(:, i)/bias_den(i)
       grad_cell(nc_in+1:2*nc_in, i) = grad_cell(nc_in+1:2*nc_in, i) - bias_num_y(:, i)/bias_den(i)
+      if (.not. boundary_2d) grad_cell(2*nc_in+1:3*nc_in, i) = grad_cell(2*nc_in+1:3*nc_in, i) - bias_num_z(:, i)/bias_den(i)
     end do
 
     ! (3) cell-blend curvature: correct the gap from blending several corner samples of a curved gradient field via the touching vertices' own Tv and the discrete second moment of their positions about the cell centroid.
-    allocate(m2d_num_xx(1, mesh%n_elems), m2d_num_xy(1, mesh%n_elems), m2d_num_yy(1, mesh%n_elems))
-    allocate(m2d_den(mesh%n_elems))
-    allocate(t_num_xxx(nc_in, mesh%n_elems), t_num_xxy(nc_in, mesh%n_elems))
-    allocate(t_num_xyy(nc_in, mesh%n_elems), t_num_yyy(nc_in, mesh%n_elems))
-    m2d_num_xx = 0.0_DOUBLE; m2d_num_xy = 0.0_DOUBLE; m2d_num_yy = 0.0_DOUBLE; m2d_den = 0.0_DOUBLE
-    t_num_xxx = 0.0_DOUBLE; t_num_xxy = 0.0_DOUBLE; t_num_xyy = 0.0_DOUBLE; t_num_yyy = 0.0_DOUBLE
+    allocate(m2d_num_xx(mesh%n_elems), m2d_num_yy(mesh%n_elems), m2d_num_zz(mesh%n_elems))
+    allocate(m2d_num_xy(mesh%n_elems), m2d_num_xz(mesh%n_elems), m2d_num_yz(mesh%n_elems), m2d_den(mesh%n_elems))
+    allocate(t_num_xxx(nc_in, mesh%n_elems), t_num_yyy(nc_in, mesh%n_elems), t_num_zzz(nc_in, mesh%n_elems))
+    allocate(t_num_xxy(nc_in, mesh%n_elems), t_num_xxz(nc_in, mesh%n_elems), t_num_xyy(nc_in, mesh%n_elems))
+    allocate(t_num_yyz(nc_in, mesh%n_elems), t_num_xzz(nc_in, mesh%n_elems), t_num_yzz(nc_in, mesh%n_elems))
+    allocate(t_num_xyz(nc_in, mesh%n_elems))
+    allocate(Tx1(nc_in), Tx2(nc_in), Tx3(nc_in), Tx4(nc_in), Tx5(nc_in))
+    allocate(Tx6(nc_in), Tx7(nc_in), Tx8(nc_in), Tx9(nc_in), Tx10(nc_in))
+    allocate(extra_x(nc_in), extra_y(nc_in), extra_z(nc_in))
+    m2d_num_xx = 0.0_DOUBLE; m2d_num_yy = 0.0_DOUBLE; m2d_num_zz = 0.0_DOUBLE
+    m2d_num_xy = 0.0_DOUBLE; m2d_num_xz = 0.0_DOUBLE; m2d_num_yz = 0.0_DOUBLE; m2d_den = 0.0_DOUBLE
+    t_num_xxx = 0.0_DOUBLE; t_num_yyy = 0.0_DOUBLE; t_num_zzz = 0.0_DOUBLE
+    t_num_xxy = 0.0_DOUBLE; t_num_xxz = 0.0_DOUBLE; t_num_xyy = 0.0_DOUBLE
+    t_num_yyz = 0.0_DOUBLE; t_num_xzz = 0.0_DOUBLE; t_num_yzz = 0.0_DOUBLE; t_num_xyz = 0.0_DOUBLE
     do iv = 1, mesh%n_vert
       if (mesh%vert(iv)%is_bound) cycle
       if (.not. valid_third_v(iv)) cycle
       do ic = 1, nc_in
-        Txxx(ic) = third_v(ic, iv)
-        Txxy(ic) = (third_v(3*nc_in+ic, iv) + third_v(9*nc_in+ic, iv) + third_v(nc_in+ic, iv)) / 3.0_DOUBLE
-        Txyy(ic) = (third_v(4*nc_in+ic, iv) + third_v(10*nc_in+ic, iv) + third_v(12*nc_in+ic, iv)) / 3.0_DOUBLE
+        Txxx(ic) = third_v(0*nc_in+ic, iv)
         Tyyy(ic) = third_v(13*nc_in+ic, iv)
+        Tzzz(ic) = third_v(26*nc_in+ic, iv)
+        Txxy(ic) = (third_v(1*nc_in+ic, iv) + third_v(3*nc_in+ic, iv) + third_v(9*nc_in+ic, iv)) / 3.0_DOUBLE
+        Txxz(ic) = (third_v(2*nc_in+ic, iv) + third_v(6*nc_in+ic, iv) + third_v(18*nc_in+ic, iv)) / 3.0_DOUBLE
+        Txyy(ic) = (third_v(4*nc_in+ic, iv) + third_v(10*nc_in+ic, iv) + third_v(12*nc_in+ic, iv)) / 3.0_DOUBLE
+        Tyyz(ic) = (third_v(14*nc_in+ic, iv) + third_v(16*nc_in+ic, iv) + third_v(22*nc_in+ic, iv)) / 3.0_DOUBLE
+        Txzz(ic) = (third_v(8*nc_in+ic, iv) + third_v(20*nc_in+ic, iv) + third_v(24*nc_in+ic, iv)) / 3.0_DOUBLE
+        Tyzz(ic) = (third_v(17*nc_in+ic, iv) + third_v(23*nc_in+ic, iv) + third_v(25*nc_in+ic, iv)) / 3.0_DOUBLE
+        Txyz(ic) = (third_v(5*nc_in+ic, iv) + third_v(7*nc_in+ic, iv) + third_v(11*nc_in+ic, iv) &
+          + third_v(15*nc_in+ic, iv) + third_v(19*nc_in+ic, iv) + third_v(21*nc_in+ic, iv)) / 6.0_DOUBLE
       end do
       ! Same grad_cell-consistent weight as the bias scatter above (redistributes grad's own samples).
       if (use_weno_blend) then
@@ -1602,32 +1663,50 @@ contains
         sub_elem_volume = mesh%sub_elem(id_sub_elem)%volume * vweight
         dvx = mesh%vert(iv)%coord(1) - mesh%elem(id_elem)%coord(1)
         dvy = mesh%vert(iv)%coord(2) - mesh%elem(id_elem)%coord(2)
-        m2d_num_xx(1,id_elem) = m2d_num_xx(1,id_elem) + sub_elem_volume*dvx*dvx
-        m2d_num_xy(1,id_elem) = m2d_num_xy(1,id_elem) + sub_elem_volume*dvx*dvy
-        m2d_num_yy(1,id_elem) = m2d_num_yy(1,id_elem) + sub_elem_volume*dvy*dvy
+        dvz = mesh%vert(iv)%coord(3) - mesh%elem(id_elem)%coord(3)
+        m2d_num_xx(id_elem) = m2d_num_xx(id_elem) + sub_elem_volume*dvx*dvx
+        m2d_num_yy(id_elem) = m2d_num_yy(id_elem) + sub_elem_volume*dvy*dvy
+        m2d_num_zz(id_elem) = m2d_num_zz(id_elem) + sub_elem_volume*dvz*dvz
+        m2d_num_xy(id_elem) = m2d_num_xy(id_elem) + sub_elem_volume*dvx*dvy
+        m2d_num_xz(id_elem) = m2d_num_xz(id_elem) + sub_elem_volume*dvx*dvz
+        m2d_num_yz(id_elem) = m2d_num_yz(id_elem) + sub_elem_volume*dvy*dvz
         m2d_den(id_elem) = m2d_den(id_elem) + sub_elem_volume
         t_num_xxx(:,id_elem) = t_num_xxx(:,id_elem) + sub_elem_volume*Txxx
-        t_num_xxy(:,id_elem) = t_num_xxy(:,id_elem) + sub_elem_volume*Txxy
-        t_num_xyy(:,id_elem) = t_num_xyy(:,id_elem) + sub_elem_volume*Txyy
         t_num_yyy(:,id_elem) = t_num_yyy(:,id_elem) + sub_elem_volume*Tyyy
+        t_num_zzz(:,id_elem) = t_num_zzz(:,id_elem) + sub_elem_volume*Tzzz
+        t_num_xxy(:,id_elem) = t_num_xxy(:,id_elem) + sub_elem_volume*Txxy
+        t_num_xxz(:,id_elem) = t_num_xxz(:,id_elem) + sub_elem_volume*Txxz
+        t_num_xyy(:,id_elem) = t_num_xyy(:,id_elem) + sub_elem_volume*Txyy
+        t_num_yyz(:,id_elem) = t_num_yyz(:,id_elem) + sub_elem_volume*Tyyz
+        t_num_xzz(:,id_elem) = t_num_xzz(:,id_elem) + sub_elem_volume*Txzz
+        t_num_yzz(:,id_elem) = t_num_yzz(:,id_elem) + sub_elem_volume*Tyzz
+        t_num_xyz(:,id_elem) = t_num_xyz(:,id_elem) + sub_elem_volume*Txyz
       end do
     end do
     do i = 1, mesh%n_elems
       if (m2d_den(i) <= 0.0_DOUBLE) cycle
-      M2xx = m2d_num_xx(1,i)/m2d_den(i); M2xy = m2d_num_xy(1,i)/m2d_den(i); M2yy = m2d_num_yy(1,i)/m2d_den(i)
-      Tx1 = t_num_xxx(:,i)/m2d_den(i); Tx2 = t_num_xxy(:,i)/m2d_den(i)
-      Tx3 = t_num_xyy(:,i)/m2d_den(i); Tx4 = t_num_yyy(:,i)/m2d_den(i)
-      extra_x = 0.5_DOUBLE*(Tx1*M2xx + 2.0_DOUBLE*Tx2*M2xy + Tx3*M2yy)
-      extra_y = 0.5_DOUBLE*(Tx2*M2xx + 2.0_DOUBLE*Tx3*M2xy + Tx4*M2yy)
+      M2xx = m2d_num_xx(i)/m2d_den(i); M2yy = m2d_num_yy(i)/m2d_den(i); M2zz = m2d_num_zz(i)/m2d_den(i)
+      M2xy = m2d_num_xy(i)/m2d_den(i); M2xz = m2d_num_xz(i)/m2d_den(i); M2yz = m2d_num_yz(i)/m2d_den(i)
+      Tx1 = t_num_xxx(:,i)/m2d_den(i); Tx2 = t_num_yyy(:,i)/m2d_den(i); Tx3 = t_num_zzz(:,i)/m2d_den(i)
+      Tx4 = t_num_xxy(:,i)/m2d_den(i); Tx5 = t_num_xxz(:,i)/m2d_den(i); Tx6 = t_num_xyy(:,i)/m2d_den(i)
+      Tx7 = t_num_yyz(:,i)/m2d_den(i); Tx8 = t_num_xzz(:,i)/m2d_den(i); Tx9 = t_num_yzz(:,i)/m2d_den(i)
+      Tx10 = t_num_xyz(:,i)/m2d_den(i)
+      extra_x = 0.5_DOUBLE*(Tx1*M2xx + Tx6*M2yy + Tx8*M2zz + 2.0_DOUBLE*Tx4*M2xy + 2.0_DOUBLE*Tx5*M2xz + 2.0_DOUBLE*Tx10*M2yz)
+      extra_y = 0.5_DOUBLE*(Tx4*M2xx + Tx2*M2yy + Tx9*M2zz + 2.0_DOUBLE*Tx6*M2xy + 2.0_DOUBLE*Tx10*M2xz + 2.0_DOUBLE*Tx7*M2yz)
+      extra_z = 0.5_DOUBLE*(Tx5*M2xx + Tx7*M2yy + Tx3*M2zz + 2.0_DOUBLE*Tx10*M2xy + 2.0_DOUBLE*Tx8*M2xz + 2.0_DOUBLE*Tx9*M2yz)
       grad_cell(1:nc_in, i) = grad_cell(1:nc_in, i) - extra_x
       grad_cell(nc_in+1:2*nc_in, i) = grad_cell(nc_in+1:2*nc_in, i) - extra_y
+      if (.not. boundary_2d) grad_cell(2*nc_in+1:3*nc_in, i) = grad_cell(2*nc_in+1:3*nc_in, i) - extra_z
     end do
 
-    deallocate(Hxx, Hxy, Hyy, Txxx, Txxy, Txyy, Tyyy, HxxJ, HxyJ, HyyJ, moment_j)
-    deallocate(bias_num_x, bias_num_y, bias_den)
-    deallocate(Tx1, Tx2, Tx3, Tx4, extra_x, extra_y)
-    deallocate(m2d_num_xx, m2d_num_xy, m2d_num_yy, m2d_den)
-    deallocate(t_num_xxx, t_num_xxy, t_num_xyy, t_num_yyy)
+    deallocate(Hxx, Hyy, Hzz, Hxy, Hxz, Hyz)
+    deallocate(Txxx, Tyyy, Tzzz, Txxy, Txxz, Txyy, Tyyz, Txzz, Tyzz, Txyz)
+    deallocate(HxxJ, HyyJ, HzzJ, HxyJ, HxzJ, HyzJ, moment_j)
+    deallocate(bias_num_x, bias_num_y, bias_num_z, bias_den)
+    deallocate(Tx1, Tx2, Tx3, Tx4, Tx5, Tx6, Tx7, Tx8, Tx9, Tx10, extra_x, extra_y, extra_z)
+    deallocate(m2d_num_xx, m2d_num_yy, m2d_num_zz, m2d_num_xy, m2d_num_xz, m2d_num_yz, m2d_den)
+    deallocate(t_num_xxx, t_num_yyy, t_num_zzz, t_num_xxy, t_num_xxz)
+    deallocate(t_num_xyy, t_num_yyz, t_num_xzz, t_num_yzz, t_num_xyz)
   end subroutine apply_grad_bias_correction
 
 end module arbitrary_high_order_module
