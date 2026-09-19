@@ -1,18 +1,4 @@
-! Arbitrary-order cell derivatives on unstructured meshes: a recursive multi-D
-! generalization of 1D divided differences. Given the order-(k-1) derivative
-! tensor in every cell (order 0 = the field itself), one order-k step
-! (compute_next_order_derivative) is:
-!   1) at every vertex, a weighted-least-squares (or Green-Gauss) affine fit
-!      of the order-(k-1) tensor over the elements touching that vertex gives
-!      the order-k tensor there (compute_nodal_derivative_at_vertex[_green_gauss]);
-!   2) that vertex tensor is scattered into every cell around the vertex as a
-!      nonlinear-WENO-weighted contribution, weight 1/(eps+OI_v^p);
-!   3) each cell normalizes its accumulator by its weight sum.
-! Only the order-k tensor needs a ghost exchange before serving as the
-! order-(k-1) input of the next step (one layer deep) -- compute_next_order_
-! derivative performs a single step and leaves the exchange to the caller, so
-! communication of order k can overlap with unrelated work while order k+1 is
-! prepared; see compute_derivative_hierarchy for the blocking chain of all orders.
+! Arbitrary-order cell derivatives on unstructured meshes: recursive multi-D divided differences, one nodal LS/Green-Gauss fit + WENO scatter per recursion order (grad->hess->third), overlappable MPI exchange between orders.
 module arbitrary_high_order_module
   use precision_module
   use mesh_module
@@ -37,69 +23,43 @@ module arbitrary_high_order_module
 
   ! eps_weno floors a WENO indicator ratio against literal division by zero.
   real(kind=DOUBLE), parameter :: eps_weno = tiny(1.0_DOUBLE)
-  ! Regularizes oi_v (the dimensionless per-vertex WENO oscillation indicator)
-  ! in scatter_weno_weighted; eps_weight_num_deep is a separate, more forgiving
-  ! floor for the hess/third recursion levels. LS-path values; GG has its own
-  ! decoupled eps_weight_num_gg/eps_weight_num_deep_gg below.
+  ! Regularizes oi_v in scatter_weno_weighted; eps_weight_num_deep is a looser floor for hess/third; GG has its own decoupled eps_weight_num_gg/_deep_gg.
   real(kind=DOUBLE), public :: eps_weight_num = 1.0e-2_DOUBLE
   real(kind=DOUBLE), public :: eps_weight_num_deep = 1.0_DOUBLE
   real(kind=DOUBLE), public :: eps_weight_num_gg = 1.0e-2_DOUBLE
   real(kind=DOUBLE), public :: eps_weight_num_deep_gg = 1.0_DOUBLE
-  ! Exponent on the oscillation indicator in the WENO weight, weight =
-  ! omega_p/(eps+OI_v^weno_power).
+  ! Exponent on the oscillation indicator: weight = omega_p/(eps+OI_v^weno_power).
   integer(kind=ENTIER), public :: weno_power = 1
-  ! Calibration divisor on the gradient-norm term added to oi_v (LS) / oi_v's
-  ! only term (GG) -- see compute_nodal_derivative_at_vertex[_green_gauss].
+  ! Calibration divisor on the gradient-norm term added to oi_v (LS) / oi_v's only term (GG).
   real(kind=DOUBLE), public :: grad_norm_derate = 1.0e4_DOUBLE
   real(kind=DOUBLE), public :: grad_norm_derate_gg = 1.0e4_DOUBLE
-  ! When .true. AND use_green_gauss, scatter_weno_weighted/rescue_zero_weight_
-  ! cell use omega_p/(eps+(1+OI)^p) instead of omega_p/(eps+OI^p).
+  ! GG-only: when .true., use omega_p/(eps+(1+OI)^p) instead of omega_p/(eps+OI^p).
   logical, public :: use_alt_gg_weight = .false.
-  ! .false.: nonlinear WENO weight is replaced by a plain volume weight
-  ! (weight=1), i.e. a straight sub_elem_volume-weighted average of nodal
-  ! derivatives with no oscillation-adaptive de-centering.
+  ! .false.: plain sub_elem_volume-weighted average of nodal derivatives, no oscillation-adaptive de-centering.
   logical, public :: use_weno_blend = .true.
-  ! Selects the per-vertex nodal fit compute_next_order_derivative uses at
-  ! every recursion level: .false. (default) is the weighted least-squares
-  ! fit ("aho ls"); .true. is the Green-Gauss divergence-theorem fit
-  ! ("aho gg"). Both produce the same (dphi_v, oi_v) shape and are consumed
-  ! identically downstream (WENO scatter, apply_grad_bias_correction).
+  ! .false.=weighted least-squares nodal fit ("aho ls"); .true.=Green-Gauss divergence-theorem fit ("aho gg"); both produce the same (dphi_v,oi_v) shape.
   logical, public :: use_green_gauss = .false.
-  ! CWENO-style central-candidate experiment (Semplice & Visconti 2020):
-  ! blends one extra "optimal" candidate (the plain linear/volume-weighted
-  ! average) into the same nonlinear WENO sum, weight cweno_center_weight/
-  ! (eps+OI_c**cweno_center_power). Off by default; opt in via
-  ! compute_next_order_derivative_cweno explicitly.
+  ! CWENO-style central candidate (Semplice & Visconti 2020): blends the plain linear average into the WENO sum, weight cweno_center_weight/(eps+OI_c** cweno_center_power); off by default, opt in via compute_next_order_derivative_cweno.
   logical, public :: use_cweno_center = .false.
   real(kind=DOUBLE), public :: cweno_center_weight = 1000.0_DOUBLE
   integer(kind=ENTIER), public :: cweno_center_power = 4
 
-  ! Per-vertex neighbor-list cache (CSR), built once per distinct mesh:
-  ! gather_ls_neighbors' ring-expansion is pure topology, independent of phi.
+  ! Per-vertex neighbor-list cache (CSR), built once per mesh: gather_ls_neighbors is pure topology.
   integer(kind=ENTIER), save :: neigh_cache_n_vert = -1
   integer(kind=ENTIER), dimension(:), allocatable, save :: neigh_cache_start
   integer(kind=ENTIER), dimension(:), allocatable, save :: neigh_cache_list
 
-  ! Per-cell second geometric moment (M2, about each cell's own centroid),
-  ! used by apply_grad_bias_correction: pure mesh geometry, cached once.
+  ! Per-cell second geometric moment, used by apply_grad_bias_correction: pure mesh geometry, cached once.
   integer(kind=ENTIER), save :: m2_cache_n_elems = -1
   real(kind=DOUBLE), dimension(:), allocatable, save :: m2_cache_xx, m2_cache_xy, m2_cache_yy
 
-  ! Per-vertex Green-Gauss fit matrix, ALREADY INVERTED: pure mesh geometry,
-  ! identical at every recursion level and every call for a given vertex, so
-  ! cached once per distinct mesh instead of rebuilt+inverted from scratch
-  ! every call. boundary_2d is baked in (row/column 3 zeroed).
+  ! Per-vertex Green-Gauss fit matrix, already inverted: pure geometry, cached once per mesh (boundary_2d baked in).
   integer(kind=ENTIER), save :: gg_mat_cache_n_vert = -1
   logical, save :: gg_mat_cache_boundary_2d = .false.
   real(kind=DOUBLE), dimension(:, :, :), allocatable, save :: gg_mat_inv_cache
   logical, dimension(:), allocatable, save :: gg_mat_valid_cache
 
-  ! Flattened (CSR-style) per-vertex list of the (area*normal, source-cell)
-  ! pairs walked by compute_nodal_derivative_at_vertex_green_gauss's flux
-  ! sum: also pure geometry, built alongside gg_mat_inv_cache above.
-  ! gg_flux_offset_cache(v):gg_flux_offset_cache(v+1)-1 indexes into the two
-  ! flat arrays for vertex v. gg_oi_hlocal_cache is the OI indicator's
-  ! geometric h_local term, cached the same way.
+  ! Flattened per-vertex (area*normal, source-cell) list for the GG flux sum, plus the OI indicator's h_local term: also pure geometry, built alongside gg_mat_inv_cache.
   integer(kind=ENTIER), dimension(:), allocatable, save :: gg_flux_offset_cache
   real(kind=DOUBLE), dimension(:, :), allocatable, save :: gg_flux_w_cache
   integer(kind=ENTIER), dimension(:), allocatable, save :: gg_flux_elem_cache
@@ -109,8 +69,7 @@ module arbitrary_high_order_module
     real(kind=DOUBLE), dimension(:, :), allocatable :: val ! (d**order, n_elems)
   end type derivative_field_type
 
-  ! One phase of one order's work, timestamped by the *_timed drivers below,
-  ! for the blocking-vs-overlap timeline figure in tex_arbitrary_high_order.
+  ! One timestamped phase of one order's work, for the blocking-vs-overlap timeline figure.
   type :: timeline_event_type
     integer(kind=ENTIER) :: order
     character(len=20)    :: phase
@@ -128,12 +87,7 @@ contains
     nc = d**order
   end function n_derivative_components
 
-  ! One step of the hierarchy: nc_in = d**(order-1) components/cell in, and
-  ! nc_out = nc_in*d components/cell out. phi must already be valid on the
-  ! single ghost layer. boundary_2d must match the mesh's own build flag: on
-  ! a mesh extruded as one thin z-layer, every vertex's neighbors share the
-  ! same z, which makes the full 3D fit singular -- boundary_2d=.true. drops
-  ! z from the fit basis instead.
+  ! One step of the hierarchy: nc_in=d**(order-1) in, nc_out=nc_in*d out; boundary_2d must match the mesh's own build flag (drops z from the fit basis on a thin-extruded mesh).
   subroutine compute_next_order_derivative(mesh, d, nc_in, boundary_2d, phi, dphi, deriv_order, &
       dphi_v_out, valid_v_out, oi_v_out)
     implicit none
@@ -143,18 +97,12 @@ contains
     logical, intent(in) :: boundary_2d
     real(kind=DOUBLE), dimension(nc_in, mesh%n_elems), intent(in) :: phi
     real(kind=DOUBLE), dimension(nc_in*d, mesh%n_elems), intent(out) :: dphi
-    ! Recursion level this call computes: 1=grad, 2=hess, 3=third -- selects
-    ! eps_weight_num (level 1) vs eps_weight_num_deep (level>=2). Optional,
-    ! defaults to 1.
+    ! Recursion level: 1=grad, 2=hess, 3=third -- selects eps_weight_num vs eps_weight_num_deep. Defaults to 1.
     integer(kind=ENTIER), intent(in), optional :: deriv_order
-    ! Optional: exposes the per-vertex nodal estimate this call computes
-    ! internally anyway -- used by apply_grad_bias_correction to get an
-    ! accurate per-vertex Hessian/third tensor without a redundant LS solve.
+    ! Optional: exposes the per-vertex nodal estimate, used by apply_grad_bias_correction to avoid a redundant LS solve.
     real(kind=DOUBLE), dimension(:, :), allocatable, intent(out), optional :: dphi_v_out
     logical, dimension(:), allocatable, intent(out), optional :: valid_v_out
-    ! Optional: exposes the per-vertex oscillation indicator oi_v, used by
-    ! apply_grad_bias_correction to recompute the same per-vertex WENO
-    ! weight grad_cell was actually scattered with.
+    ! Optional: exposes the per-vertex oscillation indicator, used by apply_grad_bias_correction to match grad_cell's own WENO weight.
     real(kind=DOUBLE), dimension(:), allocatable, intent(out), optional :: oi_v_out
 
     integer(kind=ENTIER) :: nc_out, id_vert, id_elem, deriv_order_eff
@@ -176,11 +124,7 @@ contains
     weno_num = 0.0_DOUBLE
     weno_den = 0.0_DOUBLE
 
-    ! Each vertex's nodal derivative is computed once and immediately
-    ! scattered, WENO-weighted, into every cell touching it. A vertex on the
-    ! physical domain boundary is skipped (its dual-cell neighbor gather is
-    ! one-sided, spurious tangential derivatives) unless .not. boundary_2d,
-    ! where skipping it too would starve every vertex at once.
+    ! A boundary vertex is skipped (one-sided neighbor gather) unless .not. boundary_2d, where skipping it would starve every vertex.
     do id_vert = 1, mesh%n_vert
       if (mesh%vert(id_vert)%is_bound) cycle
       call accumulate_weno_contribution(mesh, d, nc_in, boundary_2d, id_vert, &
@@ -188,9 +132,7 @@ contains
         deriv_order=deriv_order_eff)
     end do
 
-    ! Fallback for a cell left with zero total weight (e.g. every touching
-    ! vertex sits on the domain boundary): re-admit boundary vertices for
-    ! that cell only.
+    ! Fallback for a cell left with zero weight (e.g. every touching vertex on the boundary): re-admit its own boundary vertices.
     do id_elem = 1, mesh%n_elems
       if (weno_den(id_elem) == 0.0_DOUBLE) then
         call rescue_zero_weight_cell(mesh, d, nc_in, boundary_2d, id_elem, &
@@ -222,12 +164,7 @@ contains
     deallocate(weno_num, weno_den, dphi_v_cache, valid_cache, oi_cache)
   end subroutine compute_next_order_derivative
 
-  ! CWENO variant of compute_next_order_derivative: accumulates, in one pass,
-  ! the usual nonlinear WENO num/den, a LINEAR (unweighted) num/den from the
-  ! same per-vertex candidates, and a volume-weighted running average of the
-  ! vertices' own OI. The final per-cell derivative folds the linear
-  ! candidate back into the nonlinear blend with weight cweno_center_weight/
-  ! (eps+OI_c**power) -- see use_cweno_center's header.
+  ! CWENO variant: also accumulates a linear (unweighted) num/den and a volume-weighted OI average, folded back with weight cweno_center_weight/(eps+OI_c**power) -- see use_cweno_center.
   subroutine compute_next_order_derivative_cweno(mesh, d, nc_in, boundary_2d, phi, dphi)
     implicit none
 
@@ -270,8 +207,7 @@ contains
       if (weno_den(id_elem) == 0.0_DOUBLE) then
         call rescue_zero_weight_cell(mesh, d, nc_in, boundary_2d, id_elem, &
           phi, weno_num, weno_den)
-        ! Rescue's fallback has no linear/OI counterpart -- mirror it into
-        ! the linear accumulators too.
+        ! Rescue's fallback has no linear/OI counterpart -- mirror it into the linear accumulators too.
         lin_num(:, id_elem) = weno_num(:, id_elem)
         lin_den(id_elem) = weno_den(id_elem)
       end if
@@ -296,9 +232,7 @@ contains
     deallocate(dphi_v_cache, valid_cache, oi_cache, dphi_lin_elem)
   end subroutine compute_next_order_derivative_cweno
 
-  ! Same per-vertex LS/GG solve as accumulate_weno_contribution, but scatters
-  ! into three running sums at once (nonlinear WENO, linear/center, and a
-  ! volume-weighted running OI average).
+  ! Same per-vertex LS/GG solve as accumulate_weno_contribution, scattering into three running sums at once (WENO, linear/center, OI average).
   subroutine accumulate_cweno_contribution(mesh, d, nc_in, boundary_2d, id_vert, &
       phi, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den, lin_num, lin_den, &
       oi_num, oi_den)
@@ -332,9 +266,7 @@ contains
     oi_cache(id_vert) = oi_v
     if (.not. valid) return
 
-    ! use_weno_blend=.false. must reduce weno_num/weno_den to exactly
-    ! lin_num/lin_den (weight=1), so the center-candidate blend below is a
-    ! provable no-op in that mode -- mirrors scatter_weno_weighted's own gate.
+    ! use_weno_blend=.false. must reduce weno_num/den to exactly lin_num/den (weight=1) so the center blend below is a provable no-op.
     if (use_weno_blend) then
       if (use_green_gauss) then
         if (use_alt_gg_weight) then
@@ -365,10 +297,7 @@ contains
     end do
   end subroutine accumulate_cweno_contribution
 
-  ! Rescue path for a cell left with zero total WENO weight after is_bound
-  ! vertices were skipped -- only possible if every one of the cell's own
-  ! vertices sits on the domain boundary. Re-admits just this cell's own
-  ! boundary vertices so the caller never divides by zero.
+  ! Rescue for a cell left with zero WENO weight (every vertex on the boundary): re-admits just this cell's own boundary vertices.
   subroutine rescue_zero_weight_cell(mesh, d, nc_in, boundary_2d, id_elem, &
       phi, weno_num, weno_den)
     implicit none
@@ -388,10 +317,7 @@ contains
     do j = 1, mesh%elem(id_elem)%n_vert
       id_vert = mesh%elem(id_elem)%vert(j)
       id_sub_elem = mesh%elem(id_elem)%sub_elem(j)
-      ! Under use_green_gauss this is currently a no-op for a fully-boundary
-      ! cell: the GG fit always returns valid=.false. at a boundary vertex
-      ! (no one-sided estimate implemented for it), so such a cell is
-      ! correctly left at weno_den=0 rather than silently borrowing an LS estimate.
+      ! Under use_green_gauss this is a no-op for a fully-boundary cell: the GG fit always returns valid=.false. there.
       if (use_green_gauss) then
         call compute_nodal_derivative_at_vertex_green_gauss(mesh, d, nc_in, boundary_2d, &
           id_vert, phi, dphi_v, valid, oi_v)
@@ -418,16 +344,10 @@ contains
         + (sub_elem_volume * vertex_weno_weight) * dphi_v
       weno_den(id_elem) = weno_den(id_elem) + sub_elem_volume * vertex_weno_weight
     end do
-    ! If every vertex was invalid too (isolated cell cluster), leave
-    ! weno_den at 0; the caller must not divide by it.
+    ! If every vertex is invalid too, weno_den is left at 0; the caller must not divide by it.
   end subroutine rescue_zero_weight_cell
 
-  ! Same order-k step as compute_next_order_derivative, but overlapping the
-  ! ghost exchange of its own output with local work: (1) sweep vertices
-  ! touching a to-be-sent cell and finalize just those cells; (2) post that
-  ! exchange non-blockingly; (3) sweep every remaining vertex/cell while the
-  ! exchange is in flight; (4) wait for it, filling in this rank's ghost
-  ! cells. With num_procs=1 this degenerates to compute_next_order_derivative.
+  ! Same step as compute_next_order_derivative, overlapping its own ghost exchange with local work (send-cells first, post, remaining work, wait); degenerates to it when num_procs=1.
   subroutine compute_next_order_derivative_overlap(mesh, mpi_send_recv, num_procs, &
       d, nc_in, boundary_2d, phi, dphi)
     use mpi_module, only: mpi_memory_exchange_post, mpi_memory_exchange_wait
@@ -501,8 +421,7 @@ contains
     ! Step 2: hand the just-finalized boundary cells to MPI and move on.
     if (num_procs > 1) call mpi_memory_exchange_post(mpi_send_recv, mesh%n_elems, nc_out, dphi)
 
-    ! Step 3: everything else, computed while the exchange is in flight.
-    ! Boundary vertices reuse their Step-1 cached dphi_v.
+    ! Step 3: everything else, computed while the exchange is in flight (boundary vertices reuse their Step-1 cached dphi_v).
     do id_vert = 1, mesh%n_vert
       if (is_boundary_vertex(id_vert)) cycle
       if (mesh%vert(id_vert)%is_bound) cycle
@@ -535,9 +454,7 @@ contains
     deallocate(is_send_cell, is_boundary_vertex)
   end subroutine compute_next_order_derivative_overlap
 
-  ! Reconstructs every order 1..max_order from the scalar field phi0. Each
-  ! order's cell-centered input is exchanged across the single ghost layer
-  ! before it is used to build the next order.
+  ! Reconstructs every order 1..max_order from phi0, exchanging each order's ghost layer before building the next.
   subroutine compute_derivative_hierarchy(mesh, mpi_send_recv, num_procs, &
       d, boundary_2d, max_order, phi0, dfield)
     implicit none
@@ -574,10 +491,7 @@ contains
     deallocate(phi_prev)
   end subroutine compute_derivative_hierarchy
 
-  ! Same as compute_derivative_hierarchy, using compute_next_order_derivative_
-  ! overlap for each order: that routine already waits for its own output's
-  ! exchange, so phi_prev is ghost-complete for the next order without a
-  ! separate top-of-loop exchange -- except phi0 itself, exchanged once up front.
+  ! Same as compute_derivative_hierarchy using the overlap step: phi_prev is already ghost-complete except phi0, exchanged once up front.
   subroutine compute_derivative_hierarchy_overlap(mesh, mpi_send_recv, num_procs, &
       d, boundary_2d, max_order, phi0, dfield)
     implicit none
@@ -611,10 +525,7 @@ contains
     deallocate(phi_prev)
   end subroutine compute_derivative_hierarchy_overlap
 
-  ! Same as compute_derivative_hierarchy, timestamping the two phases of
-  ! every order (blocking exchange, then compute) into events(1:n_events) --
-  ! for the blocking-vs-overlap timeline figure only. events must be
-  ! preallocated by the caller to at least 2*max_order.
+  ! Same as compute_derivative_hierarchy, timestamping exchange/compute into events (preallocate to >=2*max_order) for the timeline figure.
   subroutine compute_derivative_hierarchy_timed(mesh, mpi_send_recv, num_procs, &
       d, boundary_2d, max_order, phi0, dfield, events, n_events)
     use mpi
@@ -661,10 +572,7 @@ contains
     deallocate(phi_prev)
   end subroutine compute_derivative_hierarchy_timed
 
-  ! Same as compute_derivative_hierarchy_overlap, timestamping the four
-  ! phases of every order (compute boundary cells, post, compute interior,
-  ! wait) -- for the timeline figure only. events must be preallocated to
-  ! at least 4*max_order.
+  ! Same as compute_derivative_hierarchy_overlap, timestamping all four phases into events (preallocate to >=4*max_order).
   subroutine compute_derivative_hierarchy_overlap_timed(mesh, mpi_send_recv, num_procs, &
       d, boundary_2d, max_order, phi0, dfield, events, n_events)
     use mpi
@@ -799,14 +707,7 @@ contains
     deallocate(phi_prev)
   end subroutine compute_derivative_hierarchy_overlap_timed
 
-  ! Computes (D^k phi)_v at vertex id_vert, caches it in dphi_v_cache(:,
-  ! id_vert) (for a later accumulate_cached_weno_contribution call on the
-  ! same vertex, used by the MPI-overlap driver), and immediately scatters
-  ! it into every cell touching id_vert as a nonlinear-WENO-weighted
-  ! contribution: weight = 1/(eps+OI^p), OI a mesh-size-scaled oscillation
-  ! indicator (see scatter_weno_weighted).
-  ! skip_cell, if present, excludes cells where skip_cell(id_elem) is .true.
-  ! -- used by compute_next_order_derivative_overlap's two-pass split.
+  ! Computes+caches (D^k phi)_v at id_vert and scatters it WENO-weighted into every touching cell; skip_cell excludes cells (used by the MPI-overlap two-pass split).
   subroutine accumulate_weno_contribution(mesh, d, nc_in, boundary_2d, id_vert, &
       phi, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den, skip_cell, deriv_order)
     implicit none
@@ -851,10 +752,7 @@ contains
     call scatter_weno_weighted(mesh, id_vert, dphi_v, oi_v, weno_num, weno_den, skip_cell, eps_here)
   end subroutine accumulate_weno_contribution
 
-  ! Same scatter as accumulate_weno_contribution, but reusing an
-  ! already-cached dphi_v instead of recomputing it -- used by the MPI
-  ! overlap driver's Step 3 to fold a boundary vertex's Step-1 contribution
-  ! into non-send cells it also touches, without a second LAPACK solve.
+  ! Same scatter as accumulate_weno_contribution, reusing an already-cached dphi_v (MPI-overlap Step 3) instead of a second LAPACK solve.
   subroutine accumulate_cached_weno_contribution(mesh, id_vert, dphi_v_cache, &
       valid_cache, oi_cache, weno_num, weno_den, skip_cell)
     implicit none
@@ -874,13 +772,7 @@ contains
       oi_cache(id_vert), weno_num, weno_den, skip_cell)
   end subroutine accumulate_cached_weno_contribution
 
-  ! Shared scatter: weight = omega_p/(eps+OI^p), omega_p=sub_elem_volume (the
-  ! geometric/"linear weight" role, as in classical CWENO -- Semplice &
-  ! Visconti 2020, Def. 3) and OI=oi_v, the vertex's own fit residual/
-  ! gradient-norm indicator (see compute_nodal_derivative_at_vertex). OI
-  ! must measure disagreement with a smooth local model (vanishing under
-  ! refinement for smooth data), not raw derivative magnitude -- see that
-  ! routine's own header for the indicator's derivation.
+  ! Shared scatter: weight=omega_p/(eps+OI^p), omega_p=sub_elem_volume, OI=oi_v (the vertex's own fit residual/gradient-norm indicator, see compute_nodal_derivative_at_vertex).
   subroutine scatter_weno_weighted(mesh, id_vert, dphi_v, oi_v, weno_num, weno_den, skip_cell, eps_in)
     implicit none
 
@@ -891,8 +783,7 @@ contains
     real(kind=DOUBLE), dimension(:, :), intent(inout) :: weno_num
     real(kind=DOUBLE), dimension(:), intent(inout) :: weno_den
     logical, dimension(:), intent(in), optional :: skip_cell
-    ! Overrides eps_weight_num when present -- lets the caller pick a
-    ! level-dependent eps (grad vs hess/third).
+    ! Overrides eps_weight_num when present (level-dependent eps, grad vs hess/third).
     real(kind=DOUBLE), intent(in), optional :: eps_in
 
     integer(kind=ENTIER) :: j, id_elem, id_sub_elem
@@ -902,16 +793,14 @@ contains
     if (present(eps_in)) eps_use = eps_in
 
     if (use_weno_blend) then
-      ! GG-only alternative: omega_p/(eps+(1+OI)^p) bounds the smooth-data
-      ! weight near 1/(eps+1) instead of letting it blow up to 1/eps as OI->0.
+      ! GG-only alternative bounds the smooth-data weight near 1/(eps+1) instead of blowing up to 1/eps as OI->0.
       if (use_green_gauss .and. use_alt_gg_weight) then
         vertex_weno_weight = 1.0_DOUBLE / (eps_use + (1.0_DOUBLE + oi_v)**weno_power)
       else
         vertex_weno_weight = 1.0_DOUBLE / (eps_use + oi_v**weno_power)
       end if
     else
-      ! weight=1 cancels out of numerator/denominator, leaving a plain
-      ! sub_elem_volume-weighted average of nodal derivatives.
+      ! weight=1 cancels out of num/den, leaving a plain sub_elem_volume-weighted average.
       vertex_weno_weight = 1.0_DOUBLE
     end if
 
@@ -929,21 +818,7 @@ contains
     end do
   end subroutine scatter_weno_weighted
 
-  ! Weighted-least-squares gradient of phi at id_vert, over mesh%vert(id_vert)%
-  ! elem_neigh (never ring-expanded, see below): fits phi_c(x) ~= a0_c + G_c.
-  ! (x-x_vert) for each of the nc_in components independently, sharing one
-  ! (n_basis,n_basis) geometry-only normal matrix (one LU factorization per
-  ! vertex, reused for nc_in right-hand sides).
-  ! Candidate directions are x,y (boundary_2d) or x,y,z; only ones with a
-  ! genuinely resolvable spread among the gathered neighbors enter the basis
-  ! (dropped directions get an exact 0 derivative) -- handles both
-  ! boundary_2d's z and a quasi-1D mesh's degenerate y/z. Exact (zero
-  ! residual) whenever phi is locally affine in the active directions,
-  ! regardless of mesh irregularity.
-  ! The stencil is always exactly elem_neigh, never ring-expanded: a wider
-  ! ring is not guaranteed complete for a vertex on an MPI partition seam
-  ! (only a single node-based ghost layer), which previously caused a
-  ! rank-count-dependent accuracy regression.
+  ! Weighted-LS gradient of phi at id_vert over elem_neigh (never ring-expanded: a wider ring isn't guaranteed complete at an MPI partition seam), dynamic basis dropping any direction without a resolvable spread; exact for a locally affine phi.
   subroutine compute_nodal_derivative_at_vertex(mesh, d, nc_in, boundary_2d, &
       id_vert, phi, dphi_v, valid, oi_v)
     use linear_solver_module, only: lu_factor_lapack, lu_solve_mat_lapack
@@ -954,17 +829,9 @@ contains
     logical, intent(in) :: boundary_2d
     real(kind=DOUBLE), dimension(nc_in, mesh%n_elems), intent(in) :: phi
     real(kind=DOUBLE), dimension(nc_in*d), intent(out) :: dphi_v
-    ! .false. when not even one direction could be resolved: the caller must
-    ! exclude such a vertex from the WENO scatter entirely, not scatter
-    ! dphi_v=0 (which the 1/(eps+OI^p) weight would read as perfect confidence).
+    ! .false. when no direction could be resolved -- caller must exclude the vertex from the WENO scatter, not scatter dphi_v=0.
     logical, intent(out) :: valid
-    ! WENO oscillation indicator: the fit's own weighted-mean-squared
-    ! residual against the neighbor data, maximized over components and made
-    ! dimensionless by the neighbors' own weighted mean-square phi, combined
-    ! (via max) with a gradient-norm term beta=h_local*|grad|^2/phi_scale^2
-    ! that catches an axis-aligned jump the residual alone is blind to (a
-    ! jump exactly fit by the affine model when it doesn't vary along the
-    ! stencil's other active directions).
+    ! WENO oscillation indicator: fit residual (dimensionless) combined via max with a gradient-norm term that catches an axis-aligned jump the residual is blind to.
     real(kind=DOUBLE), intent(out) :: oi_v
 
     integer(kind=ENTIER), parameter :: max_basis = 4
@@ -1058,9 +925,7 @@ contains
     oi_v = max(oi_v, (max_spread * sum(rhs(2:n_basis, :)**2) / max(phi_scale2, 1.0e-300_DOUBLE)) &
       / grad_norm_derate)
 
-    ! rhs(1+a,i1) holds d(phi_i1)/dx_{active_dim(a)}; flatten with i1 (the
-    ! carried component) fast-varying and direction slow-varying, matching
-    ! the rest of the module's tensor layout. Inactive directions stay 0.
+    ! rhs(1+a,i1)=d(phi_i1)/dx_active_dim(a); flattened component-fast/direction-slow, inactive directions left at 0.
     do a = 1, n_active
       do i1 = 1, nc_in
         dphi_v((active_dim(a)-1)*nc_in + i1) = rhs(1+a, i1)
@@ -1068,14 +933,7 @@ contains
     end do
   end subroutine compute_nodal_derivative_at_vertex
 
-  ! Builds gg_mat_inv_cache/gg_flux_*_cache/gg_oi_hlocal_cache (all pure mesh
-  ! geometry) once per distinct mesh/boundary_2d combination -- a no-op if
-  ! already built. Uses pseudo_inverse_inplace_lapack (SVD) unconditionally:
-  ! this is now a one-time-per-vertex cost, so the inversion method no longer
-  ! matters for performance, and the SVD's robustness (handles the
-  ! boundary_2d case where mat's z-column is identically zero, and any
-  ! near-degenerate 3D element) is used instead of a closed-form inverse's
-  ! own singularity edge cases.
+  ! Builds gg_mat_inv_cache/gg_flux_*_cache/gg_oi_hlocal_cache (pure geometry) once per mesh; uses the LAPACK SVD pseudo-inverse unconditionally since inversion is now a one-time cost.
   subroutine ensure_green_gauss_mat_cache(mesh, boundary_2d)
     use linear_solver_module, only: pseudo_inverse_inplace_lapack
     implicit none
@@ -1088,10 +946,7 @@ contains
     real(kind=DOUBLE), dimension(3) :: dx, norm, dminn, dmaxn
     real(kind=DOUBLE), dimension(3, 3) :: mat, mat_inv
 
-    ! NB: .eqv. binds LOOSER than .and., so this must be parenthesized --
-    ! `A .and. B .eqv. C` parses as `(A .and. B) .eqv. C`. Without the
-    ! parens, a differently-sized mesh with boundary_2d=.false. (matching
-    ! the cache's own default) can false-positive as "already built".
+    ! NB: .eqv. binds looser than .and. -- must be parenthesized or a differently-sized mesh can false-positive as already cached.
     if (gg_mat_cache_n_vert == mesh%n_vert .and. (gg_mat_cache_boundary_2d .eqv. boundary_2d)) return
 
     if (allocated(gg_mat_inv_cache))  deallocate(gg_mat_inv_cache)
@@ -1135,8 +990,7 @@ contains
 
         do j = 1, mesh%sub_elem(id_sub_elem)%n_sub_faces
           id_sub_face = mesh%sub_elem(id_sub_elem)%sub_face(j)
-          ! sub_face%norm points from left_elem_neigh to right_elem_neigh;
-          ! flip it to point OUTWARD from this sub_elem's own cell.
+          ! sub_face%norm points left_elem_neigh->right_elem_neigh; flip it outward from this sub_elem's own cell.
           if (mesh%sub_face(id_sub_face)%left_elem_neigh == id_elem) then
             norm = mesh%sub_face(id_sub_face)%norm
           else
@@ -1165,10 +1019,7 @@ contains
       end do
       gg_oi_hlocal_cache(v) = maxval(dmaxn(1:n_cand) - dminn(1:n_cand))
 
-      ! mat's third column is identically zero for boundary_2d (every
-      ! neighbor shares the vertex's own z on a thin single-layer mesh),
-      ! singular by construction; the SVD handles that and any
-      ! near-degenerate 3D element the same way.
+      ! mat's third column is identically zero for boundary_2d (singular by construction); the SVD handles that and any near-degenerate 3D element.
       mat_inv = mat
       call pseudo_inverse_inplace_lapack(3_ENTIER, mat_inv)
       if (boundary_2d) mat_inv(3, :) = 0.0_DOUBLE
@@ -1180,22 +1031,7 @@ contains
     gg_mat_cache_boundary_2d = boundary_2d
   end subroutine ensure_green_gauss_mat_cache
 
-  ! Alternative to compute_nodal_derivative_at_vertex ("aho ls"): a discrete
-  ! Green-Gauss/divergence-theorem sum over the vertex's own dual control
-  ! volume (median-dual sub_elem/sub_face decomposition), corrected by the
-  ! inverse of the local geometric moment matrix so the result is exact for
-  ! a linear field on any (including skewed) stencil -- "aho green gauss".
-  !
-  ! Derivation: for phi linear, phi(x)=phi(x_p)+A.(x-x_p), Green-Gauss over
-  ! the closed interior dual cell gives grad_raw = phi(x_p)*sum_f(A_f*n_f) +
-  ! sum_f A_f*n_f*(A.(x_elem_f-x_p)). The first term vanishes for an
-  ! interior vertex (closed surface); boundary vertices are excluded
-  ! (valid=.false.) rather than corrected for the term not vanishing there.
-  ! The second term is mat.A with mat = sum_f A_f*(n_f (x) (x_elem_f-x_p)),
-  ! so A = mat^-1.grad_raw. mat depends only on geometry, so the same
-  ! mat^-1 (gg_mat_inv_cache) is reused unchanged at every recursion order
-  ! (grad->hess->third): the extra carried indices of a higher-order phi
-  ! are just extra right-hand-side columns.
+  ! Alternative to the LS fit ("aho gg"): Green-Gauss sum over the vertex's dual control volume, corrected by mat^-1=gg_mat_inv_cache (see that cache's own header for the derivation) so the result is exact for a linear field on any stencil.
   subroutine compute_nodal_derivative_at_vertex_green_gauss(mesh, d, nc_in, &
       boundary_2d, id_vert, phi, dphi_v, valid, oi_v)
     implicit none
@@ -1221,9 +1057,7 @@ contains
     valid = gg_mat_valid_cache(id_vert)
     if (.not. valid) return
 
-    ! Pure geometry (weighted normal, source cell) is precomputed once per
-    ! vertex in ensure_green_gauss_mat_cache; only this phi-dependent gather
-    ! is redone at every call (grad/hess/third x every RK stage x every step).
+    ! Geometry is precomputed in ensure_green_gauss_mat_cache; only this phi gather is redone every call.
     grad_raw = 0.0_DOUBLE
     k0 = gg_flux_offset_cache(id_vert)
     k1 = gg_flux_offset_cache(id_vert + 1) - 1
@@ -1238,11 +1072,7 @@ contains
 
     grad_true = matmul(gg_mat_inv_cache(:, :, id_vert), grad_raw)
 
-    ! Gradient-norm oscillation indicator, same formula/calibration idea as
-    ! compute_nodal_derivative_at_vertex's own gradient-norm term (no
-    ! residual counterpart here: GG doesn't explicitly fit an affine model,
-    ! so there is no natural "residual against the fit"). h_local is pure
-    ! geometry (cached above); phi_scale2 depends on phi and is gathered here.
+    ! Gradient-norm oscillation indicator (no residual counterpart for GG); h_local is cached, phi_scale2 depends on phi and is gathered here.
     n_cand = merge(2_ENTIER, 3_ENTIER, boundary_2d)
     weight_sum = 0.0_DOUBLE
     phi_sq_sum = 0.0_DOUBLE
@@ -1254,8 +1084,7 @@ contains
     oi_v = (gg_oi_hlocal_cache(id_vert) * sum(grad_true(1:n_cand, :)**2) &
       / max(phi_scale2, 1.0e-300_DOUBLE)) / grad_norm_derate_gg
 
-    ! Same "direction slow-varying, carried-component fast-varying" flat
-    ! layout as compute_nodal_derivative_at_vertex's own dphi_v.
+    ! Same direction-slow/component-fast flat layout as compute_nodal_derivative_at_vertex's dphi_v.
     do a = 1, d
       do i1 = 1, nc_in
         dphi_v((a-1)*nc_in + i1) = grad_true(a, i1)
@@ -1263,13 +1092,7 @@ contains
     end do
   end subroutine compute_nodal_derivative_at_vertex_green_gauss
 
-  ! Exactness/accuracy test for compute_nodal_derivative_at_vertex_green_
-  ! gauss, degree by degree: builds a polynomial phi of degree k whose exact
-  ! order-k derivative is a known constant tensor, calls the routine at
-  ! every non-boundary vertex, and prints max/RMS error for degree 1 (grad),
-  ! 2 (hess, fed the exact linear gradient field), and 3 (third, fed the
-  ! exact linear Hessian field), plus a degree-mismatch check (grad of a
-  ! quadratic field, not exact by construction, to track convergence order).
+  ! Exactness test for the GG nodal fit: degree-k polynomial phi with a known constant order-k derivative, max/RMS error at every non-boundary vertex, degree 1/2/3 plus a degree-mismatch check.
   subroutine test_green_gauss_nodal(mesh, boundary_2d)
     implicit none
 
@@ -1298,7 +1121,7 @@ contains
       h2(:, 3) = 0.0_DOUBLE
     end if
 
-    ! Degree 1: phi1 = v1.(x-x0), exact grad = v1 (constant).
+    ! Degree 1: phi1=v1.(x-x0), exact grad=v1 (constant).
     allocate(phi1(1, mesh%n_elems), dphi_v(3))
     do i = 1, mesh%n_elems
       phi1(1, i) = dot_product(v1, mesh%elem(i)%coord - x0)
@@ -1322,8 +1145,7 @@ contains
       ' max_err=', max_err, ' rms_err=', rms_err
     deallocate(phi1, dphi_v)
 
-    ! Degree 2: phi2 = 1/2 (x-x0).H2.(x-x0), exact grad = H2.(x-x0), exact
-    ! hess = H2 (constant).
+    ! Degree 2: phi2=1/2 (x-x0).H2.(x-x0), exact grad=H2.(x-x0), exact hess=H2.
     allocate(phi2(3, mesh%n_elems), dphi_v(9))
     do i = 1, mesh%n_elems
       dx = mesh%elem(i)%coord - x0
@@ -1354,8 +1176,7 @@ contains
       n_valid, ' max_err=', max_err, ' rms_err=', rms_err
     deallocate(phi2, dphi_v)
 
-    ! Degree 3: phi3 = 1/6 (v3.(x-x0))^3, exact hess = (v3.(x-x0))*v3(x)v3,
-    ! exact third = v3(x)v3(x)v3 (constant, fully symmetric).
+    ! Degree 3: phi3=1/6 (v3.(x-x0))^3, exact hess=(v3.(x-x0))*v3(x)v3, exact third=v3(x)v3(x)v3.
     allocate(phi3(9, mesh%n_elems), dphi_v(27))
     do i = 1, mesh%n_elems
       dx = mesh%elem(i)%coord - x0
@@ -1392,9 +1213,7 @@ contains
       n_valid, ' max_err=', max_err, ' rms_err=', rms_err
     deallocate(phi3, dphi_v)
 
-    ! Degree-mismatch: grad (order=1 call) of the SAME quadratic phi2q used
-    ! above -- not exact (scheme is only linear-exact); report the error so
-    ! the caller can confirm the expected shrink rate under refinement.
+    ! Degree mismatch: grad (order=1) of the same quadratic phi2 -- not exact, tracks convergence order.
     allocate(phi1(1, mesh%n_elems), dphi_v(3))
     do i = 1, mesh%n_elems
       dx = mesh%elem(i)%coord - x0
@@ -1420,13 +1239,7 @@ contains
     deallocate(phi1, dphi_v)
   end subroutine test_green_gauss_nodal
 
-  ! Same idea as test_green_gauss_nodal's degree-mismatch check, but on the
-  ! real (non-polynomial) stationary isentropic vortex density profile
-  ! (domain [-10,10]^2, beta=5, gamma=1.4, t=0), compared against its exact
-  ! analytic grad/hess/third. Static test only (no RK3, no flux, no WENO):
-  ! isolates whether the Green-Gauss nodal operator alone gets the right
-  ! order on smooth, non-polynomial data -- not the same as the paper's own
-  ! vortex L2(rho) convergence table, which measures the full solver.
+  ! Same idea on the real (non-polynomial) stationary vortex density, vs its exact analytic grad/hess/third; static test, isolates the GG nodal operator alone, not the full solver's own convergence table.
   subroutine test_green_gauss_vortex(mesh, boundary_2d)
     implicit none
 
@@ -1489,7 +1302,7 @@ contains
       xv = mesh%vert(id_vert)%coord(1); yv = mesh%vert(id_vert)%coord(2)
       call vortex_ref(xv, yv, rho_v, gx, gy, hxx, hxy, hyy, txxx, txxy, txyy, tyyy)
       n_valid = n_valid + 1
-      ! true Hess = [[hxx,hxy,0],[hxy,hyy,0],[0,0,0]], layout (a-1)*3+i1
+      ! true Hess=[[hxx,hxy,0],[hxy,hyy,0],[0,0,0]], layout (a-1)*3+i1.
       err = (dphi_v(1)-hxx)**2 + (dphi_v(2)-hxy)**2 + dphi_v(3)**2 &
           + (dphi_v(4)-hxy)**2 + (dphi_v(5)-hyy)**2 + dphi_v(6)**2 &
           + dphi_v(7)**2 + dphi_v(8)**2 + dphi_v(9)**2
@@ -1522,9 +1335,7 @@ contains
       xv = mesh%vert(id_vert)%coord(1); yv = mesh%vert(id_vert)%coord(2)
       call vortex_ref(xv, yv, rho_v, gx, gy, hxx, hxy, hyy, txxx, txxy, txyy, tyyy)
       n_valid = n_valid + 1
-      ! true third tensor: fully symmetric in (x,y), zero if any index is z.
-      ! dphi_v((a-1)*9+(a2-1)*3+i1): a=new (3rd) derivative direction,
-      ! a2/i1=Hess indices carried from the previous step.
+      ! true third tensor symmetric in (x,y), zero if any index is z; dphi_v((a-1)*9+(a2-1)*3+i1).
       err = 0.0_DOUBLE
       err = err + (dphi_v(1)-txxx)**2 + (dphi_v(2)-txxy)**2 + dphi_v(3)**2
       err = err + (dphi_v(4)-txxy)**2 + (dphi_v(5)-txyy)**2 + dphi_v(6)**2
@@ -1545,11 +1356,7 @@ contains
     deallocate(phi3, dphi_v)
   end subroutine test_green_gauss_vortex
 
-  ! Exact analytic rho and its grad/hess/third (x,y components only -- the
-  ! vortex is z-invariant) for the stationary (t=0) isentropic vortex used
-  ! throughout this paper (vortex_prim in euler_ho_module: beta=5, gamma=1.4,
-  ! domain-centred, no background advection at t=0). Generated via sympy
-  ! (diff+cse) from the same closed-form rho, K=(gamma-1)*beta^2/(8*gamma*pi^2).
+  ! Exact analytic rho and grad/hess/third for the stationary isentropic vortex (beta=5, gamma=1.4); generated via sympy diff+cse.
   pure subroutine vortex_ref(x, y, rho_v, gx, gy, hxx, hxy, hyy, &
       txxx, txxy, txyy, tyyy)
     implicit none
@@ -1565,10 +1372,7 @@ contains
     include "vortex_ref_cse.inc"
   end subroutine vortex_ref
 
-  ! Builds neigh_cache_start/neigh_cache_list (CSR) by calling
-  ! gather_ls_neighbors once per vertex -- the one-time cost that used to be
-  ! paid on every one of compute_nodal_derivative_at_vertex's many calls per
-  ! vertex. A no-op if the cache already matches this mesh's vertex count.
+  ! Builds the CSR neighbor cache once per mesh so compute_nodal_derivative_at_vertex doesn't re-derive it on every call.
   subroutine ensure_neighbor_cache(mesh)
     implicit none
 
@@ -1601,9 +1405,7 @@ contains
     neigh_cache_n_vert = mesh%n_vert
   end subroutine ensure_neighbor_cache
 
-  ! Builds m2_cache_xx/xy/yy (each cell's own second geometric moment about
-  ! its own centroid) once per distinct mesh, via degree-5 quadrature. A
-  ! no-op if already built for this mesh.
+  ! Builds each cell's own second geometric moment once per mesh via degree-5 quadrature.
   subroutine ensure_m2_cache(mesh)
     use quadrature_module, only: volume_quad_pts
     implicit none
@@ -1639,9 +1441,7 @@ contains
     m2_cache_n_elems = mesh%n_elems
   end subroutine ensure_m2_cache
 
-  ! Element neighbors of id_vert for the least-squares fit: exactly
-  ! mesh%vert(id_vert)%elem_neigh, never ring-expanded (see
-  ! compute_nodal_derivative_at_vertex's header).
+  ! Element neighbors of id_vert: exactly elem_neigh, never ring-expanded (see compute_nodal_derivative_at_vertex).
   subroutine gather_ls_neighbors(mesh, id_vert, n_neigh, neigh)
     use sort_module, only: add_sort_unique_int
     implicit none
@@ -1655,23 +1455,7 @@ contains
     call add_sort_unique_int(neigh, n_neigh, mesh%vert(id_vert)%elem_neigh)
   end subroutine gather_ls_neighbors
 
-  ! Corrects the grad step's own O(h^2) bias against a genuinely cubic
-  ! field, in place, using the per-vertex nodal Hessian (hess_v) and
-  ! third-derivative tensor (third_v) -- both already computed as
-  ! intermediates elsewhere, no extra neighbors or LS solves needed beyond
-  ! each cell's own second geometric moment.
-  !
-  ! The vertex's own weighted-LS affine fit is biased by three additive
-  ! contributions, all linear in the (assumed locally cubic) field and its
-  ! own H,T: (1) the vertex's own Taylor terms beyond affine, evaluated
-  ! exactly using its own Hv,Tv; (2) each neighbor cell's own
-  ! cell-average-vs-point-value gap, 0.5*H(centroid_j):M2_j; (3) the gap
-  ! from blending several corner (vertex) samples of a curved gradient
-  ! field into one cell value, corrected via the discrete second moment of
-  ! the touching vertices' own positions. All three vanish for affine or
-  ! quadratic data; for cubic data they reproduce the full observed grad bias.
-  !
-  ! Only implemented for boundary_2d=.true.; a .false. call is a no-op.
+  ! Corrects the grad step's own O(h^2) bias against a cubic field in place, using each vertex's nodal Hessian/third tensor and per-cell second moment; only implemented for boundary_2d=.true.
   subroutine apply_grad_bias_correction(mesh, d, nc_in, boundary_2d, grad_cell, &
       hess_v, third_v, valid_hess_v, valid_third_v, grad_oi_v)
     use linear_solver_module, only: lu_factor_lapack, lu_solve_mat_lapack
@@ -1684,11 +1468,7 @@ contains
     real(kind=DOUBLE), dimension(nc_in*d*d, mesh%n_vert), intent(in) :: hess_v
     real(kind=DOUBLE), dimension(nc_in*d*d*d, mesh%n_vert), intent(in) :: third_v
     logical, dimension(mesh%n_vert), intent(in) :: valid_hess_v, valid_third_v
-    ! Per-vertex oscillation indicator from the gradient-level call of
-    ! compute_next_order_derivative -- used to recompute the exact
-    ! per-vertex weight (sub_elem_volume*vertex_weno_weight) that grad_cell
-    ! was actually scattered with, matching its own vertex-to-cell blend
-    ! instead of assuming a plain sub_elem_volume average.
+    ! Per-vertex OI from the gradient-level call, used to match grad_cell's own vertex-to-cell WENO weight exactly.
     real(kind=DOUBLE), dimension(mesh%n_vert), intent(in) :: grad_oi_v
 
     integer(kind=ENTIER) :: iv, j, id_elem, id_sub_elem, kv, n_v, ic, i
@@ -1793,11 +1573,7 @@ contains
       grad_cell(nc_in+1:2*nc_in, i) = grad_cell(nc_in+1:2*nc_in, i) - bias_num_y(:, i)/bias_den(i)
     end do
 
-    ! (3) cell-blend curvature: even with each vertex's own grad exactly
-    ! unbiased, blending several corner samples of a curved gradient field
-    ! does not equal its value at the cell centroid -- correct using the
-    ! touching vertices' own Tv and the discrete second moment of their
-    ! positions about the cell centroid.
+    ! (3) cell-blend curvature: correct the gap from blending several corner samples of a curved gradient field via the touching vertices' own Tv and the discrete second moment of their positions about the cell centroid.
     allocate(m2d_num_xx(1, mesh%n_elems), m2d_num_xy(1, mesh%n_elems), m2d_num_yy(1, mesh%n_elems))
     allocate(m2d_den(mesh%n_elems))
     allocate(t_num_xxx(nc_in, mesh%n_elems), t_num_xxy(nc_in, mesh%n_elems))
@@ -1813,9 +1589,7 @@ contains
         Txyy(ic) = (third_v(4*nc_in+ic, iv) + third_v(10*nc_in+ic, iv) + third_v(12*nc_in+ic, iv)) / 3.0_DOUBLE
         Tyyy(ic) = third_v(13*nc_in+ic, iv)
       end do
-      ! Same grad_cell-consistent weight as the bias scatter above -- this
-      ! redistributes grad's own per-vertex samples, so it must match
-      ! grad's own blend, not third_v's.
+      ! Same grad_cell-consistent weight as the bias scatter above (redistributes grad's own samples).
       if (use_weno_blend) then
         vweight = 1.0_DOUBLE / (eps_weight_num + grad_oi_v(iv)**weno_power)
       else
