@@ -19,10 +19,15 @@ module euler_ho_module
     aho_module_use_green_gauss => use_green_gauss, &
     aho_module_use_cweno_center => use_cweno_center, &
     aho_module_cweno_center_weight => cweno_center_weight, &
+    aho_module_cweno_center_power => cweno_center_power, &
     aho_module_eps_weight_num => eps_weight_num, &
     aho_module_eps_weight_num_deep => eps_weight_num_deep, &
+    aho_module_eps_weight_num_gg => eps_weight_num_gg, &
+    aho_module_eps_weight_num_deep_gg => eps_weight_num_deep_gg, &
     aho_module_weno_power => weno_power, &
-    aho_module_grad_norm_derate => grad_norm_derate
+    aho_module_grad_norm_derate => grad_norm_derate, &
+    aho_module_grad_norm_derate_gg => grad_norm_derate_gg, &
+    aho_module_use_alt_gg_weight => use_alt_gg_weight
   use mpi_module, only: mpi_send_recv_type, mpi_memory_exchange
   implicit none
   private
@@ -110,6 +115,7 @@ module euler_ho_module
   ! arbitrary-high-order memory for the full writeup.
   logical, public :: use_cweno_center          = .false.
   real(kind=DOUBLE), public :: cweno_center_weight = 1000.0_DOUBLE
+  integer(kind=ENTIER), public :: cweno_center_power = 4
   ! At order=4 only: corrects the grad step's own O(h^2) affine-fit bias
   ! in place, using the per-vertex nodal Hessian/third-derivative tensors
   ! already computed as intermediates while building hess/third (see
@@ -124,6 +130,30 @@ module euler_ho_module
   ! no correction (apply_grad_bias_correction is a documented no-op
   ! there), not yet extended to genuine 3D.
   logical, public :: use_grad_bias_correction  = .true.
+  ! Classical (non-SSP) 4-stage RK4 in place of SSP-RK3 (2026-09-18, per
+  ! the user, to rule out RK3's own O(dt^3) temporal error as the reason
+  ! order 4's spatial accuracy doesn't clearly separate from order 3 on
+  ! some benchmarks -- a direct, unambiguous check to run alongside the
+  ! cheaper dt-shrinking diagnostic already tried for the same question).
+  ! .false. (default) keeps the existing SSP-RK3 exactly as before; see
+  ! euler_ho_main.F90's time loop for both branches, selected once at
+  ! the top of the timestep, everything else (compute_rhs, MPI exchange,
+  ! sync_gamma_arr, output/error cadence) shared identically either way.
+  logical, public :: use_rk4 = .false.
+  ! CFL time-step criterion: .false. (default) keeps the existing dt =
+  ! cfl*volume/sum_lambda(i), summing each face's A_pcf*lambda_pcf over
+  ! every face of the cell (a domain-of-dependence bound on the cell's
+  ! full boundary). .true. instead uses dt = cfl*volume/max_lambda(i),
+  ! the MAX over the cell's faces of that same per-face quantity, a much
+  ! less restrictive criterion for cells with many faces (2026-09-18, per
+  ! the user, to test alongside cfl=0.95 locally whether it still holds
+  ! stable at every order on a coarse shock-bubble mesh). face_flux_loop
+  ! accumulates a face-local total across that face's quadrature points
+  ! first, then folds it into sum_lambda(il)/sum_lambda(ir) via + (sum
+  ! mode) or max() (max mode) -- same array either way, so compute_dt and
+  ! every call site are untouched; sum mode is bit-for-bit identical to
+  ! the pre-existing behaviour.
+  logical, public :: use_max_lambda_dt = .false.
   ! Runtime-settable mirrors of arbitrary_high_order_module's own
   ! eps_weight_num/eps_weight_num_deep/weno_power/grad_norm_derate
   ! (2026-09-17, made settable there too -- see that module's own
@@ -135,8 +165,12 @@ module euler_ho_module
   ! calibration without a rebuild.
   real(kind=DOUBLE), public :: eps_weight_num      = 1.0e-2_DOUBLE
   real(kind=DOUBLE), public :: eps_weight_num_deep = 1.0_DOUBLE
+  real(kind=DOUBLE), public :: eps_weight_num_gg = 1.0e-2_DOUBLE
+  real(kind=DOUBLE), public :: eps_weight_num_deep_gg = 1.0_DOUBLE
   integer(kind=ENTIER), public :: weno_power       = 1
   real(kind=DOUBLE), public :: grad_norm_derate    = 1.0e4_DOUBLE
+  real(kind=DOUBLE), public :: grad_norm_derate_gg = 1.0e4_DOUBLE
+  logical, public :: use_alt_gg_weight = .false.
   ! Numerical flux at each face quadrature point: 'rusanov' (local
   ! Lax-Friedrichs, the original default) or 'three_wave' (an HLLC-family,
   ! 3-wave approximate Riemann solver -- same algorithm as
@@ -225,8 +259,10 @@ contains
       u_bg_vortex, v_bg_vortex, &
       gamma_gas, order, cfl, tmax, n_sol_vtu, &
       compute_error, error_2d, use_aho_reconstruction, use_weno_blend, use_green_gauss, &
-      use_cweno_center, cweno_center_weight, use_grad_bias_correction, flux_scheme, &
-      eps_weight_num, eps_weight_num_deep, weno_power, grad_norm_derate
+      use_cweno_center, cweno_center_weight, cweno_center_power, use_grad_bias_correction, use_rk4, &
+      use_max_lambda_dt, flux_scheme, &
+      eps_weight_num, eps_weight_num_deep, weno_power, grad_norm_derate, &
+      grad_norm_derate_gg, use_alt_gg_weight, eps_weight_num_gg, eps_weight_num_deep_gg
     open(newunit=funit, file=trim(adjustl(filename)))
     read(nml=INPUT_PARAM, unit=funit)
     close(funit)
@@ -1128,10 +1164,15 @@ contains
     aho_module_use_green_gauss = use_green_gauss
     aho_module_use_cweno_center = use_cweno_center
     aho_module_cweno_center_weight = cweno_center_weight
+    aho_module_cweno_center_power = cweno_center_power
     aho_module_eps_weight_num = eps_weight_num
     aho_module_eps_weight_num_deep = eps_weight_num_deep
     aho_module_weno_power = weno_power
     aho_module_grad_norm_derate = grad_norm_derate
+    aho_module_grad_norm_derate_gg = grad_norm_derate_gg
+    aho_module_use_alt_gg_weight = use_alt_gg_weight
+    aho_module_eps_weight_num_gg = eps_weight_num_gg
+    aho_module_eps_weight_num_deep_gg = eps_weight_num_deep_gg
 
     allocate(grad_flat(15, mesh%n_elems))
     allocate(grad_oi_v(mesh%n_vert))
@@ -1453,7 +1494,7 @@ contains
     real(kind=DOUBLE), dimension(1)    :: qwts_single
     real(kind=DOUBLE) :: qwt
     real(kind=DOUBLE), dimension(5) :: wL, wR, flux
-    real(kind=DOUBLE) :: lambda, gL, gR
+    real(kind=DOUBLE) :: lambda, gL, gR, face_lambda_accum
     ! Passive-scalar flux for the gamma-transport variable sol(6,:) =
     ! rho*Gamma (see gamma_arr's declaration): upwinded by the sign of the
     ! mass flux (flux(1)) already computed below -- same convention as a
@@ -1554,6 +1595,7 @@ contains
         qwts_single(1)    = mesh%face(iface)%area
       end if
 
+      face_lambda_accum = 0.0_DOUBLE
       do q = 1, n_qpts
         if (use_face_quad) then
           xface = qpts(:, q)
@@ -1584,6 +1626,7 @@ contains
         end select
         lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL, gL), &
                      abs(dot_product(wR(2:4), norm)) + cs(wR, gR)) * qwt
+        face_lambda_accum = face_lambda_accum + lambda
 
         ! Gamma-transport passive-scalar flux: upwind Gamma = sol(6,:)/
         ! sol(1,:) (rho*Gamma/rho) by the sign of the mass flux flux(1)
@@ -1605,7 +1648,6 @@ contains
 
         rhs(1:5, il) = rhs(1:5, il) - flux
         rhs(6, il)   = rhs(6, il)   - flux_rgm1
-        sum_lambda(il) = sum_lambda(il) + lambda
         if (ir > 0) then
           ! Fortran's .and. does not guarantee short-circuit evaluation
           ! (unlike C) -- a combined "ir > 0 .and. .not. mesh%elem(ir)%is_ghost"
@@ -1618,10 +1660,30 @@ contains
           if (.not. mesh%elem(ir)%is_ghost) then
             rhs(1:5, ir) = rhs(1:5, ir) + flux
             rhs(6, ir)   = rhs(6, ir)   + flux_rgm1
-            sum_lambda(ir) = sum_lambda(ir) + lambda
           end if
         end if
       end do
+
+      ! Fold this face's total (summed over its own quad points just
+      ! above) into sum_lambda(il)/sum_lambda(ir): += for the original
+      ! sum-over-faces CFL bound (bit-for-bit identical to summing every
+      ! quad point directly, since + is associative), or max() for the
+      ! looser max-over-faces bound (use_max_lambda_dt) -- see that
+      ! flag's declaration.
+      if (use_max_lambda_dt) then
+        sum_lambda(il) = max(sum_lambda(il), face_lambda_accum)
+      else
+        sum_lambda(il) = sum_lambda(il) + face_lambda_accum
+      end if
+      if (ir > 0) then
+        if (.not. mesh%elem(ir)%is_ghost) then
+          if (use_max_lambda_dt) then
+            sum_lambda(ir) = max(sum_lambda(ir), face_lambda_accum)
+          else
+            sum_lambda(ir) = sum_lambda(ir) + face_lambda_accum
+          end if
+        end if
+      end if
 
       if (use_face_quad) deallocate(qpts, qwts)
     end do

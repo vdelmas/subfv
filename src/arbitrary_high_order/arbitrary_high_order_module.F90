@@ -125,6 +125,17 @@ module arbitrary_high_order_module
   ! are already tiny/negligible except right at a genuine discontinuity)
   ! use a more forgiving floor without touching grad's own protection.
   real(kind=DOUBLE), public :: eps_weight_num_deep = 1.0_DOUBLE
+
+  ! GG's OWN eps floor (2026-09-18, per the user): decoupled from LS's own
+  ! eps_weight_num/eps_weight_num_deep above, exactly like
+  ! grad_norm_derate_gg -- lets GG's WENO weight be recalibrated (e.g. the
+  ! old, more aggressive 1e-6 floor, which de-centers harder and gives
+  ! much smaller Sod overshoot at the cost of the exact order-4 rate) for
+  ! GG specifically, without touching LS's own already-calibrated 1e-2
+  ! default. Default matches LS's current values (no behavior change
+  ! until swept/set explicitly).
+  real(kind=DOUBLE), public :: eps_weight_num_gg = 1.0e-2_DOUBLE
+  real(kind=DOUBLE), public :: eps_weight_num_deep_gg = 1.0_DOUBLE
   ! Exponent on the oscillation indicator in the WENO weight,
   ! weight = omega_p/(eps+OI_v^weno_power). Standard WENO/Jiang-Shu
   ! practice is power=2; RECALIBRATED to power=1 on 2026-09-16, per the
@@ -168,6 +179,23 @@ module arbitrary_high_order_module
   ! at derate=1.
   real(kind=DOUBLE), public :: grad_norm_derate = 1.0e4_DOUBLE
 
+  ! GG's OWN gradient-norm derate (2026-09-17, per the user): GG's oi_v
+  ! (compute_nodal_derivative_at_vertex_green_gauss) has no residual term
+  ! to fall back on (unlike LS's combined OI_v), so it is calibrated
+  ! independently from grad_norm_derate above rather than forced to share
+  ! LS's own value -- lets GG's WENO sensitivity be tuned (e.g. to reduce
+  ! Sod overshoot/undershoot) without touching LS's already-calibrated
+  ! behavior. Defaults to the same 1e4 as LS's own constant (no behavior
+  ! change until swept).
+  real(kind=DOUBLE), public :: grad_norm_derate_gg = 1.0e4_DOUBLE
+
+  ! EXPERIMENTAL (2026-09-17, per the user): when .true. AND use_green_gauss,
+  ! scatter_weno_weighted/rescue_zero_weight_cell use omega_p/(eps+(1+OI)^p)
+  ! instead of the standard omega_p/(eps+OI^p) -- see scatter_weno_weighted's
+  ! own comment for the motivation. .false. (default) leaves GG's weight
+  ! formula identical to LS's own.
+  logical, public :: use_alt_gg_weight = .false.
+
   ! Linear-blend mode (2026-09-15, per the user's request for a baseline
   ! comparison against the pure-ls reconstruction source): when .false.,
   ! the nonlinear WENO weight below is replaced by a plain volume weight
@@ -209,6 +237,16 @@ module arbitrary_high_order_module
   ! wired into aho_reconstruction/euler_ho_module.
   logical, public :: use_cweno_center = .false.
   real(kind=DOUBLE), public :: cweno_center_weight = 1000.0_DOUBLE
+  ! Exponent for the center-vs-nonlinear blend specifically (2026-09-18,
+  ! per literature: classical CWENO calibrations -- Levy/Puppo/Russo 2000,
+  ! Dumbser/Kaser 2007 -- use a large center weight (50-400) together with
+  ! a STEEP exponent p=4 for this particular blend, distinct from the
+  ! per-vertex WENO exponent (weno_power=1 here, tuned separately for a
+  ! different blend). Previously this routine reused weno_power for both,
+  ! which was never actually the literature's own recommendation for the
+  ! center blend -- kept as a separate knob so the two can be tuned
+  ! independently.
+  integer(kind=ENTIER), public :: cweno_center_power = 4
 
   ! Per-vertex neighbor-list cache (2026-09-14): gather_ls_neighbors'
   ! ring-expansion + sort-based uniqueness only depends on mesh topology
@@ -475,7 +513,7 @@ contains
       end if
       if (lin_den(id_elem) > 0.0_DOUBLE .and. oi_den(id_elem) > 0.0_DOUBLE) then
         oi_c = oi_num(id_elem) / oi_den(id_elem)
-        w_c = cweno_center_weight / (eps_weight_num + oi_c**weno_power)
+        w_c = cweno_center_weight / (eps_weight_num + oi_c**cweno_center_power)
         dphi_lin_elem = lin_num(:, id_elem) / lin_den(id_elem)
         dphi(:, id_elem) = (weno_num(:, id_elem) + w_c * dphi_lin_elem) / (weno_den(id_elem) + w_c)
       else
@@ -512,8 +550,17 @@ contains
     integer(kind=ENTIER) :: j, id_elem, id_sub_elem
     real(kind=DOUBLE) :: sub_elem_volume, vertex_weno_weight
 
-    call compute_nodal_derivative_at_vertex(mesh, d, nc_in, boundary_2d, &
-      id_vert, phi, dphi_v, valid, oi_v)
+    ! WIRED IN 2026-09-17 (was LS-only until now, per the user): same
+    ! switch as accumulate_weno_contribution -- see use_green_gauss's
+    ! header. Everything below (the WENO/linear/OI accumulators) is
+    ! already agnostic to which fit produced (dphi_v, oi_v).
+    if (use_green_gauss) then
+      call compute_nodal_derivative_at_vertex_green_gauss(mesh, d, nc_in, boundary_2d, &
+        id_vert, phi, dphi_v, valid, oi_v)
+    else
+      call compute_nodal_derivative_at_vertex(mesh, d, nc_in, boundary_2d, &
+        id_vert, phi, dphi_v, valid, oi_v)
+    end if
     dphi_v_cache(:, id_vert) = dphi_v
     valid_cache(id_vert) = valid
     oi_cache(id_vert) = oi_v
@@ -531,7 +578,15 @@ contains
     ! correct, it just has nothing left to do when there is no nonlinear
     ! candidate to protect against.
     if (use_weno_blend) then
-      vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + oi_v**weno_power)
+      if (use_green_gauss) then
+        if (use_alt_gg_weight) then
+          vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num_gg + (1.0_DOUBLE + oi_v)**weno_power)
+        else
+          vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num_gg + oi_v**weno_power)
+        end if
+      else
+        vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + oi_v**weno_power)
+      end if
     else
       vertex_weno_weight = 1.0_DOUBLE
     end if
@@ -593,7 +648,15 @@ contains
       if (.not. valid) cycle ! see compute_nodal_derivative_at_vertex's header
       sub_elem_volume = mesh%sub_elem(id_sub_elem)%volume
       if (use_weno_blend) then
-        vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + oi_v**weno_power)
+        if (use_green_gauss) then
+          if (use_alt_gg_weight) then
+            vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num_gg + (1.0_DOUBLE + oi_v)**weno_power)
+          else
+            vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num_gg + oi_v**weno_power)
+          end if
+        else
+          vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + oi_v**weno_power)
+        end if
       else
         vertex_weno_weight = 1.0_DOUBLE
       end if
@@ -1081,7 +1144,11 @@ contains
 
     deriv_order_eff = 1
     if (present(deriv_order)) deriv_order_eff = deriv_order
-    eps_here = merge(eps_weight_num, eps_weight_num_deep, deriv_order_eff <= 1)
+    if (use_green_gauss) then
+      eps_here = merge(eps_weight_num_gg, eps_weight_num_deep_gg, deriv_order_eff <= 1)
+    else
+      eps_here = merge(eps_weight_num, eps_weight_num_deep, deriv_order_eff <= 1)
+    end if
 
     call scatter_weno_weighted(mesh, id_vert, dphi_v, oi_v, weno_num, weno_den, skip_cell, eps_here)
   end subroutine accumulate_weno_contribution
@@ -1171,7 +1238,17 @@ contains
     if (present(eps_in)) eps_use = eps_in
 
     if (use_weno_blend) then
-      vertex_weno_weight = 1.0_DOUBLE / (eps_use + oi_v**weno_power)
+      ! EXPERIMENTAL (2026-09-17, per the user, GG-only): omega_p/(eps+(1+OI)^p)
+      ! instead of omega_p/(eps+OI^p) -- bounds the smooth-data weight near
+      ! 1/(eps+1) instead of letting it blow up to 1/eps as OI->0, a gentler
+      ! ratio between smooth and near-discontinuity vertices. Gated on
+      ! use_green_gauss so LS's own already-calibrated formula/behavior is
+      ! completely untouched.
+      if (use_green_gauss .and. use_alt_gg_weight) then
+        vertex_weno_weight = 1.0_DOUBLE / (eps_use + (1.0_DOUBLE + oi_v)**weno_power)
+      else
+        vertex_weno_weight = 1.0_DOUBLE / (eps_use + oi_v**weno_power)
+      end if
     else
       ! Linear-blend mode: weight=1 cancels out of numerator/denominator,
       ! leaving a plain sub_elem_volume-weighted average (see use_weno_blend's
@@ -1653,7 +1730,7 @@ contains
       h_local = maxval(spreadn(1:n_cand))
       phi_scale2 = maxval(phi_sq_sum) / max(weight_sum, 1.0e-300_DOUBLE)
       oi_v = (h_local * sum(grad_true(1:n_cand, :)**2) / max(phi_scale2, 1.0e-300_DOUBLE)) &
-        / grad_norm_derate
+        / grad_norm_derate_gg
     end block
 
     ! Same "direction slow-varying, carried-component fast-varying" flat
