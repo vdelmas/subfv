@@ -40,6 +40,13 @@ program euler_ho_main
     n_bc, bc_name, me, num_procs, mpi_send_recv)
   call build_mesh(mesh, num_procs, mpi_send_recv, .true., boundary_2d)
   call compute_geometry_mesh(mesh, .true., boundary_2d)
+  ! setup_wall_mirror (wall-tangent fit at boundary vertices) is implemented but NOT enabled yet:
+  ! it still develops a slow instability at some wall-adjacent vertices on the cylinder-tunnel mesh
+  ! (elevated but finite tangential gradient that compounds over ~100+ iterations into NaN) --
+  ! reproduces even at single rank, so it's not an MPI/ghost issue, root cause still open. Leave
+  ! disabled (falls through to the proven phantom-zero-gradient hack in
+  ! arbitrary_high_order_module's compute_next_order_derivative) until that's understood.
+  ! call setup_wall_mirror(mesh)
   if (order >= 3) call compute_cell_moments(mesh)
 
   allocate(sol(6, mesh%n_elems), sol1(6, mesh%n_elems), sol2(6, mesh%n_elems))

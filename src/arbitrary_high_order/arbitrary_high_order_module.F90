@@ -25,6 +25,8 @@ module arbitrary_high_order_module
   public :: recombine_derivative_regression
   public :: compute_2exact_hessian_aho_cls
   public :: apply_discrete_vertex_moment_correction
+  public :: set_wall_mirror_data
+  public :: mirror_wall_vec_start
 
   ! eps_weno floors a WENO indicator ratio against literal division by zero.
   real(kind=DOUBLE), parameter :: eps_weno = tiny(1.0_DOUBLE)
@@ -81,6 +83,30 @@ module arbitrary_high_order_module
   integer(kind=ENTIER), dimension(:), allocatable, save :: gg_flux_elem_cache
   real(kind=DOUBLE), dimension(:), allocatable, save :: gg_oi_hlocal_cache
 
+  ! Wall-tangent fit for boundary-vertex reconstruction (2026-09-20; supersedes an earlier
+  ! mirror-ghost-cell attempt that turned out numerically unstable -- reflecting sub-face geometry
+  ! across the wall could drive the LS/GG fit matrix arbitrarily close to singular, producing huge
+  ! finite gradients that only showed up as NaN several RK stages downstream, well after any
+  ! dt/t-based health check would catch it): the caller (euler_ho_module) computes, once per mesh,
+  ! a per-vertex outward wall normal from the vertex's touching WALL-type boundary faces and
+  ! registers it here via set_wall_mirror_data. mirror_wall_vec_start=0 disables the whole
+  ! mechanism (default); any nonzero value enables it (the specific value is no longer used to pick
+  ! which nc_in components are velocity -- this approach never touches phi's components at all).
+  ! Enabled, a wall vertex's fit is restricted to the plane tangent to its wall normal (1 tangent
+  ! direction for boundary_2d, 2 otherwise) instead of the global x[,y[,z]] directions: a small,
+  ! well-posed problem using only the well-resolved along-wall neighbor spread, leaving the
+  ! (poorly-resolved, one-sided) wall-normal gradient component at exactly 0 rather than
+  ! extrapolating it. See compute_nodal_derivative_at_vertex (LS) and
+  ! ensure_green_gauss_mat_cache/compute_nodal_derivative_at_vertex_green_gauss (GG). Only
+  ! consulted at deriv_order=1 (nc_in=5, primitives) -- compute_next_order_derivative's boundary
+  ! loop keeps the earlier phantom-zero-gradient hack for deriv_order=2/3 (hess/third) and for any
+  ! boundary vertex without a clean single-wall normal (mixed wall+inflow/outflow vertices, or
+  ! wall_mirror_valid=.false.).
+  integer(kind=ENTIER), save :: mirror_wall_vec_start = 0
+  integer(kind=ENTIER), save :: wall_mirror_n_vert = -1
+  real(kind=DOUBLE), dimension(:, :), allocatable, save :: wall_mirror_norm
+  logical, dimension(:), allocatable, save :: wall_mirror_valid
+
   type :: derivative_field_type
     real(kind=DOUBLE), dimension(:, :), allocatable :: val ! (d**order, n_elems)
   end type derivative_field_type
@@ -121,6 +147,40 @@ module arbitrary_high_order_module
   end type timeline_event_type
 
 contains
+
+  ! Registers the per-vertex wall normal used by the mirror-ghost-cell fix (see the cache block's
+  ! header comment above). Call once per mesh, before the first compute_next_order_derivative/
+  ! ensure_green_gauss_mat_cache call that should see it (mesh%n_vert-sized re-registration is
+  ! cheap; the GG cache only rebuilds when mesh%n_vert or boundary_2d changes, so calling this
+  ! AFTER ensure_green_gauss_mat_cache has already run for this mesh size would not retroactively
+  ! rebuild it -- register before the first reconstruction call of a run).
+  subroutine set_wall_mirror_data(mesh, norm_v, valid_v)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(:, :), intent(in) :: norm_v
+    logical, dimension(:), intent(in) :: valid_v
+
+    if (allocated(wall_mirror_norm))  deallocate(wall_mirror_norm)
+    if (allocated(wall_mirror_valid)) deallocate(wall_mirror_valid)
+    allocate(wall_mirror_norm(3, mesh%n_vert))
+    allocate(wall_mirror_valid(mesh%n_vert))
+    wall_mirror_norm  = norm_v
+    wall_mirror_valid = valid_v
+    wall_mirror_n_vert = mesh%n_vert
+  end subroutine set_wall_mirror_data
+
+  ! .true. iff v is a registered wall-mirror vertex (a valid unit normal is available and mirroring is enabled).
+  pure function is_wall_mirror_vertex(v, n_vert_mesh) result(r)
+    implicit none
+
+    integer(kind=ENTIER), intent(in) :: v, n_vert_mesh
+    logical :: r
+
+    r = mirror_wall_vec_start > 0 .and. wall_mirror_n_vert == n_vert_mesh
+    if (r) r = allocated(wall_mirror_valid)
+    if (r) r = wall_mirror_valid(v)
+  end function is_wall_mirror_vertex
 
   pure function n_derivative_components(d, order) result(nc)
     implicit none
@@ -169,8 +229,40 @@ contains
     weno_den = 0.0_DOUBLE
 
     ! A boundary vertex is skipped (one-sided neighbor gather) unless .not. boundary_2d, where skipping it would starve every vertex.
+    ! 2026-09-20: at deriv_order=1 (the primitive gradient), a registered wall-mirror vertex
+    ! (is_wall_mirror_vertex) instead gets a symmetrized fit via a mirrored ghost-neighbor
+    ! contribution (LS: wall_norm passed into compute_nodal_derivative_at_vertex; GG: baked into
+    ! ensure_green_gauss_mat_cache's own per-vertex matrix) -- see the wall-mirror cache block's
+    ! header comment. Every other boundary vertex (deriv_order=2/3's hess/third, or any boundary
+    ! vertex without a clean single-wall normal) keeps the earlier phantom-zero-gradient hack:
+    ! scatter a phantom near-zero gradient (dphi_v~1e-16, oi_v=0) with the standard
+    ! weight=omega_p/(eps+OI^p) formula -- OI=0 makes this phantom sample dominate the blend for
+    ! any touching cell, pulling the reconstructed derivative toward flat/first-order near walls.
     do id_vert = 1, mesh%n_vert
-      if (mesh%vert(id_vert)%is_bound) cycle
+      if (mesh%vert(id_vert)%is_bound) then
+        if (deriv_order_eff == 1 .and. is_wall_mirror_vertex(id_vert, mesh%n_vert)) then
+          if (use_green_gauss) then
+            call accumulate_weno_contribution(mesh, d, nc_in, boundary_2d, id_vert, &
+              phi, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den, &
+              deriv_order=deriv_order_eff)
+          else
+            call accumulate_weno_contribution(mesh, d, nc_in, boundary_2d, id_vert, &
+              phi, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den, &
+              deriv_order=deriv_order_eff, wall_norm=wall_mirror_norm(:, id_vert))
+          end if
+          cycle
+        end if
+        block
+          real(kind=DOUBLE), dimension(nc_out) :: dphi_v_zero
+          dphi_v_zero = 1.0e-16_DOUBLE
+          dphi_v_cache(:, id_vert) = dphi_v_zero
+          valid_cache(id_vert) = .true.
+          oi_cache(id_vert) = 0.0_DOUBLE
+          call scatter_weno_weighted(mesh, id_vert, dphi_v_zero, 0.0_DOUBLE, weno_num, weno_den, &
+            eps_in=1.0e-16_DOUBLE)
+        end block
+        cycle
+      end if
       call accumulate_weno_contribution(mesh, d, nc_in, boundary_2d, id_vert, &
         phi, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den, &
         deriv_order=deriv_order_eff)
@@ -753,7 +845,7 @@ contains
 
   ! Computes+caches (D^k phi)_v at id_vert and scatters it WENO-weighted into every touching cell; skip_cell excludes cells (used by the MPI-overlap two-pass split).
   subroutine accumulate_weno_contribution(mesh, d, nc_in, boundary_2d, id_vert, &
-      phi, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den, skip_cell, deriv_order)
+      phi, dphi_v_cache, valid_cache, oi_cache, weno_num, weno_den, skip_cell, deriv_order, wall_norm)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -767,6 +859,10 @@ contains
     real(kind=DOUBLE), dimension(:), intent(inout) :: weno_den
     logical, dimension(:), intent(in), optional :: skip_cell
     integer(kind=ENTIER), intent(in), optional :: deriv_order
+    ! LS-only wall-mirror normal for this vertex (GG's mirror handling is entirely baked into
+    ! ensure_green_gauss_mat_cache/compute_nodal_derivative_at_vertex_green_gauss, keyed off the
+    ! module-level wall_mirror_norm/valid, so it needs no argument here).
+    real(kind=DOUBLE), dimension(3), intent(in), optional :: wall_norm
 
     real(kind=DOUBLE), dimension(nc_in*d) :: dphi_v
     logical :: valid
@@ -776,6 +872,9 @@ contains
     if (use_green_gauss) then
       call compute_nodal_derivative_at_vertex_green_gauss(mesh, d, nc_in, boundary_2d, &
         id_vert, phi, dphi_v, valid, oi_v)
+    else if (present(wall_norm)) then
+      call compute_nodal_derivative_at_vertex(mesh, d, nc_in, boundary_2d, &
+        id_vert, phi, dphi_v, valid, oi_v, wall_norm)
     else
       call compute_nodal_derivative_at_vertex(mesh, d, nc_in, boundary_2d, &
         id_vert, phi, dphi_v, valid, oi_v)
@@ -864,7 +963,7 @@ contains
 
   ! Weighted-LS gradient of phi at id_vert over elem_neigh (never ring-expanded: a wider ring isn't guaranteed complete at an MPI partition seam), dynamic basis dropping any direction without a resolvable spread; exact for a locally affine phi.
   subroutine compute_nodal_derivative_at_vertex(mesh, d, nc_in, boundary_2d, &
-      id_vert, phi, dphi_v, valid, oi_v)
+      id_vert, phi, dphi_v, valid, oi_v, wall_norm)
     use linear_solver_module, only: lu_factor_lapack, lu_solve_mat_lapack
     implicit none
 
@@ -877,33 +976,81 @@ contains
     logical, intent(out) :: valid
     ! WENO oscillation indicator: fit residual (dimensionless) combined via max with a gradient-norm term that catches an axis-aligned jump the residual is blind to.
     real(kind=DOUBLE), intent(out) :: oi_v
+    ! Wall-tangent fit (2026-09-20, replaces an earlier mirror-ghost-cell attempt that turned out
+    ! numerically unstable): when present (and mirror_wall_vec_start>0), the fit basis is restricted
+    ! to the plane tangent to this unit wall normal (1 tangent direction for boundary_2d, 2
+    ! otherwise) instead of the global x[,y[,z]] directions -- a small, well-posed problem using
+    ! only the well-resolved along-wall neighbor spread. The wall-normal gradient component is never
+    ! solved for and is left at exactly 0 rather than extrapolated from a one-sided stencil.
+    real(kind=DOUBLE), dimension(3), intent(in), optional :: wall_norm
 
     integer(kind=ENTIER), parameter :: max_basis = 4
     real(kind=DOUBLE), parameter :: rel_spread_tol = 1.0e-8_DOUBLE
-    integer(kind=ENTIER) :: n_basis, n_cand, n_active, j, a, b, i1, id_elem, n_neigh
+    integer(kind=ENTIER) :: n_basis, n_cand, n_active, j, a, b, i1, id_elem, n_neigh, bdir, n_tan
     integer(kind=ENTIER), dimension(3) :: active_dim
     integer(kind=ENTIER), dimension(:), allocatable :: neigh
     integer(kind=ENTIER), dimension(max_basis) :: ipiv
-    real(kind=DOUBLE), dimension(3) :: dx, dmin, dmax, spread
-    real(kind=DOUBLE) :: weight, max_spread, weight_sum, phi_scale2
+    real(kind=DOUBLE), dimension(3) :: dx, dmin, dmax, spread, bp, refv
+    real(kind=DOUBLE), dimension(3, 2) :: tvec
+    real(kind=DOUBLE) :: weight, max_spread, weight_sum, phi_scale2, dcoord
     real(kind=DOUBLE), dimension(max_basis) :: basis
     real(kind=DOUBLE), dimension(max_basis, max_basis) :: mat
     real(kind=DOUBLE), dimension(max_basis, nc_in) :: rhs
     real(kind=DOUBLE), dimension(nc_in) :: predicted, resid_sq, phi_sq_sum
+    logical :: is_wall
+
+    is_wall = present(wall_norm) .and. mirror_wall_vec_start > 0
+    bp = 0.0_DOUBLE
+    n_tan = 0
+    if (is_wall) then
+      if (dot_product(wall_norm, wall_norm) < 1.0e-24_DOUBLE) then
+        is_wall = .false.
+      else
+        bp = wall_norm / sqrt(dot_product(wall_norm, wall_norm))
+      end if
+    end if
+
+    if (is_wall) then
+      ! Orthonormal tangent basis {t1[,t2]} spanning the plane perp to bp (Gram-Schmidt off a
+      ! reference axis not near-parallel to bp; boundary_2d keeps t1 in-plane, z=0, since bp itself
+      ! has bp(3)=0 for any side wall of a z-extruded 2D mesh).
+      n_tan = merge(1_ENTIER, 2_ENTIER, boundary_2d)
+      if (abs(bp(1)) < 0.9_DOUBLE) then
+        refv = (/1.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE/)
+      else
+        refv = (/0.0_DOUBLE, 1.0_DOUBLE, 0.0_DOUBLE/)
+      end if
+      tvec(:, 1) = refv - dot_product(refv, bp) * bp
+      tvec(:, 1) = tvec(:, 1) / sqrt(dot_product(tvec(:, 1), tvec(:, 1)))
+      if (n_tan == 2) then
+        tvec(1, 2) = bp(2)*tvec(3,1) - bp(3)*tvec(2,1)
+        tvec(2, 2) = bp(3)*tvec(1,1) - bp(1)*tvec(3,1)
+        tvec(3, 2) = bp(1)*tvec(2,1) - bp(2)*tvec(1,1)
+      end if
+    end if
 
     call ensure_neighbor_cache(mesh)
     n_neigh = neigh_cache_start(id_vert+1) - neigh_cache_start(id_vert)
     allocate(neigh(n_neigh))
     neigh = neigh_cache_list(neigh_cache_start(id_vert):neigh_cache_start(id_vert+1)-1)
 
-    n_cand = merge(2_ENTIER, 3_ENTIER, boundary_2d)
+    if (is_wall) then
+      n_cand = n_tan
+    else
+      n_cand = merge(2_ENTIER, 3_ENTIER, boundary_2d)
+    end if
     dmin(1:n_cand) = huge(1.0_DOUBLE)
     dmax(1:n_cand) = -huge(1.0_DOUBLE)
     do j = 1, n_neigh
       dx = mesh%elem(neigh(j))%coord - mesh%vert(id_vert)%coord
       do a = 1, n_cand
-        dmin(a) = min(dmin(a), dx(a))
-        dmax(a) = max(dmax(a), dx(a))
+        if (is_wall) then
+          dcoord = dot_product(dx, tvec(:, a))
+        else
+          dcoord = dx(a)
+        end if
+        dmin(a) = min(dmin(a), dcoord)
+        dmax(a) = max(dmax(a), dcoord)
       end do
     end do
     spread(1:n_cand) = dmax(1:n_cand) - dmin(1:n_cand)
@@ -932,7 +1079,11 @@ contains
 
       basis(1) = 1.0_DOUBLE
       do a = 1, n_active
-        basis(1+a) = dx(active_dim(a))
+        if (is_wall) then
+          basis(1+a) = dot_product(dx, tvec(:, active_dim(a)))
+        else
+          basis(1+a) = dx(active_dim(a))
+        end if
       end do
 
       do a = 1, n_basis
@@ -959,7 +1110,11 @@ contains
       weight = 1.0_DOUBLE / max(dot_product(dx, dx), 1.0e-24_DOUBLE)
       predicted = rhs(1, :)
       do a = 1, n_active
-        predicted = predicted + rhs(1+a, :) * dx(active_dim(a))
+        if (is_wall) then
+          predicted = predicted + rhs(1+a, :) * dot_product(dx, tvec(:, active_dim(a)))
+        else
+          predicted = predicted + rhs(1+a, :) * dx(active_dim(a))
+        end if
       end do
       resid_sq = resid_sq + weight * (phi(:, id_elem) - predicted)**2
     end do
@@ -969,12 +1124,26 @@ contains
     oi_v = max(oi_v, (max_spread * sum(rhs(2:n_basis, :)**2) / max(phi_scale2, 1.0e-300_DOUBLE)) &
       / grad_norm_derate)
 
-    ! rhs(1+a,i1)=d(phi_i1)/dx_active_dim(a); flattened component-fast/direction-slow, inactive directions left at 0.
-    do a = 1, n_active
-      do i1 = 1, nc_in
-        dphi_v((active_dim(a)-1)*nc_in + i1) = rhs(1+a, i1)
+    ! rhs(1+a,i1)=d(phi_i1)/dx_active_dim(a); flattened component-fast/direction-slow, inactive
+    ! directions left at 0. is_wall: active_dim(a) instead indexes a SURVIVING TANGENT direction
+    ! (tvec(:,active_dim(a))), expanded back into global x[,y[,z]] components -- the wall-normal
+    ! component is never touched and stays 0 (dphi_v was zeroed above).
+    if (is_wall) then
+      do a = 1, n_active
+        do i1 = 1, nc_in
+          do bdir = 1, d
+            dphi_v((bdir-1)*nc_in + i1) = dphi_v((bdir-1)*nc_in + i1) &
+              + rhs(1+a, i1) * tvec(bdir, active_dim(a))
+          end do
+        end do
       end do
-    end do
+    else
+      do a = 1, n_active
+        do i1 = 1, nc_in
+          dphi_v((active_dim(a)-1)*nc_in + i1) = rhs(1+a, i1)
+        end do
+      end do
+    end if
   end subroutine compute_nodal_derivative_at_vertex
 
   ! Builds gg_mat_inv_cache/gg_flux_*_cache/gg_oi_hlocal_cache (pure geometry) once per mesh; uses the LAPACK SVD pseudo-inverse unconditionally since inversion is now a one-time cost.
@@ -987,8 +1156,12 @@ contains
 
     integer(kind=ENTIER) :: v, i, j, a, b, k, n_cand
     integer(kind=ENTIER) :: id_sub_elem, id_elem, id_sub_face, total_pairs
-    real(kind=DOUBLE), dimension(3) :: dx, norm, dminn, dmaxn
+    real(kind=DOUBLE), dimension(3) :: dx, norm, dminn, dmaxn, bp, refv
     real(kind=DOUBLE), dimension(3, 3) :: mat, mat_inv
+    real(kind=DOUBLE), dimension(3, 2) :: tvec, mt
+    real(kind=DOUBLE), dimension(2, 2) :: tam, tam_inv
+    integer(kind=ENTIER) :: n_tan
+    logical :: is_wm
 
     ! NB: .eqv. binds looser than .and. -- must be parenthesized or a differently-sized mesh can false-positive as already cached.
     if (gg_mat_cache_n_vert == mesh%n_vert .and. (gg_mat_cache_boundary_2d .eqv. boundary_2d)) return
@@ -1004,9 +1177,13 @@ contains
     allocate(gg_oi_hlocal_cache(mesh%n_vert))
     allocate(gg_flux_offset_cache(mesh%n_vert + 1))
 
+    ! A registered wall vertex (see the wall-mirror cache block's header comment -- name kept for
+    ! the shared is_wall_mirror_vertex helper, though this GG path no longer mirrors anything) gets
+    ! a valid matrix too, built from real geometry only, same as any interior vertex.
     total_pairs = 0
     do v = 1, mesh%n_vert
-      if (mesh%vert(v)%is_bound) cycle
+      is_wm = is_wall_mirror_vertex(v, mesh%n_vert)
+      if (mesh%vert(v)%is_bound .and. .not. is_wm) cycle
       do i = 1, mesh%vert(v)%n_sub_elems_neigh
         total_pairs = total_pairs + mesh%sub_elem(mesh%vert(v)%sub_elem_neigh(i))%n_sub_faces
       end do
@@ -1018,7 +1195,8 @@ contains
     k = 0
     do v = 1, mesh%n_vert
       gg_flux_offset_cache(v) = k + 1
-      if (mesh%vert(v)%is_bound) then
+      is_wm = is_wall_mirror_vertex(v, mesh%n_vert)
+      if (mesh%vert(v)%is_bound .and. .not. is_wm) then
         gg_mat_valid_cache(v) = .false.
         gg_mat_inv_cache(:, :, v) = 0.0_DOUBLE
         gg_oi_hlocal_cache(v) = 0.0_DOUBLE
@@ -1063,11 +1241,52 @@ contains
       end do
       gg_oi_hlocal_cache(v) = maxval(dmaxn(1:n_cand) - dminn(1:n_cand))
 
-      ! mat's third column is identically zero for boundary_2d (singular by construction); the SVD handles that and any near-degenerate 3D element.
-      mat_inv = mat
-      call pseudo_inverse_inplace_lapack(3_ENTIER, mat_inv)
-      if (boundary_2d) mat_inv(3, :) = 0.0_DOUBLE
-      gg_mat_inv_cache(:, :, v) = mat_inv
+      if (is_wm) then
+        ! Wall-tangent fit (see compute_nodal_derivative_at_vertex's own header comment for the
+        ! LS twin of this same idea): restrict the flux-matching unknown to grad=T@grad_t (T's
+        ! columns an orthonormal tangent basis), solved by least squares --
+        ! grad_t=(T'mat'mat T)^-1 T'mat' grad_raw -- then folded into one effective 3x3 operator
+        ! mat_inv_eff=T@(T'mat'mat T)^-1@T'mat' so compute_nodal_derivative_at_vertex_green_gauss's
+        ! plain grad_true=mat_inv_eff@grad_raw needs no changes. The wall-normal component is never
+        ! solved for, so it comes out exactly 0.
+        bp = wall_mirror_norm(:, v)
+        n_tan = merge(1_ENTIER, 2_ENTIER, boundary_2d)
+        if (abs(bp(1)) < 0.9_DOUBLE) then
+          refv = (/1.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE/)
+        else
+          refv = (/0.0_DOUBLE, 1.0_DOUBLE, 0.0_DOUBLE/)
+        end if
+        tvec(:, 1) = refv - dot_product(refv, bp) * bp
+        tvec(:, 1) = tvec(:, 1) / sqrt(dot_product(tvec(:, 1), tvec(:, 1)))
+        if (n_tan == 2) then
+          tvec(1, 2) = bp(2)*tvec(3,1) - bp(3)*tvec(2,1)
+          tvec(2, 2) = bp(3)*tvec(1,1) - bp(1)*tvec(3,1)
+          tvec(3, 2) = bp(1)*tvec(2,1) - bp(2)*tvec(1,1)
+        end if
+
+        mt(:, 1:n_tan) = matmul(mat, tvec(:, 1:n_tan))
+        tam(1:n_tan, 1:n_tan) = matmul(transpose(mt(:, 1:n_tan)), mt(:, 1:n_tan))
+        ! Tikhonov ridge, relative to mat's own scale: a genuinely near-singular tam (t happens to
+        ! sit close to mat's null space too, seen on a handful of mesh-quality-degenerate wall
+        ! vertices) then damps smoothly toward a near-0 tangential gradient there instead of the
+        ! plain SVD pseudo-inverse's huge-but-finite blowup (1/tiny-sigma) -- confirmed by direct
+        ! measurement to reach ~1e6-1e7 on this mesh's worst vertices, enough to detonate the whole
+        ! solve within ~100 iterations despite looking like a merely "ill-conditioned", not exactly
+        ! singular, 1x1/2x2 system.
+        do a = 1, n_tan
+          tam(a, a) = tam(a, a) + 1.0e-6_DOUBLE * sum(mat**2)
+        end do
+        tam_inv(1:n_tan, 1:n_tan) = tam(1:n_tan, 1:n_tan)
+        call pseudo_inverse_inplace_lapack(n_tan, tam_inv(1:n_tan, 1:n_tan))
+        gg_mat_inv_cache(:, :, v) = matmul(tvec(:, 1:n_tan), &
+          matmul(tam_inv(1:n_tan, 1:n_tan), transpose(mt(:, 1:n_tan))))
+      else
+        ! mat's third column is identically zero for boundary_2d (singular by construction); the SVD handles that and any near-degenerate 3D element.
+        mat_inv = mat
+        call pseudo_inverse_inplace_lapack(3_ENTIER, mat_inv)
+        if (boundary_2d) mat_inv(3, :) = 0.0_DOUBLE
+        gg_mat_inv_cache(:, :, v) = mat_inv
+      end if
     end do
     gg_flux_offset_cache(mesh%n_vert + 1) = total_pairs + 1
 
@@ -1264,7 +1483,9 @@ contains
     valid = gg_mat_valid_cache(id_vert)
     if (.not. valid) return
 
-    ! Geometry is precomputed in ensure_green_gauss_mat_cache; only this phi gather is redone every call.
+    ! Geometry is precomputed in ensure_green_gauss_mat_cache (gg_mat_inv_cache is the plain
+    ! pseudo-inverse for an interior vertex, or the wall-tangent-projected effective operator for a
+    ! wall vertex -- see that cache's own header comment); only this phi gather is redone every call.
     grad_raw = 0.0_DOUBLE
     k0 = gg_flux_offset_cache(id_vert)
     k1 = gg_flux_offset_cache(id_vert + 1) - 1

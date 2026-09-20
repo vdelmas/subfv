@@ -5,6 +5,8 @@ module euler_ho_module
   use quadrature_module
   use arbitrary_high_order_module, only: compute_next_order_derivative, &
     compute_next_order_derivative_cweno, apply_grad_bias_correction, &
+    aho_set_wall_mirror_data => set_wall_mirror_data, &
+    aho_module_mirror_wall_vec_start => mirror_wall_vec_start, &
     aho_module_use_weno_blend => use_weno_blend, &
     aho_module_use_green_gauss => use_green_gauss, &
     aho_module_use_cweno_center => use_cweno_center, &
@@ -55,7 +57,8 @@ module euler_ho_module
   real(kind=DOUBLE), public :: grad_norm_derate_gg = 1.0e4_DOUBLE
   logical, public :: use_alt_gg_weight = .false.
   character(len=32), public :: flux_scheme    = 'three_wave'
-  integer(kind=ENTIER), parameter :: FLUX_RUSANOV = 0, FLUX_TWO_WAVE = 1, FLUX_THREE_WAVE = 2
+  integer(kind=ENTIER), parameter :: FLUX_RUSANOV = 0, FLUX_TWO_WAVE = 1, FLUX_THREE_WAVE = 2, &
+    FLUX_MODIFIED_THREE_WAVE = 3
   integer(kind=ENTIER) :: flux_scheme_id = FLUX_RUSANOV
 
   integer(kind=ENTIER), public :: n_bc = 0
@@ -86,11 +89,72 @@ module euler_ho_module
   public :: test_reconstruction_exactness
   public :: compute_cell_moments
   public :: reconstruct, ls_reconstruction, aho_reconstruction
+  public :: setup_wall_mirror
 
   real(kind=DOUBLE), dimension(:, :, :), allocatable :: cell_moment
   real(kind=DOUBLE), dimension(:, :, :, :), allocatable :: cell_moment3
 
 contains
+
+  ! Registers the aho module's wall-mirror ghost-cell fix (see arbitrary_high_order_module's own
+  ! cache-block header comment): for every boundary vertex whose touching boundary faces are ALL
+  ! wall-type (never mixed with freestream/outflow/etc.), average their face-area-weighted outward
+  ! normal (mesh%face(iface)%norm already points outward from the real cell for a boundary face --
+  ! same convention ghost_prim relies on) into a unit wall normal. Call once per mesh, after
+  ! compute_geometry_mesh and before the first aho_reconstruction call.
+  subroutine setup_wall_mirror(mesh)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+
+    integer(kind=ENTIER) :: iface, ir, id_bc, iv, v
+    real(kind=DOUBLE), dimension(:, :), allocatable :: norm_acc
+    real(kind=DOUBLE), dimension(:, :), allocatable :: wall_norm_v
+    logical, dimension(:), allocatable :: touches_wall, touches_nonwall, wall_valid_v
+    real(kind=DOUBLE), dimension(3) :: n
+
+    allocate(norm_acc(3, mesh%n_vert))
+    allocate(touches_wall(mesh%n_vert), touches_nonwall(mesh%n_vert))
+    norm_acc = 0.0_DOUBLE
+    touches_wall = .false.
+    touches_nonwall = .false.
+
+    do iface = 1, mesh%n_faces
+      ir = mesh%face(iface)%right_neigh
+      if (ir >= 0) cycle
+      id_bc = -ir
+      if (id_bc < 1 .or. id_bc > n_bc) cycle
+      if (.not. allocated(mesh%face(iface)%vert)) cycle
+      ! z-faces on a boundary_2d extrusion carry no physics (same guard as face_flux_loop's is_zface).
+      if (boundary_2d .and. abs(abs(mesh%face(iface)%norm(3)) - 1.0_DOUBLE) < 1.0e-6_DOUBLE) cycle
+      do iv = 1, mesh%face(iface)%n_vert
+        v = mesh%face(iface)%vert(iv)
+        if (bc_type_id(id_bc) == BC_WALL) then
+          norm_acc(:, v) = norm_acc(:, v) + mesh%face(iface)%area * mesh%face(iface)%norm
+          touches_wall(v) = .true.
+        else
+          touches_nonwall(v) = .true.
+        end if
+      end do
+    end do
+
+    allocate(wall_norm_v(3, mesh%n_vert), wall_valid_v(mesh%n_vert))
+    wall_norm_v = 0.0_DOUBLE
+    wall_valid_v = .false.
+    do v = 1, mesh%n_vert
+      if (.not. mesh%vert(v)%is_bound) cycle
+      if (.not. touches_wall(v) .or. touches_nonwall(v)) cycle
+      n = norm_acc(:, v)
+      if (dot_product(n, n) < 1.0e-24_DOUBLE) cycle
+      wall_norm_v(:, v) = n / sqrt(dot_product(n, n))
+      wall_valid_v(v) = .true.
+    end do
+
+    aho_module_mirror_wall_vec_start = 2_ENTIER
+    call aho_set_wall_mirror_data(mesh, wall_norm_v, wall_valid_v)
+
+    deallocate(norm_acc, touches_wall, touches_nonwall, wall_norm_v, wall_valid_v)
+  end subroutine setup_wall_mirror
 
   subroutine read_params(filename)
     implicit none
@@ -118,6 +182,8 @@ contains
     select case (trim(adjustl(flux_scheme)))
     case ('three_wave')
       flux_scheme_id = FLUX_THREE_WAVE
+    case ('modified_three_wave')
+      flux_scheme_id = FLUX_MODIFIED_THREE_WAVE
     case ('two_wave')
       flux_scheme_id = FLUX_TWO_WAVE
     case default
@@ -1070,6 +1136,8 @@ contains
         select case (flux_scheme_id)
         case (FLUX_THREE_WAVE)
           flux = three_wave_flux(wL, wR, norm, gL, gR) * qwt
+        case (FLUX_MODIFIED_THREE_WAVE)
+          flux = modified_three_wave_flux(wL, wR, norm, gL, gR) * qwt
         case (FLUX_TWO_WAVE)
           flux = two_wave_flux(wL, wR, norm, gL, gR) * qwt
         case default
@@ -1445,6 +1513,72 @@ contains
       abs(v_star)*(uR_star - uL_star) + &
       abs(sR_wave)*(uR - uR_star))
   end function three_wave_flux
+
+  ! Modified 3-wave solver (Toro-family HLLC variant): blends a SINGLE shared tangential
+  ! velocity between both star states, instead of three_wave_flux's plain carry-through of
+  ! each side's own unchanged tangential velocity, with a matching tang_energy correction so
+  ! the energy equation stays consistent -- own local copy of ns_euler_rs_module's
+  ! modified_three_wave, gamma_arr multi-material aware like this module's own three_wave_flux.
+  pure function modified_three_wave_flux(wL, wR, n, gL, gR) result(F)
+    implicit none
+
+    real(kind=DOUBLE), dimension(5), intent(in) :: wL, wR
+    real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), intent(in) :: gL, gR
+    real(kind=DOUBLE), dimension(5) :: F
+
+    real(kind=DOUBLE), dimension(5) :: uL, uR, fL, fR, uL_star, uR_star
+    real(kind=DOUBLE) :: rhoL, rhoR, vnL, vnR, pL, pR, eL, eR, aL, aR
+    real(kind=DOUBLE) :: lambdaL, lambdaR, v_star, tang_coeff, tang_energy
+    real(kind=DOUBLE) :: rhoL_star, rhoR_star, pL_star, pR_star, sL_wave, sR_wave
+    real(kind=DOUBLE), dimension(3) :: vtL, vtR, vt_star, dvt
+
+    rhoL = wL(1); vnL = dot_product(wL(2:4), n); pL = wL(5)
+    uL = primit_to_conserv(wL, gL); eL = uL(5)/rhoL; aL = cs(wL, gL)
+
+    rhoR = wR(1); vnR = dot_product(wR(2:4), n); pR = wR(5)
+    uR = primit_to_conserv(wR, gR); eR = uR(5)/rhoR; aR = cs(wR, gR)
+
+    fL(1)   = vnL*uL(1)
+    fL(2:4) = vnL*uL(2:4) + pL*n
+    fL(5)   = (uL(5) + pL)*vnL
+
+    fR(1)   = vnR*uR(1)
+    fR(2:4) = vnR*uR(2:4) + pR*n
+    fR(5)   = (uR(5) + pR)*vnR
+
+    lambdaL = max(aL*rhoL, sqrt(rhoL*max(0.0_DOUBLE, pR - pL)), -rhoL*(vnR - vnL))
+    lambdaR = max(aR*rhoR, sqrt(rhoR*max(0.0_DOUBLE, pL - pR)), -rhoR*(vnR - vnL))
+    v_star  = (lambdaL*vnL + lambdaR*vnR - (pR - pL)) / (lambdaR + lambdaL)
+
+    vtL = wL(2:4) - vnL*n
+    vtR = wR(2:4) - vnR*n
+    vt_star = (lambdaL*vtL + lambdaR*vtR) / (lambdaL + lambdaR)
+    dvt = vtR - vtL
+
+    tang_coeff  = -lambdaL*lambdaR / (lambdaL + lambdaR)
+    tang_energy = tang_coeff * dot_product(dvt, vt_star)
+
+    rhoL_star = 1.0_DOUBLE / (1.0_DOUBLE/rhoL + (v_star - vnL)/lambdaL)
+    pL_star   = pL - lambdaL*(v_star - vnL)
+    uL_star(1)   = rhoL_star
+    uL_star(2:4) = rhoL_star*(v_star*n + vt_star)
+    uL_star(5)   = rhoL_star*(eL + (pL*vnL - pL_star*v_star - tang_energy)/lambdaL)
+
+    rhoR_star = 1.0_DOUBLE / (1.0_DOUBLE/rhoR + (vnR - v_star)/lambdaR)
+    pR_star   = pR + lambdaR*(v_star - vnR)
+    uR_star(1)   = rhoR_star
+    uR_star(2:4) = rhoR_star*(v_star*n + vt_star)
+    uR_star(5)   = rhoR_star*(eR + (pR_star*v_star - pR*vnR + tang_energy)/lambdaR)
+
+    sL_wave = vnL - lambdaL/rhoL
+    sR_wave = vnR + lambdaR/rhoR
+
+    F = 0.5_DOUBLE*(fL + fR) - 0.5_DOUBLE * ( &
+      abs(sL_wave)*(uL_star - uL) + &
+      abs(v_star)*(uR_star - uL_star) + &
+      abs(sR_wave)*(uR - uR_star))
+  end function modified_three_wave_flux
 
   ! HLL-family 2-wave approximate Riemann solver: single star state, no contact wave.
   pure function two_wave_flux(wL, wR, n, gL, gR) result(F)
