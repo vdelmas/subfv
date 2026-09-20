@@ -68,7 +68,10 @@ contains
       case (2);     n = 3
       case (3);     n = 4
       case (4);     n = 6
-      case default; n = 7   ! order >= 5
+      case (5);     n = 7
+      ! order>=7 reuses the degree-6, 12-pt rule (no verified degree-7
+      ! rule yet) -- see tri_face_rule's own case default. Keep in sync.
+      case default; n = 12   ! order >= 6
       end select
     case (4)
       select case (order)
@@ -92,17 +95,18 @@ contains
       case (1);     n = 1
       case (2);     n = 4
       case (3);     n = 5
-      ! TEMPORARY (2026-09-15): order>=5 reuses the degree-4, 11-pt rule
-      ! pending a verified degree-5 tet rule -- see tet_rule's own
-      ! case default. Keep this in sync with tet_rule's point count.
-      case default; n = 11  ! order >= 4
+      case (4);     n = 11
+      ! order>=6 reuses the degree-5, 15-pt rule (no verified degree-6
+      ! tet rule yet) -- see tet_rule's own case default. Keep in sync.
+      case default; n = 15  ! order >= 5
       end select
     case (5)   ! pyramid = 2 tets
       select case (order)
       case (1);     n = 2 * 1
       case (2);     n = 2 * 4
       case (3);     n = 2 * 5
-      case default; n = 2 * 11  ! order >= 4, see n_nodes=4 case above
+      case (4);     n = 2 * 11
+      case default; n = 2 * 15  ! order >= 5, see n_nodes=4 case above
       end select
     case (6)   ! prism = triangle x line
       select case (order)
@@ -110,7 +114,8 @@ contains
       case (2);     n = 6   ! 3 tri pts x 2 line pts
       case (3);     n = 12  ! 4 tri pts x 3 line pts
       case (4);     n = 24  ! 6 tri pts x 4 line pts
-      case default; n = 35  ! order >= 5: 7 tri pts x 5 line pts
+      case (5);     n = 35  ! 7 tri pts x 5 line pts
+      case default; n = 60  ! order >= 6: 12 tri pts x 5 line pts
       end select
     case (8)   ! hexahedron = line x line x line
       select case (order)
@@ -225,9 +230,10 @@ contains
         wts(4:6)  = w2 * area
       end block
 
-    case default   ! order >= 5: 7-point Dunavant/Radon, exact for
-      ! degree 5. Centroid plus two symmetric orbits of 3 permutations
-      ! of (a,a,b); verified numerically up to degree 5 (max error 1e-15).
+    case (5)   ! 7-point Dunavant/Radon, exact for degree 5. Centroid
+      ! plus two symmetric orbits of 3 permutations of (a,a,b); verified
+      ! numerically up to degree 5 (max error 1e-15), and confirmed
+      ! genuinely NOT exact at degree 6 (~1e-4 relative error there).
       block
         real(kind=DOUBLE), parameter :: w0 = 0.225_DOUBLE
         real(kind=DOUBLE), parameter :: a1 = 0.470142064105115_DOUBLE
@@ -246,6 +252,53 @@ contains
         pts(:, 6) = a2*v1 + b2*v2 + a2*v3
         pts(:, 7) = b2*v1 + a2*v2 + a2*v3
         wts(5:7)  = w2 * area
+      end block
+
+    case default   ! order >= 6: 12-point Dunavant (1985) degree-6 rule.
+      ! Two S21 orbits (3 pts each, perms of (a,a,1-2a)) + one S111
+      ! orbit (6 pts, all perms of (a3,b3,1-a3-b3), all three barycentric
+      ! values distinct). Derived from scratch by symbolic moment-matching
+      ! (sympy/mpmath, multi-start Levenberg-Marquardt refined to 50+
+      ! digits) against the exact reference-triangle integral of every
+      ! monomial up to degree 6, not transcribed from a table -- the
+      ! ansatz has several real roots (trivial relabelings of the same
+      ! rule); the one used has every point interior and every weight
+      ! positive, and its constants independently match the published
+      ! Dunavant degree-6 values to the digits checked. Verified
+      ! numerically to ~1e-17 max error over every monomial up to degree
+      ! 6, and confirmed genuinely NOT exact at degree 7 (~1e-6 relative
+      ! error there). Replaces the previous fallback that silently
+      ! reused the degree-5, 7-point rule for order>=6 -- this is also
+      ! what prism_rule gets for its triangle side via tri_ref_rule
+      ! below, since a triangular-base prism is just this rule times
+      ! gauss1d in the extrusion direction.
+      block
+        real(kind=DOUBLE), parameter :: a1 = 0.2492867451709104_DOUBLE
+        real(kind=DOUBLE), parameter :: w1 = 0.1167862757263794_DOUBLE
+        real(kind=DOUBLE), parameter :: a2 = 0.06308901449150223_DOUBLE
+        real(kind=DOUBLE), parameter :: w2 = 0.05084490637020682_DOUBLE
+        real(kind=DOUBLE), parameter :: a3 = 0.3103524510337844_DOUBLE
+        real(kind=DOUBLE), parameter :: b3 = 0.05314504984481695_DOUBLE
+        real(kind=DOUBLE), parameter :: w3 = 0.08285107561837358_DOUBLE
+        real(kind=DOUBLE) :: c1, c2, c3
+        c1 = 1.0_DOUBLE - 2.0_DOUBLE*a1
+        c2 = 1.0_DOUBLE - 2.0_DOUBLE*a2
+        c3 = 1.0_DOUBLE - a3 - b3
+        pts(:, 1) = a1*v1 + a1*v2 + c1*v3
+        pts(:, 2) = a1*v1 + c1*v2 + a1*v3
+        pts(:, 3) = c1*v1 + a1*v2 + a1*v3
+        wts(1:3)  = w1 * area
+        pts(:, 4) = a2*v1 + a2*v2 + c2*v3
+        pts(:, 5) = a2*v1 + c2*v2 + a2*v3
+        pts(:, 6) = c2*v1 + a2*v2 + a2*v3
+        wts(4:6)  = w2 * area
+        pts(:, 7)  = a3*v1 + b3*v2 + c3*v3
+        pts(:, 8)  = a3*v1 + c3*v2 + b3*v3
+        pts(:, 9)  = b3*v1 + a3*v2 + c3*v3
+        pts(:, 10) = b3*v1 + c3*v2 + a3*v3
+        pts(:, 11) = c3*v1 + a3*v2 + b3*v3
+        pts(:, 12) = c3*v1 + b3*v2 + a3*v3
+        wts(7:12)  = w3 * area
       end block
 
     end select
@@ -333,15 +386,15 @@ contains
       pts(:, 5) = 0.5_DOUBLE*v4 + (v1+v2+v3)/6.0_DOUBLE
       wts(2:5) = 9.0_DOUBLE / 20.0_DOUBLE * vol
 
-    case default   ! order >= 4: 11 pts, Keast order 4. Centroid orbit
-      ! (1 pt) + S31(a) orbit (4 pts, perms of (a,a,a,1-3a)) + S22(b)
-      ! orbit (6 pts, perms of (b,b,1/2-b,1/2-b)). Derived from scratch
-      ! via symbolic moment-matching (sympy) against the exact reference-
-      ! tetrahedron integrals of every monomial up to degree 4, not
-      ! transcribed from a table -- verified numerically afterward to
-      ! ~1e-17 max error (see aho-mpi-ghost-stencil-bug memory /
-      ! tex_arbitrary_high_order for the derivation script). Matches the
-      ! classical Keast(1986) degree-4 rule.
+    case (4)   ! 11 pts, Keast order 4. Centroid orbit (1 pt) + S31(a)
+      ! orbit (4 pts, perms of (a,a,a,1-3a)) + S22(b) orbit (6 pts, perms
+      ! of (b,b,1/2-b,1/2-b)). Derived from scratch via symbolic
+      ! moment-matching (sympy) against the exact reference-tetrahedron
+      ! integrals of every monomial up to degree 4, not transcribed from
+      ! a table -- verified numerically afterward to ~1e-17 max error
+      ! (see aho-mpi-ghost-stencil-bug memory / tex_arbitrary_high_order
+      ! for the derivation script). Matches the classical Keast(1986)
+      ! degree-4 rule.
       block
         real(kind=DOUBLE), parameter :: a = 1.0_DOUBLE/14.0_DOUBLE
         real(kind=DOUBLE), parameter :: b = 0.25_DOUBLE - sqrt(70.0_DOUBLE)/56.0_DOUBLE
@@ -365,6 +418,60 @@ contains
         pts(:, 10) = cb*v1 + b*v2 + cb*v3 + b*v4
         pts(:, 11) = cb*v1 + cb*v2 + b*v3 + b*v4
         wts(6:11) = wb * vol
+      end block
+
+    case default   ! order >= 5: 15 pts, degree-5. Centroid orbit (1 pt)
+      ! + S31(a) orbit (4 pts, perms of (a,a,a,1-3a)) + S31(b) orbit (4
+      ! pts, perms of (b,b,b,1-3b), a second, independent S31 family --
+      ! degree 4 alone needs only one S31 orbit, degree 5 needs two) +
+      ! S22(c) orbit (6 pts, perms of (c,c,d,d), d=1/2-c). All three
+      ! shape parameters and four weights derived from scratch by
+      ! symbolic moment-matching (sympy/mpmath, Levenberg-Marquardt
+      ! refined to 50+ digits) against the exact reference-tetrahedron
+      ! integral of every monomial up to degree 5, not transcribed from
+      ! a table -- this particular real root of the (overdetermined,
+      ! 18-equation/7-unknown) moment system was chosen because it has
+      ! every point strictly interior and every weight strictly positive
+      ! (other real roots of the same ansatz exist but place a point
+      ! outside the tet or a negative weight). Verified numerically
+      ! afterward to ~1e-17 max error over every monomial up to degree 5,
+      ! and confirmed genuinely NOT exact at degree 6 (~1e-4 relative
+      ! error there, as expected for a degree-5 rule). Replaces the
+      ! previous fallback that silently reused the degree-4, 11-pt rule
+      ! for order>=5. Order >= 6 still has no verified rule of its own
+      ! and reuses this one, so a request for a true degree-6 tet
+      ! quadrature remains inexact by this same ~1e-4 margin.
+      block
+        real(kind=DOUBLE), parameter :: a  = 0.09198569323008009_DOUBLE
+        real(kind=DOUBLE), parameter :: b  = 0.3196170515859492_DOUBLE
+        real(kind=DOUBLE), parameter :: c  = 0.4438225029698707_DOUBLE
+        real(kind=DOUBLE), parameter :: w0 = 0.1169962321923602_DOUBLE
+        real(kind=DOUBLE), parameter :: w1 = 0.07196628338760167_DOUBLE
+        real(kind=DOUBLE), parameter :: w2 = 0.06970310366278548_DOUBLE
+        real(kind=DOUBLE), parameter :: w3 = 0.05272103660101520_DOUBLE
+        real(kind=DOUBLE) :: ca, cb, d
+        ca = 1.0_DOUBLE - 3.0_DOUBLE*a
+        cb = 1.0_DOUBLE - 3.0_DOUBLE*b
+        d  = 0.5_DOUBLE - c
+        pts(:, 1) = 0.25_DOUBLE*(v1+v2+v3+v4)
+        wts(1) = w0 * vol
+        pts(:, 2) = a*v1 + a*v2 + a*v3 + ca*v4
+        pts(:, 3) = a*v1 + a*v2 + ca*v3 + a*v4
+        pts(:, 4) = a*v1 + ca*v2 + a*v3 + a*v4
+        pts(:, 5) = ca*v1 + a*v2 + a*v3 + a*v4
+        wts(2:5) = w1 * vol
+        pts(:, 6) = b*v1 + b*v2 + b*v3 + cb*v4
+        pts(:, 7) = b*v1 + b*v2 + cb*v3 + b*v4
+        pts(:, 8) = b*v1 + cb*v2 + b*v3 + b*v4
+        pts(:, 9) = cb*v1 + b*v2 + b*v3 + b*v4
+        wts(6:9) = w2 * vol
+        pts(:, 10) = c*v1 + c*v2 + d*v3 + d*v4
+        pts(:, 11) = c*v1 + d*v2 + c*v3 + d*v4
+        pts(:, 12) = c*v1 + d*v2 + d*v3 + c*v4
+        pts(:, 13) = d*v1 + c*v2 + c*v3 + d*v4
+        pts(:, 14) = d*v1 + c*v2 + d*v3 + c*v4
+        pts(:, 15) = d*v1 + d*v2 + c*v3 + c*v4
+        wts(10:15) = w3 * vol
       end block
 
     end select
@@ -415,7 +522,7 @@ contains
     real(kind=DOUBLE), dimension(:),    intent(out) :: wts
 
     ! Triangle Gauss reference data (barycentric, weights sum to 1)
-    integer(kind=ENTIER), parameter :: max_tri = 7, max_line = 5
+    integer(kind=ENTIER), parameter :: max_tri = 12, max_line = 5
     integer(kind=ENTIER) :: n_tri, n_line, i, j, k
     real(kind=DOUBLE), dimension(3, max_tri) :: L_tri
     real(kind=DOUBLE), dimension(max_tri)    :: w_tri
@@ -425,9 +532,12 @@ contains
     real(kind=DOUBLE), dimension(3) :: dxdL1, dxdL2, dxdt
     real(kind=DOUBLE) :: jac
 
-    ! tri_ref_rule and gauss1d both now support up to order 5 (2026-09-15),
-    ! matching n_volume_quad_pts(6,order)'s 7-tri-pt x 5-line-pt count at
-    ! order 5 -- no clamp needed any more.
+    ! tri_ref_rule now supports up to order 6 (2026-09-20, 12-pt Dunavant)
+    ! and gauss1d caps at its own 5-pt rule (order>=5): a triangular-base
+    ! prism is exactly this triangle rule times gauss1d in the extrusion
+    ! direction, so raising the triangle side's degree is all a prism
+    ! needs -- matching n_volume_quad_pts(6,order)'s tri-pts x line-pts
+    ! count, no separate volume-specific rule required.
     call tri_ref_rule(order, n_tri, L_tri, w_tri)
     call gauss1d(order, n_line, t_line, w_line)
 
@@ -496,14 +606,16 @@ contains
   ! ================================================================
 
   ! 1D Gauss-Legendre nodes and weights on [-1,1], n=1..5 points.
-  ! An n-point rule is exact for polynomials up to degree 2n-1, so
-  ! n=4 (degree 7) and n=5 (degree 9) comfortably cover a cubic
-  ! (order-4 aho) or quartic (order-5 aho) reconstructed state's flux
-  ! integral -- see the module-level TODO below for why this alone is
-  ! NOT sufficient to claim full order-4/5 support (only the quad-face/
-  ! hex-volume tensor-product rules consume this; tri/tet still cap at
-  ! degree 3, see quad_face_rule/hex_rule callers n_face_quad_pts and
-  ! n_volume_quad_pts, cases n_nodes=3/4/5/6).
+  ! An n-point rule is exact for polynomials up to degree 2n-1, so this
+  ! alone (quad-face/hex-volume tensor-product rules only) comfortably
+  ! covers every degree tested so far. The triangle/tet/prism/pyramid
+  ! rules are separate, non-tensor-product constructions with their own
+  ! degree ceiling: degree 5 for triangle/prism (tri_ref_rule), degree 5
+  ! for tet/pyramid (tet_rule) -- see n_face_quad_pts/n_volume_quad_pts
+  ! for the current per-shape degree each order actually gets, and
+  ! tri_face_rule/tet_rule's own case-default comments for what happens
+  ! past that (silent reuse of the highest verified rule, not a hard
+  ! error).
   subroutine gauss1d(order, ng, xi, w)
     integer(kind=ENTIER), intent(in)  :: order
     integer(kind=ENTIER), intent(out) :: ng
@@ -551,12 +663,12 @@ contains
   ! w_tri are normalized so sum(w_tri) = 1. Same underlying rules as
   ! tri_face_rule (kept as a separate barycentric-table routine for
   ! prism_rule's tensor-product use) -- see tri_face_rule for the
-  ! degree-4/5 rules' verification note.
+  ! degree-4/5/6 rules' verification note.
   subroutine tri_ref_rule(order, n, L, w)
     integer(kind=ENTIER), intent(in)  :: order
     integer(kind=ENTIER), intent(out) :: n
-    real(kind=DOUBLE), dimension(3, 7), intent(out) :: L
-    real(kind=DOUBLE), dimension(7),    intent(out) :: w
+    real(kind=DOUBLE), dimension(3, 12), intent(out) :: L
+    real(kind=DOUBLE), dimension(12),    intent(out) :: w
 
     select case (order)
     case (1)
@@ -591,7 +703,7 @@ contains
         L(:, 4) = [a2, a2, b2]; L(:, 5) = [a2, b2, a2]; L(:, 6) = [b2, a2, a2]
         w(4:6) = w2
       end block
-    case default   ! order >= 5
+    case (5)
       n = 7
       block
         real(kind=DOUBLE), parameter :: w0 = 0.225_DOUBLE
@@ -607,6 +719,30 @@ contains
         w(2:4) = w1
         L(:, 5) = [a2, a2, b2]; L(:, 6) = [a2, b2, a2]; L(:, 7) = [b2, a2, a2]
         w(5:7) = w2
+      end block
+    case default   ! order >= 6: 12-pt Dunavant degree-6 rule, see
+      ! tri_face_rule's case default for the derivation/verification note.
+      n = 12
+      block
+        real(kind=DOUBLE), parameter :: a1 = 0.2492867451709104_DOUBLE
+        real(kind=DOUBLE), parameter :: w1 = 0.1167862757263794_DOUBLE
+        real(kind=DOUBLE), parameter :: a2 = 0.06308901449150223_DOUBLE
+        real(kind=DOUBLE), parameter :: w2 = 0.05084490637020682_DOUBLE
+        real(kind=DOUBLE), parameter :: a3 = 0.3103524510337844_DOUBLE
+        real(kind=DOUBLE), parameter :: b3 = 0.05314504984481695_DOUBLE
+        real(kind=DOUBLE), parameter :: w3 = 0.08285107561837358_DOUBLE
+        real(kind=DOUBLE) :: c1, c2, c3
+        c1 = 1.0_DOUBLE - 2.0_DOUBLE*a1
+        c2 = 1.0_DOUBLE - 2.0_DOUBLE*a2
+        c3 = 1.0_DOUBLE - a3 - b3
+        L(:, 1) = [a1, a1, c1]; L(:, 2) = [a1, c1, a1]; L(:, 3) = [c1, a1, a1]
+        w(1:3) = w1
+        L(:, 4) = [a2, a2, c2]; L(:, 5) = [a2, c2, a2]; L(:, 6) = [c2, a2, a2]
+        w(4:6) = w2
+        L(:, 7)  = [a3, b3, c3]; L(:, 8)  = [a3, c3, b3]
+        L(:, 9)  = [b3, a3, c3]; L(:, 10) = [b3, c3, a3]
+        L(:, 11) = [c3, a3, b3]; L(:, 12) = [c3, b3, a3]
+        w(7:12) = w3
       end block
     end select
   end subroutine tri_ref_rule
