@@ -18,8 +18,22 @@ module arbitrary_high_order_module
   public :: compute_derivative_hierarchy_timed
   public :: compute_derivative_hierarchy_overlap_timed
   public :: apply_grad_bias_correction
+  public :: apply_local_taylor_correction
+  public :: apply_gradient_node_correction
+  public :: compute_gradient_node_bias
+  public :: compute_node_derivative_bias
+  public :: recombine_derivative_regression
+  public :: compute_2exact_hessian_aho_cls
+  public :: apply_discrete_vertex_moment_correction
   public :: test_green_gauss_nodal
   public :: test_green_gauss_vortex
+  public :: compute_next_order_polynomial_fv
+  public :: compute_derivative_hierarchy_fv
+  public :: compute_nodal_polynomial_fv
+  public :: ensure_aho_fv_moment_cache
+  public :: shift_polynomial
+  public :: shifted_moments
+  public :: aho_fv_max_degree
 
   ! eps_weno floors a WENO indicator ratio against literal division by zero.
   real(kind=DOUBLE), parameter :: eps_weno = tiny(1.0_DOUBLE)
@@ -49,6 +63,16 @@ module arbitrary_high_order_module
   integer(kind=ENTIER), dimension(:), allocatable, save :: neigh_cache_start
   integer(kind=ENTIER), dimension(:), allocatable, save :: neigh_cache_list
 
+  ! Vertex-to-vertex adjacency (CSR), built once per mesh: v' is a neighbor of v if they share at
+  ! least one cell. Pure topology (no such array exists on vert_type/mesh_type itself -- every
+  ! _neigh field there points to elements/faces, never other vertices). Needed for aho_cls
+  ! (Haider, Croisille & Courbet 2011): raising a vertex's k-exact k-th derivative to (k+1)-exact
+  ! uses differences against NEIGHBORING VERTICES' own k-exact derivative, staying at the vertex
+  ! level between orders instead of compute_next_order_derivative's node->cell->node chain.
+  integer(kind=ENTIER), save :: vv_neigh_cache_n_vert = -1
+  integer(kind=ENTIER), dimension(:), allocatable, save :: vv_neigh_cache_start
+  integer(kind=ENTIER), dimension(:), allocatable, save :: vv_neigh_cache_list
+
   ! Per-cell second geometric moment, used by apply_grad_bias_correction: pure mesh geometry, cached once.
   integer(kind=ENTIER), save :: m2_cache_n_elems = -1
   real(kind=DOUBLE), dimension(:), allocatable, save :: m2_cache_xx, m2_cache_yy, m2_cache_zz
@@ -66,9 +90,59 @@ module arbitrary_high_order_module
   integer(kind=ENTIER), dimension(:), allocatable, save :: gg_flux_elem_cache
   real(kind=DOUBLE), dimension(:), allocatable, save :: gg_oi_hlocal_cache
 
+  ! aho_fv: per-cell geometric moments about the cell's own centroid,
+  ! mu_{abc}(c) = int_c (x-x_c)^a (y-y_c)^b (z-z_c)^c dV, for 0<=a+b+c<=aho_fv_max_degree.
+  ! Pure mesh geometry, cached once per mesh. A neighbor cell's moments about a DIFFERENT
+  ! point (a node p) are obtained cheaply from these via the binomial (Taylor-shift) formula,
+  ! so no per-(cell,node) storage is needed. mu_{000}=volume, mu_{100}=mu_{010}=mu_{001}=0
+  ! identically (elem%coord is the exact quadrature centroid, see compute_elem_centroid).
+  integer(kind=ENTIER), parameter :: aho_fv_max_degree = 3
+  integer(kind=ENTIER), save :: aho_fv_mom_cache_n_elems = -1
+  real(kind=DOUBLE), dimension(:, :, :, :), allocatable, save :: aho_fv_mom_cache
+
   type :: derivative_field_type
     real(kind=DOUBLE), dimension(:, :), allocatable :: val ! (d**order, n_elems)
   end type derivative_field_type
+
+  ! Per-cell geometric moments about the cell's OWN centroid, M_c^{(m)} = (1/V_c) int_c (x-x_c)^{tensor
+  ! m} dV, stored as a full (row-major, redundant) flat tensor of size 3**m -- same layout convention
+  ! as hess_flat/third_flat (size 9, 27). Pure geometry, cached once per mesh, for m=2..max_order.
+  ! M_c^{(1)}=0 identically (x_c is the exact quadrature centroid, see compute_elem_centroid); used by
+  ! apply_local_taylor_correction to correct lower-order cell derivatives from higher ones purely
+  ! locally to the cell -- no node/neighbor geometry involved.
+  type :: cell_moment_ptr_type
+    real(kind=DOUBLE), dimension(:, :), allocatable :: m ! (3**order, n_elems)
+  end type cell_moment_ptr_type
+
+  integer(kind=ENTIER), save :: cell_moment_cache_n_elems = -1
+  integer(kind=ENTIER), save :: cell_moment_cache_max_order = 0
+  type(cell_moment_ptr_type), dimension(:), allocatable, save :: cell_moment_cache ! indexed 2:max_order
+
+  ! Per-cell DISCRETE moment of its own touching vertices, mu_m^discrete(c) = average over the
+  ! cell's own corner vertices v of (x_v-x_c)^{tensor m} -- the discrete analogue of
+  ! cell_moment_cache's continuous volume-integral moment, needed when averaging a per-vertex
+  ! SAMPLE (not a continuous field) over a cell's corners: see recombine_derivative_regression's
+  ! own header and apply_discrete_vertex_moment_correction. Full flat tensor, same convention as
+  ! cell_moment_cache; m=2..max_order (mu^discrete_1=0 only for a maximally symmetric cell, unlike
+  ! the continuous case -- kept anyway for m>=2, which is all this correction currently uses).
+  integer(kind=ENTIER), save :: discrete_vmom_cache_n_elems = -1
+  integer(kind=ENTIER), save :: discrete_vmom_cache_max_order = 0
+  type(cell_moment_ptr_type), dimension(:), allocatable, save :: discrete_vmom_cache ! indexed 2:max_order
+
+  ! Per-vertex 1-exact-gradient of the geometric field (x_elem-x_vert)^{tensor m}, Pont et al.
+  ! (2017, JCP 350) eq. 56-61 generalized to arbitrary m: H_m^(1)(v) = same GG flux-sum +
+  ! gg_mat_inv_cache machinery used for phi, fed the geometric field instead. Stored as a full
+  ! flat tensor of shape (3*3**m, n_vert) -- component index t*3+i, t=0..3**m-1 the geometric
+  ! multi-index (row-major, same convention as cell_moment_cache/hess_flat/third_flat), i=1..3
+  ! the gradient output direction. Pure geometry (1-ring of the vertex only), cached once per
+  ! mesh; corrects the gradient from any higher true derivative m=2..max_order
+  ! (apply_gradient_node_correction). Genuinely needs the node's own neighbor geometry -- unlike
+  ! cell_moment_cache this is NOT local to a single cell -- but nothing beyond the existing
+  ! gg_mat_inv_cache/gg_flux_*_cache stencil (no deeper ring, no new MPI exchange).
+  integer(kind=ENTIER), save :: gg_grad_h1_cache_n_vert = -1
+  integer(kind=ENTIER), save :: gg_grad_h1_cache_max_order = 0
+  logical, save :: gg_grad_h1_cache_boundary_2d = .false.
+  type(cell_moment_ptr_type), dimension(:), allocatable, save :: gg_grad_h1_cache ! indexed 2:max_order
 
   ! One timestamped phase of one order's work, for the blocking-vs-overlap timeline figure.
   type :: timeline_event_type
@@ -1032,6 +1106,180 @@ contains
     gg_mat_cache_boundary_2d = boundary_2d
   end subroutine ensure_green_gauss_mat_cache
 
+  ! Builds cell_moment_cache(m), m=2..max_order: each cell's own geometric moment tensor
+  ! M_c^{(m)} = (1/V_c) int_c (x-x_c)^{tensor m} dV, stored as a full flat tensor of size 3**m
+  ! (component t = i_1*3**(m-1)+...+i_m, each i_l in 1..3 -- same row-major convention as
+  ! hess_flat/third_flat), via degree->=max_order quadrature. Pure geometry, cached once per mesh.
+  subroutine ensure_cell_moment_cache(mesh, max_order)
+    use quadrature_module, only: volume_quad_pts
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: max_order
+
+    integer(kind=ENTIER) :: i, kv, n_v, m, t, idx, r, dloc, n_quad, quad_deg
+    real(kind=DOUBLE), dimension(:, :), allocatable :: vcoords, pq
+    real(kind=DOUBLE), dimension(:), allocatable :: wq, prod
+    real(kind=DOUBLE), dimension(:, :), allocatable :: dxq
+    real(kind=DOUBLE) :: xc, yc, zc
+
+    if (cell_moment_cache_n_elems == mesh%n_elems .and. cell_moment_cache_max_order >= max_order) return
+
+    if (allocated(cell_moment_cache)) deallocate(cell_moment_cache)
+    allocate(cell_moment_cache(2:max_order))
+    do m = 2, max_order
+      allocate(cell_moment_cache(m)%m(3**m, mesh%n_elems))
+      cell_moment_cache(m)%m = 0.0_DOUBLE
+    end do
+
+    quad_deg = max(5_ENTIER, max_order)
+
+    do i = 1, mesh%n_elems
+      n_v = mesh%elem(i)%n_vert
+      allocate(vcoords(3, n_v))
+      do kv = 1, n_v
+        vcoords(:, kv) = mesh%vert(mesh%elem(i)%vert(kv))%coord
+      end do
+      call volume_quad_pts(n_v, vcoords, quad_deg, pq, wq)
+      xc = mesh%elem(i)%coord(1); yc = mesh%elem(i)%coord(2); zc = mesh%elem(i)%coord(3)
+
+      n_quad = size(wq)
+      allocate(dxq(3, n_quad), prod(n_quad))
+      dxq(1, :) = pq(1, :) - xc
+      dxq(2, :) = pq(2, :) - yc
+      dxq(3, :) = pq(3, :) - zc
+
+      do m = 2, max_order
+        do t = 0, 3**m - 1
+          ! unravel t into its m base-3 digits (order irrelevant: product is commutative)
+          idx = t
+          prod = 1.0_DOUBLE
+          do r = 1, m
+            dloc = mod(idx, 3) + 1
+            idx = idx / 3
+            prod = prod * dxq(dloc, :)
+          end do
+          cell_moment_cache(m)%m(t+1, i) = sum(wq * prod) / mesh%elem(i)%volume
+        end do
+      end do
+      deallocate(dxq, prod, vcoords, pq, wq)
+    end do
+
+    cell_moment_cache_n_elems = mesh%n_elems
+    cell_moment_cache_max_order = max_order
+  end subroutine ensure_cell_moment_cache
+
+  ! z_vK^(m) = (1/|T_K|) int_{T_K} (x-x_v)^{tensor m} dV, for ONE neighbor cell id_elem and shift
+  ! s = x_elem - x_v, as a full flat tensor of size 3**m (row-major, same convention as
+  ! cell_moment_cache/hess_flat/third_flat). Computed via the binomial/moment-shift expansion
+  ! (Haider, Croisille & Courbet 2011, eq. 1/13's z_{alpha,beta}): writing x-x_v = s + (x-x_K),
+  !   z^(m)[i_1..i_m] = sum over subsets S of {1..m} ( prod_{l not in S} s_{i_l} ) * M_K^{(|S|)}[i_l, l in S]
+  ! with M_K^(0)=1, M_K^(1)=0 (x_K is the exact centroid) and M_K^(j)=cell_moment_cache(j) for
+  ! j>=2 -- i.e. this ONE moment folds together the node-stencil-geometry bias (the S={} term,
+  ! the only one an earlier, position-only version of this cache used) AND neighbor K's own
+  ! cell-average-vs-point-value gap (every S!={} term), which used to need a second, separate GG
+  ! pass on a "gap field" (apply_local_taylor_correction + one more compute_next_order_derivative
+  ! call). Folding both into one cache this way is cheaper: neighbor moments are already cached
+  ! once per cell (ensure_cell_moment_cache) and reused algebraically for every vertex that
+  ! touches that cell, instead of a fresh GG pass per correction call.
+  subroutine shifted_cell_moment_full(id_elem, s, m, z)
+    implicit none
+
+    integer(kind=ENTIER), intent(in) :: id_elem, m
+    real(kind=DOUBLE), dimension(3), intent(in) :: s
+    real(kind=DOUBLE), dimension(3**m), intent(out) :: z
+
+    integer(kind=ENTIER) :: t, idx, l, mask, j, sub_idx
+    integer(kind=ENTIER), dimension(m) :: digits
+    real(kind=DOUBLE) :: prod_s, mval
+
+    z = 0.0_DOUBLE
+    do t = 0, 3**m - 1
+      idx = t
+      do l = m, 1, -1
+        digits(l) = mod(idx, 3)
+        idx = idx / 3
+      end do
+      do mask = 0, 2**m - 1
+        j = popcnt(mask)
+        prod_s = 1.0_DOUBLE
+        sub_idx = 0
+        do l = 1, m
+          if (btest(mask, l-1)) then
+            sub_idx = sub_idx*3 + digits(l)
+          else
+            prod_s = prod_s * s(digits(l)+1)
+          end if
+        end do
+        if (j == 0) then
+          mval = 1.0_DOUBLE
+        else if (j == 1) then
+          mval = 0.0_DOUBLE
+        else
+          mval = cell_moment_cache(j)%m(sub_idx+1, id_elem)
+        end if
+        z(t+1) = z(t+1) + prod_s * mval
+      end do
+    end do
+  end subroutine shifted_cell_moment_full
+
+  ! Builds gg_grad_h1_cache(m), m=2..max_order: for each vertex v, the SAME 1-exact GG gradient
+  ! operator (flux-sum + gg_mat_inv_cache) applied to the geometric field {z_vK^(m)}_K
+  ! (shifted_cell_moment_full) instead of phi. Pure geometry (v's own 1-ring plus each touching
+  ! cell's own cached moments), cached once per mesh. Generalizes ensure_green_gauss_h21_cache/
+  ! h31_cache (this session's earlier, order-specific, reduced-component, position-only versions)
+  ! to arbitrary m using the full flat-tensor convention, so the symmetric-contraction weights
+  ! fall out automatically in apply_gradient_node_correction instead of needing hand-picked
+  ! multinomial factors per order.
+  subroutine ensure_gg_gradient_h1_cache(mesh, boundary_2d, max_order)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    logical, intent(in) :: boundary_2d
+    integer(kind=ENTIER), intent(in) :: max_order
+
+    integer(kind=ENTIER) :: v, k, id_elem, m, tt
+    real(kind=DOUBLE), dimension(3) :: dx_v, tmp
+    real(kind=DOUBLE), dimension(:, :), allocatable :: raw
+    real(kind=DOUBLE), dimension(:), allocatable :: z
+
+    call ensure_green_gauss_mat_cache(mesh, boundary_2d)
+    call ensure_cell_moment_cache(mesh, max_order)
+
+    if (gg_grad_h1_cache_n_vert == mesh%n_vert .and. gg_grad_h1_cache_max_order >= max_order &
+        .and. (gg_grad_h1_cache_boundary_2d .eqv. boundary_2d)) return
+
+    if (allocated(gg_grad_h1_cache)) deallocate(gg_grad_h1_cache)
+    allocate(gg_grad_h1_cache(2:max_order))
+    do m = 2, max_order
+      allocate(gg_grad_h1_cache(m)%m(3*3**m, mesh%n_vert))
+      gg_grad_h1_cache(m)%m = 0.0_DOUBLE
+    end do
+
+    do v = 1, mesh%n_vert
+      if (.not. gg_mat_valid_cache(v)) cycle
+      do m = 2, max_order
+        allocate(raw(3, 3**m), z(3**m))
+        raw = 0.0_DOUBLE
+        do k = gg_flux_offset_cache(v), gg_flux_offset_cache(v+1) - 1
+          id_elem = gg_flux_elem_cache(k)
+          dx_v = mesh%elem(id_elem)%coord - mesh%vert(v)%coord
+          call shifted_cell_moment_full(id_elem, dx_v, m, z)
+          raw = raw + spread(gg_flux_w_cache(:, k), 2, 3**m) * spread(z, 1, 3)
+        end do
+        do tt = 1, 3**m
+          tmp = matmul(gg_mat_inv_cache(:, :, v), raw(:, tt))
+          gg_grad_h1_cache(m)%m((tt-1)*3+1 : (tt-1)*3+3, v) = tmp
+        end do
+        deallocate(raw, z)
+      end do
+    end do
+
+    gg_grad_h1_cache_n_vert = mesh%n_vert
+    gg_grad_h1_cache_max_order = max_order
+    gg_grad_h1_cache_boundary_2d = boundary_2d
+  end subroutine ensure_gg_gradient_h1_cache
+
   ! Alternative to the LS fit ("aho gg"): Green-Gauss sum over the vertex's dual control volume, corrected by mat^-1=gg_mat_inv_cache (see that cache's own header for the derivation) so the result is exact for a linear field on any stencil.
   subroutine compute_nodal_derivative_at_vertex_green_gauss(mesh, d, nc_in, &
       boundary_2d, id_vert, phi, dphi_v, valid, oi_v)
@@ -1406,6 +1654,66 @@ contains
     neigh_cache_n_vert = mesh%n_vert
   end subroutine ensure_neighbor_cache
 
+  ! Builds vv_neigh_cache: for each vertex v, the set of OTHER vertices sharing at least one cell
+  ! with v (deduplicated), via a two-pass CSR build using a reusable "last touched by v" mark
+  ! array (avoids an O(n_vert) reset per vertex). Pure topology, cached once per mesh.
+  subroutine ensure_vv_neighbor_cache(mesh)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+
+    integer(kind=ENTIER) :: v, i, kv, id_elem, n_v, w, n_uniq, p
+    integer(kind=ENTIER), dimension(:), allocatable :: mark
+
+    if (vv_neigh_cache_n_vert == mesh%n_vert) return
+
+    if (allocated(vv_neigh_cache_start)) deallocate(vv_neigh_cache_start)
+    if (allocated(vv_neigh_cache_list))  deallocate(vv_neigh_cache_list)
+    allocate(vv_neigh_cache_start(mesh%n_vert + 1))
+    allocate(mark(mesh%n_vert))
+    mark = 0
+
+    vv_neigh_cache_start(1) = 1
+    do v = 1, mesh%n_vert
+      n_uniq = 0
+      do i = 1, mesh%vert(v)%n_elems_neigh
+        id_elem = mesh%vert(v)%elem_neigh(i)
+        n_v = mesh%elem(id_elem)%n_vert
+        do kv = 1, n_v
+          w = mesh%elem(id_elem)%vert(kv)
+          if (w == v) cycle
+          if (mark(w) /= v) then
+            mark(w) = v
+            n_uniq = n_uniq + 1
+          end if
+        end do
+      end do
+      vv_neigh_cache_start(v+1) = vv_neigh_cache_start(v) + n_uniq
+    end do
+
+    allocate(vv_neigh_cache_list(vv_neigh_cache_start(mesh%n_vert+1) - 1))
+    mark = 0
+    do v = 1, mesh%n_vert
+      p = vv_neigh_cache_start(v)
+      do i = 1, mesh%vert(v)%n_elems_neigh
+        id_elem = mesh%vert(v)%elem_neigh(i)
+        n_v = mesh%elem(id_elem)%n_vert
+        do kv = 1, n_v
+          w = mesh%elem(id_elem)%vert(kv)
+          if (w == v) cycle
+          if (mark(w) /= v) then
+            mark(w) = v
+            vv_neigh_cache_list(p) = w
+            p = p + 1
+          end if
+        end do
+      end do
+    end do
+    deallocate(mark)
+
+    vv_neigh_cache_n_vert = mesh%n_vert
+  end subroutine ensure_vv_neighbor_cache
+
   ! Builds each cell's own second geometric moment once per mesh via degree-5 quadrature.
   subroutine ensure_m2_cache(mesh)
     use quadrature_module, only: volume_quad_pts
@@ -1448,6 +1756,566 @@ contains
 
     m2_cache_n_elems = mesh%n_elems
   end subroutine ensure_m2_cache
+
+  ! Builds aho_fv_mom_cache: pure geometry, cached once per mesh.
+  subroutine ensure_aho_fv_moment_cache(mesh)
+    use quadrature_module, only: volume_quad_pts
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+
+    integer(kind=ENTIER) :: i, kv, n_v, a, b, c
+    real(kind=DOUBLE), dimension(:, :), allocatable :: vcoords, pq
+    real(kind=DOUBLE), dimension(:), allocatable :: wq
+    real(kind=DOUBLE) :: xc, yc, zc
+
+    if (aho_fv_mom_cache_n_elems == mesh%n_elems) return
+
+    if (allocated(aho_fv_mom_cache)) deallocate(aho_fv_mom_cache)
+    allocate(aho_fv_mom_cache(0:aho_fv_max_degree, 0:aho_fv_max_degree, 0:aho_fv_max_degree, mesh%n_elems))
+    aho_fv_mom_cache = 0.0_DOUBLE
+
+    do i = 1, mesh%n_elems
+      n_v = mesh%elem(i)%n_vert
+      allocate(vcoords(3, n_v))
+      do kv = 1, n_v
+        vcoords(:, kv) = mesh%vert(mesh%elem(i)%vert(kv))%coord
+      end do
+      call volume_quad_pts(n_v, vcoords, 5_ENTIER, pq, wq)
+      xc = mesh%elem(i)%coord(1); yc = mesh%elem(i)%coord(2); zc = mesh%elem(i)%coord(3)
+      do a = 0, aho_fv_max_degree
+        do b = 0, aho_fv_max_degree - a
+          do c = 0, aho_fv_max_degree - a - b
+            aho_fv_mom_cache(a, b, c, i) = &
+              sum(wq * (pq(1,:)-xc)**a * (pq(2,:)-yc)**b * (pq(3,:)-zc)**c)
+          end do
+        end do
+      end do
+      deallocate(vcoords, pq, wq)
+    end do
+
+    aho_fv_mom_cache_n_elems = mesh%n_elems
+  end subroutine ensure_aho_fv_moment_cache
+
+  ! Enumerates all multi-indices (a,b,c) with 0<=a+b+c<=max_deg (c forced to 0 when boundary_2d),
+  ! in a fixed order reused consistently for the LS unknowns/rows in compute_nodal_polynomial_fv.
+  subroutine enumerate_multi_indices(max_deg, boundary_2d, midx, n)
+    implicit none
+
+    integer(kind=ENTIER), intent(in) :: max_deg
+    logical, intent(in) :: boundary_2d
+    integer(kind=ENTIER), dimension(3, 20), intent(out) :: midx
+    integer(kind=ENTIER), intent(out) :: n
+
+    integer(kind=ENTIER) :: a, b, c, cmax
+
+    n = 0
+    do a = 0, max_deg
+      do b = 0, max_deg - a
+        cmax = max_deg - a - b
+        if (boundary_2d) cmax = 0
+        do c = 0, cmax
+          n = n + 1
+          midx(1, n) = a
+          midx(2, n) = b
+          midx(3, n) = c
+        end do
+      end do
+    end do
+  end subroutine enumerate_multi_indices
+
+  ! n!/(n-kk)! for small non-negative integers (kk<=n): converts Taylor coefficients to/from raw
+  ! partial derivatives without a separate factorial table.
+  pure function fact_ratio(n, kk) result(r)
+    implicit none
+
+    integer(kind=ENTIER), intent(in) :: n, kk
+    real(kind=DOUBLE) :: r
+    integer(kind=ENTIER) :: i
+
+    r = 1.0_DOUBLE
+    do i = n-kk+1, n
+      r = r * real(i, kind=DOUBLE)
+    end do
+  end function fact_ratio
+
+  ! Binomial coefficient C(n,kk) for small non-negative integers, via fact_ratio.
+  ! Hardcoded for n,kk in 0..3 (aho_fv_max_degree): a hot-path call (every shifted-moment and
+  ! polynomial-shift entry), and nint()-of-a-division was showing up as pure __llround overhead
+  ! in profiling for what is really just 10 fixed integers.
+  pure function binom_int(n, kk) result(r)
+    implicit none
+
+    integer(kind=ENTIER), intent(in) :: n, kk
+    integer(kind=ENTIER) :: r
+    integer(kind=ENTIER), parameter :: table(0:3, 0:3) = reshape( &
+      (/ 1,0,0,0,  1,1,0,0,  1,2,1,0,  1,3,3,1 /), (/4, 4/))
+
+    r = table(kk, n)
+  end function binom_int
+
+  ! base**n for n in 0..3 (aho_fv_max_degree) without a generic runtime power call (__powidf2),
+  ! which profiling showed as a real cost in shift_polynomial/shifted_moments' hot loops.
+  pure function ipow_small(base, n) result(r)
+    implicit none
+
+    real(kind=DOUBLE), intent(in) :: base
+    integer(kind=ENTIER), intent(in) :: n
+    real(kind=DOUBLE) :: r
+
+    select case (n)
+    case (0)
+      r = 1.0_DOUBLE
+    case (1)
+      r = base
+    case (2)
+      r = base * base
+    case (3)
+      r = base * base * base
+    case default
+      r = base ** n
+    end select
+  end function ipow_small
+
+  ! nu(a,b,c) := int_c (x-x_p)^a (y-y_p)^b (z-z_p)^c dV for cell id_elem, from the cell's own
+  ! moments about its centroid (aho_fv_mom_cache) and the shift s = x_c - x_p, via the multi-index
+  ! binomial (Taylor-shift) formula (tex_aho_formula/main.tex, "Moments autour d'un noeud"). Pure
+  ! algebra recombining already-cached moments -- never a new quadrature.
+  subroutine shifted_moments(id_elem, s, nu)
+    implicit none
+
+    integer(kind=ENTIER), intent(in) :: id_elem
+    real(kind=DOUBLE), dimension(3), intent(in) :: s
+    real(kind=DOUBLE), dimension(0:aho_fv_max_degree, 0:aho_fv_max_degree, 0:aho_fv_max_degree), &
+      intent(out) :: nu
+
+    integer(kind=ENTIER) :: a, b, c, ea, eb, ec
+
+    nu = 0.0_DOUBLE
+    do a = 0, aho_fv_max_degree
+      do b = 0, aho_fv_max_degree - a
+        do c = 0, aho_fv_max_degree - a - b
+          do ea = 0, a
+            do eb = 0, b
+              do ec = 0, c
+                nu(a,b,c) = nu(a,b,c) &
+                  + real(binom_int(a,ea)*binom_int(b,eb)*binom_int(c,ec), kind=DOUBLE) &
+                  * ipow_small(s(1),a-ea) * ipow_small(s(2),b-eb) * ipow_small(s(3),c-ec) &
+                  * aho_fv_mom_cache(ea, eb, ec, id_elem)
+              end do
+            end do
+          end do
+        end do
+      end do
+    end do
+  end subroutine shifted_moments
+
+  ! Re-expresses a per-node Taylor polynomial (coefficients poly_p about x_p, total degree
+  ! <=max_deg) as the equivalent Taylor polynomial about a different point x_p+delta, via the same
+  ! multi-index binomial shift as shifted_moments: c'_gamma = sum_{beta>=gamma} c_beta *
+  ! C(beta,gamma) * delta^(beta-gamma). Required before blending several nodes' polynomials into
+  ! one cell polynomial -- they must first all be re-centered on that cell's own centroid, since a
+  ! node's raw coefficients are meaningless mixed directly into a different expansion point.
+  subroutine shift_polynomial(nc_in, max_deg, delta, poly_p, poly_shifted)
+    implicit none
+
+    integer(kind=ENTIER), intent(in) :: nc_in, max_deg
+    real(kind=DOUBLE), dimension(3), intent(in) :: delta
+    real(kind=DOUBLE), dimension(nc_in, 0:aho_fv_max_degree, 0:aho_fv_max_degree, &
+      0:aho_fv_max_degree), intent(in) :: poly_p
+    real(kind=DOUBLE), dimension(nc_in, 0:aho_fv_max_degree, 0:aho_fv_max_degree, &
+      0:aho_fv_max_degree), intent(out) :: poly_shifted
+
+    integer(kind=ENTIER) :: ga, gb, gc, ba, bb, bc
+
+    poly_shifted = 0.0_DOUBLE
+    do ga = 0, max_deg
+      do gb = 0, max_deg - ga
+        do gc = 0, max_deg - ga - gb
+          do ba = ga, max_deg
+            do bb = gb, max_deg - ba
+              do bc = gc, max_deg - ba - bb
+                poly_shifted(:, ga, gb, gc) = poly_shifted(:, ga, gb, gc) &
+                  + poly_p(:, ba, bb, bc) &
+                  * real(binom_int(ba,ga)*binom_int(bb,gb)*binom_int(bc,gc), kind=DOUBLE) &
+                  * ipow_small(delta(1),ba-ga) * ipow_small(delta(2),bb-gb) * ipow_small(delta(3),bc-gc)
+              end do
+            end do
+          end do
+        end do
+      end do
+    end do
+  end subroutine shift_polynomial
+
+  ! aho_fv nodal fit at recursion level k->k+1 (tex_aho_formula/main.tex, "Recursion generale
+  ! (multi-D)" and "Systeme moindres carres au noeud"): builds, at node id_vert, the canonical-
+  ! basis Taylor polynomial poly_p(:,a,b,c) of total degree <=k+1 about x_p, by weighted least
+  ! squares imposing (i) the true FV mean on every neighbor cell and (ii) for q=1..k, that every
+  ! q-th partial derivative of poly_p integrates over each neighbor cell to the same value as the
+  ! already-known degree-k polynomial poly_in there. Weight w_c=1/|x_c-x_p|^2, as in
+  ! compute_nodal_derivative_at_vertex; degenerates exactly to that routine's LS system at k=0
+  ! (mu_1(c)=0 identically, elem%coord being the exact quadrature centroid).
+  subroutine compute_nodal_polynomial_fv(mesh, nc_in, boundary_2d, k, id_vert, poly_in, poly_p, valid)
+    use linear_solver_module, only: lu_factor_lapack, lu_solve_mat_lapack
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: nc_in, k, id_vert
+    logical, intent(in) :: boundary_2d
+    real(kind=DOUBLE), dimension(nc_in, 0:aho_fv_max_degree, 0:aho_fv_max_degree, &
+      0:aho_fv_max_degree, mesh%n_elems), intent(in) :: poly_in
+    real(kind=DOUBLE), dimension(nc_in, 0:aho_fv_max_degree, 0:aho_fv_max_degree, &
+      0:aho_fv_max_degree), intent(out) :: poly_p
+    logical, intent(out) :: valid
+
+    integer(kind=ENTIER), parameter :: max_basis = 20
+    integer(kind=ENTIER), dimension(3, max_basis) :: midx_out, midx_in
+    integer(kind=ENTIER) :: n_basis, n_in_basis, n_neigh, j, ib, jb, id_elem
+    integer(kind=ENTIER) :: q, da, db, dcv, a, b, c, aa, bb, cc
+    integer(kind=ENTIER), dimension(:), allocatable :: neigh
+    integer(kind=ENTIER), dimension(max_basis) :: ipiv
+    real(kind=DOUBLE), dimension(max_basis, max_basis) :: mat
+    real(kind=DOUBLE), dimension(max_basis, nc_in) :: rhs
+    real(kind=DOUBLE), dimension(0:aho_fv_max_degree, 0:aho_fv_max_degree, 0:aho_fv_max_degree) :: nu
+    real(kind=DOUBLE), dimension(3) :: s
+    real(kind=DOUBLE) :: weight
+    real(kind=DOUBLE), dimension(max_basis) :: row
+    real(kind=DOUBLE), dimension(nc_in) :: target_val
+
+    call enumerate_multi_indices(k+1, boundary_2d, midx_out, n_basis)
+    call enumerate_multi_indices(k, boundary_2d, midx_in, n_in_basis)
+
+    call ensure_neighbor_cache(mesh)
+    n_neigh = neigh_cache_start(id_vert+1) - neigh_cache_start(id_vert)
+
+    poly_p = 0.0_DOUBLE
+    valid = (n_neigh >= 1)
+    if (.not. valid) return
+
+    allocate(neigh(n_neigh))
+    neigh = neigh_cache_list(neigh_cache_start(id_vert):neigh_cache_start(id_vert+1)-1)
+
+    mat = 0.0_DOUBLE
+    rhs = 0.0_DOUBLE
+
+    do j = 1, n_neigh
+      id_elem = neigh(j)
+      s = mesh%elem(id_elem)%coord - mesh%vert(id_vert)%coord
+      weight = 1.0_DOUBLE / max(dot_product(s, s), 1.0e-24_DOUBLE)
+
+      call shifted_moments(id_elem, s, nu)
+
+      ! q = 0: match the true FV mean (poly_in's own degree-0 coefficient).
+      do ib = 1, n_basis
+        row(ib) = nu(midx_out(1,ib), midx_out(2,ib), midx_out(3,ib))
+      end do
+      do ib = 1, n_basis
+        do jb = 1, n_basis
+          mat(ib, jb) = mat(ib, jb) + weight * row(ib) * row(jb)
+        end do
+        rhs(ib, :) = rhs(ib, :) + (weight * row(ib)) &
+          * (poly_in(:, 0, 0, 0, id_elem) * mesh%elem(id_elem)%volume)
+      end do
+
+      ! q = 1..k: match every q-th derivative of the known degree-k polynomial.
+      do q = 1, k
+        do da = 0, q
+          do db = 0, q - da
+            dcv = q - da - db
+            if (boundary_2d .and. dcv > 0) cycle
+
+            row = 0.0_DOUBLE
+            do ib = 1, n_basis
+              a = midx_out(1,ib); b = midx_out(2,ib); c = midx_out(3,ib)
+              if (a >= da .and. b >= db .and. c >= dcv) then
+                row(ib) = fact_ratio(a,da) * fact_ratio(b,db) * fact_ratio(c,dcv) &
+                  * nu(a-da, b-db, c-dcv)
+              end if
+            end do
+
+            target_val = 0.0_DOUBLE
+            do jb = 1, n_in_basis
+              aa = midx_in(1,jb); bb = midx_in(2,jb); cc = midx_in(3,jb)
+              if (aa >= da .and. bb >= db .and. cc >= dcv) then
+                target_val = target_val + poly_in(:, aa, bb, cc, id_elem) &
+                  * (fact_ratio(aa,da) * fact_ratio(bb,db) * fact_ratio(cc,dcv)) &
+                  * aho_fv_mom_cache(aa-da, bb-db, cc-dcv, id_elem)
+              end if
+            end do
+
+            do ib = 1, n_basis
+              do jb = 1, n_basis
+                mat(ib, jb) = mat(ib, jb) + weight * row(ib) * row(jb)
+              end do
+              rhs(ib, :) = rhs(ib, :) + (weight * row(ib)) * target_val
+            end do
+          end do
+        end do
+      end do
+    end do
+
+    ! Verified (empirically, against an SVD pseudo-inverse) that this normal-equations matrix is
+    ! never actually singular on any mesh/vertex tested here -- plain LU gives bit-identical
+    ! results to the SVD pseudo-inverse in every case, so LU is kept for its much lower cost.
+    call lu_factor_lapack(n_basis, mat(1:n_basis, 1:n_basis), ipiv(1:n_basis))
+    call lu_solve_mat_lapack(n_basis, mat(1:n_basis, 1:n_basis), &
+      ipiv(1:n_basis), nc_in, rhs(1:n_basis, :))
+
+    do ib = 1, n_basis
+      poly_p(:, midx_out(1,ib), midx_out(2,ib), midx_out(3,ib)) = rhs(ib, :)
+    end do
+
+    deallocate(neigh)
+  end subroutine compute_nodal_polynomial_fv
+
+  ! Rescue for a cell left with zero blend weight (e.g. every touching vertex on the boundary):
+  ! re-admit its own boundary vertices, mirroring rescue_zero_weight_cell for the aho_fv fit.
+  subroutine rescue_zero_weight_cell_fv(mesh, nc_in, boundary_2d, k, id_elem, poly_in, num, den)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: nc_in, k, id_elem
+    logical, intent(in) :: boundary_2d
+    real(kind=DOUBLE), dimension(nc_in, 0:aho_fv_max_degree, 0:aho_fv_max_degree, &
+      0:aho_fv_max_degree, mesh%n_elems), intent(in) :: poly_in
+    real(kind=DOUBLE), dimension(:, 0:, 0:, 0:, :), intent(inout) :: num
+    real(kind=DOUBLE), dimension(:), intent(inout) :: den
+
+    integer(kind=ENTIER) :: j, id_vert, id_sub_elem
+    real(kind=DOUBLE), dimension(nc_in, 0:aho_fv_max_degree, 0:aho_fv_max_degree, &
+      0:aho_fv_max_degree) :: poly_p, poly_p_shifted
+    real(kind=DOUBLE) :: sub_elem_volume
+    logical :: valid
+
+    do j = 1, mesh%elem(id_elem)%n_vert
+      id_vert = mesh%elem(id_elem)%vert(j)
+      id_sub_elem = mesh%elem(id_elem)%sub_elem(j)
+      call compute_nodal_polynomial_fv(mesh, nc_in, boundary_2d, k, id_vert, poly_in, poly_p, valid)
+      if (.not. valid) cycle
+      ! Re-center poly_p (about x_p) onto x_c before blending: see shift_polynomial.
+      call shift_polynomial(nc_in, k+1, mesh%elem(id_elem)%coord - mesh%vert(id_vert)%coord, &
+        poly_p, poly_p_shifted)
+      sub_elem_volume = mesh%sub_elem(id_sub_elem)%volume
+      num(:, :, :, :, id_elem) = num(:, :, :, :, id_elem) + sub_elem_volume * poly_p_shifted
+      den(id_elem) = den(id_elem) + sub_elem_volume
+    end do
+  end subroutine rescue_zero_weight_cell_fv
+
+  ! aho_fv recursive step: builds the degree-(k+1) canonical-basis polynomial field in every cell
+  ! from the degree-k polynomial field, via a per-node weighted LS fit (compute_nodal_polynomial_fv)
+  ! followed by a linear sub_elem_volume-weighted blend back to the cell. WENO blending is layered
+  ! on top later, exactly as for aho_ls/aho_gg (see scatter_weno_weighted).
+  subroutine compute_next_order_polynomial_fv(mesh, nc_in, boundary_2d, k, poly_in, poly_out)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: nc_in, k
+    logical, intent(in) :: boundary_2d
+    real(kind=DOUBLE), dimension(nc_in, 0:aho_fv_max_degree, 0:aho_fv_max_degree, &
+      0:aho_fv_max_degree, mesh%n_elems), intent(in) :: poly_in
+    real(kind=DOUBLE), dimension(nc_in, 0:aho_fv_max_degree, 0:aho_fv_max_degree, &
+      0:aho_fv_max_degree, mesh%n_elems), intent(out) :: poly_out
+
+    real(kind=DOUBLE), dimension(:, :, :, :, :), allocatable :: num
+    real(kind=DOUBLE), dimension(:), allocatable :: den
+    real(kind=DOUBLE), dimension(nc_in, 0:aho_fv_max_degree, 0:aho_fv_max_degree, &
+      0:aho_fv_max_degree) :: poly_p, poly_p_shifted
+    logical :: valid
+    integer(kind=ENTIER) :: id_vert, id_elem, j, id_sub_elem
+    real(kind=DOUBLE) :: sub_elem_volume
+
+    call ensure_aho_fv_moment_cache(mesh)
+    call ensure_neighbor_cache(mesh)
+
+    allocate(num(nc_in, 0:aho_fv_max_degree, 0:aho_fv_max_degree, 0:aho_fv_max_degree, mesh%n_elems))
+    allocate(den(mesh%n_elems))
+    num = 0.0_DOUBLE
+    den = 0.0_DOUBLE
+
+    do id_vert = 1, mesh%n_vert
+      if (mesh%vert(id_vert)%is_bound) cycle
+      call compute_nodal_polynomial_fv(mesh, nc_in, boundary_2d, k, id_vert, poly_in, poly_p, valid)
+      if (.not. valid) cycle
+      do j = 1, mesh%vert(id_vert)%n_sub_elems_neigh
+        id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
+        id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+        ! Re-center poly_p (about x_p) onto x_c before blending: see shift_polynomial.
+        call shift_polynomial(nc_in, k+1, mesh%elem(id_elem)%coord - mesh%vert(id_vert)%coord, &
+          poly_p, poly_p_shifted)
+        sub_elem_volume = mesh%sub_elem(id_sub_elem)%volume
+        num(:, :, :, :, id_elem) = num(:, :, :, :, id_elem) + sub_elem_volume * poly_p_shifted
+        den(id_elem) = den(id_elem) + sub_elem_volume
+      end do
+    end do
+
+    do id_elem = 1, mesh%n_elems
+      if (den(id_elem) == 0.0_DOUBLE) then
+        call rescue_zero_weight_cell_fv(mesh, nc_in, boundary_2d, k, id_elem, poly_in, num, den)
+      end if
+    end do
+
+    do id_elem = 1, mesh%n_elems
+      if (den(id_elem) == 0.0_DOUBLE) then
+        poly_out(:, :, :, :, id_elem) = 0.0_DOUBLE
+      else
+        poly_out(:, :, :, :, id_elem) = num(:, :, :, :, id_elem) / den(id_elem)
+      end if
+      ! Exact conservation: the degree-0 coefficient is always the true FV mean, never the blend.
+      poly_out(:, 0, 0, 0, id_elem) = poly_in(:, 0, 0, 0, id_elem)
+    end do
+
+    deallocate(num, den)
+  end subroutine compute_next_order_polynomial_fv
+
+  ! Raw partial derivative d^n phi / dx_{dirs(1)}...dx_{dirs(n)} at every cell, read off a
+  ! canonical-basis Taylor polynomial field poly (about each cell's own centroid): builds the
+  ! exponent triple from dirs then converts the Taylor coefficient via the standard alpha! factor.
+  function raw_deriv_from_poly(mesh, nc_in, poly, dirs, ndirs) result(v)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: nc_in, ndirs
+    real(kind=DOUBLE), dimension(nc_in, 0:aho_fv_max_degree, 0:aho_fv_max_degree, &
+      0:aho_fv_max_degree, mesh%n_elems), intent(in) :: poly
+    integer(kind=ENTIER), dimension(ndirs), intent(in) :: dirs
+    real(kind=DOUBLE), dimension(nc_in, mesh%n_elems) :: v
+
+    integer(kind=ENTIER) :: i, exps(3)
+
+    exps = 0
+    do i = 1, ndirs
+      exps(dirs(i)) = exps(dirs(i)) + 1
+    end do
+    v = poly(:, exps(1), exps(2), exps(3), :) &
+      * (fact_ratio(exps(1),exps(1)) * fact_ratio(exps(2),exps(2)) * fact_ratio(exps(3),exps(3)))
+  end function raw_deriv_from_poly
+
+  ! aho_fv end-to-end: builds grad_flat/hess_flat/third_flat in the exact flattened layout
+  ! aho_reconstruction (euler_ho_module.F90) already expects from compute_next_order_derivative --
+  ! (dir-1)*nc_in+v for grad, (dir2-1)*3*nc_in+(dir1-1)*nc_in+v for hess,
+  ! (dir3-1)*9*nc_in+(dir2-1)*3*nc_in+(dir1-1)*nc_in+v for third -- so it drops in as a direct
+  ! replacement for the three separate compute_next_order_derivative calls, no bias correction
+  ! needed since the recursion is exact by construction (see tex_aho_formula/main.tex).
+  ! Every exposed derivative is read off the SAME, deepest polynomial actually built for the
+  ! requested order (poly1 for order 2, poly2 for order 3, poly3 for order 4): a lower-order slot
+  ! of a deeper polynomial (e.g. poly3's own gradient) is a refit, not the same value as the
+  ! shallower level's own slot (e.g. poly1's gradient) -- that refit IS the point of the recursion,
+  ! so grad/hess must never be pulled from an earlier level than the one hess/third came from.
+  ! Optional num_procs/mpi_send_recv: when num_procs>1, each freshly-built poly level is exchanged
+  ! (ghost cells updated) before being used as poly_in for the next level, exactly as grad_flat/
+  ! hess_flat/third_flat are exchanged between levels in aho_reconstruction.
+  subroutine compute_derivative_hierarchy_fv(mesh, nc_in, boundary_2d, order, phi, &
+      grad_flat, hess_flat, third_flat, num_procs, mpi_send_recv)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: nc_in, order
+    logical, intent(in) :: boundary_2d
+    real(kind=DOUBLE), dimension(nc_in, mesh%n_elems), intent(in) :: phi
+    real(kind=DOUBLE), dimension(3*nc_in, mesh%n_elems), intent(out) :: grad_flat
+    real(kind=DOUBLE), dimension(9*nc_in, mesh%n_elems), intent(out), optional :: hess_flat
+    real(kind=DOUBLE), dimension(27*nc_in, mesh%n_elems), intent(out), optional :: third_flat
+    integer(kind=ENTIER), intent(in), optional :: num_procs
+    type(mpi_send_recv_type), intent(inout), optional :: mpi_send_recv
+
+    real(kind=DOUBLE), dimension(:, :, :, :, :), allocatable :: poly0, poly1, poly2, poly3
+    integer(kind=ENTIER) :: d1, d2, d3, off
+    logical :: do_exchange
+
+    do_exchange = present(num_procs)
+    if (do_exchange) do_exchange = num_procs > 1
+
+    allocate(poly0(nc_in, 0:aho_fv_max_degree, 0:aho_fv_max_degree, 0:aho_fv_max_degree, mesh%n_elems))
+    allocate(poly1(nc_in, 0:aho_fv_max_degree, 0:aho_fv_max_degree, 0:aho_fv_max_degree, mesh%n_elems))
+    poly0 = 0.0_DOUBLE
+    poly0(:, 0, 0, 0, :) = phi
+    call compute_next_order_polynomial_fv(mesh, nc_in, boundary_2d, 0_ENTIER, poly0, poly1)
+    if (do_exchange) call exchange_poly_fv(mesh, nc_in, mpi_send_recv, poly1)
+
+    if (order <= 2) then
+      do d1 = 1, 3
+        off = (d1-1)*nc_in
+        grad_flat(off+1:off+nc_in, :) = raw_deriv_from_poly(mesh, nc_in, poly1, [d1], 1_ENTIER)
+      end do
+      deallocate(poly0, poly1)
+      return
+    end if
+
+    allocate(poly2(nc_in, 0:aho_fv_max_degree, 0:aho_fv_max_degree, 0:aho_fv_max_degree, mesh%n_elems))
+    call compute_next_order_polynomial_fv(mesh, nc_in, boundary_2d, 1_ENTIER, poly1, poly2)
+    if (do_exchange) call exchange_poly_fv(mesh, nc_in, mpi_send_recv, poly2)
+
+    if (order == 3) then
+      do d1 = 1, 3
+        off = (d1-1)*nc_in
+        grad_flat(off+1:off+nc_in, :) = raw_deriv_from_poly(mesh, nc_in, poly2, [d1], 1_ENTIER)
+      end do
+      if (present(hess_flat)) then
+        do d2 = 1, 3
+          do d1 = 1, 3
+            off = (d2-1)*3*nc_in + (d1-1)*nc_in
+            hess_flat(off+1:off+nc_in, :) = raw_deriv_from_poly(mesh, nc_in, poly2, [d1,d2], 2_ENTIER)
+          end do
+        end do
+      end if
+      deallocate(poly0, poly1, poly2)
+      return
+    end if
+
+    ! order >= 4
+    allocate(poly3(nc_in, 0:aho_fv_max_degree, 0:aho_fv_max_degree, 0:aho_fv_max_degree, mesh%n_elems))
+    call compute_next_order_polynomial_fv(mesh, nc_in, boundary_2d, 2_ENTIER, poly2, poly3)
+
+    do d1 = 1, 3
+      off = (d1-1)*nc_in
+      grad_flat(off+1:off+nc_in, :) = raw_deriv_from_poly(mesh, nc_in, poly3, [d1], 1_ENTIER)
+    end do
+    if (present(hess_flat)) then
+      do d2 = 1, 3
+        do d1 = 1, 3
+          off = (d2-1)*3*nc_in + (d1-1)*nc_in
+          hess_flat(off+1:off+nc_in, :) = raw_deriv_from_poly(mesh, nc_in, poly3, [d1,d2], 2_ENTIER)
+        end do
+      end do
+    end if
+    if (present(third_flat)) then
+      do d3 = 1, 3
+        do d2 = 1, 3
+          do d1 = 1, 3
+            off = (d3-1)*9*nc_in + (d2-1)*3*nc_in + (d1-1)*nc_in
+            third_flat(off+1:off+nc_in, :) = raw_deriv_from_poly(mesh, nc_in, poly3, [d1,d2,d3], 3_ENTIER)
+          end do
+        end do
+      end do
+    end if
+
+    deallocate(poly0, poly1, poly2, poly3)
+  end subroutine compute_derivative_hierarchy_fv
+
+  ! MPI ghost exchange for a full poly level (used as poly_in by the next recursion level):
+  ! flattens the (nc_in,0:D,0:D,0:D) block per cell into a plain (n_comp,n_elems) view (same
+  ! memory layout, cell as the slowest-varying index) so the existing mpi_memory_exchange can be
+  ! reused unchanged, then unflattens the result back in place.
+  subroutine exchange_poly_fv(mesh, nc_in, mpi_send_recv, poly)
+    use mpi_module, only: mpi_send_recv_type, mpi_memory_exchange
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: nc_in
+    type(mpi_send_recv_type), intent(inout) :: mpi_send_recv
+    real(kind=DOUBLE), dimension(nc_in, 0:aho_fv_max_degree, 0:aho_fv_max_degree, &
+      0:aho_fv_max_degree, mesh%n_elems), intent(inout) :: poly
+
+    real(kind=DOUBLE), dimension(:, :), allocatable :: poly_flat
+    integer(kind=ENTIER) :: n_comp
+
+    n_comp = nc_in * (aho_fv_max_degree+1)**3
+    allocate(poly_flat(n_comp, mesh%n_elems))
+    poly_flat = reshape(poly, [n_comp, mesh%n_elems])
+    call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, n_comp, poly_flat)
+    poly = reshape(poly_flat, shape(poly))
+    deallocate(poly_flat)
+  end subroutine exchange_poly_fv
 
   ! Element neighbors of id_vert: exactly elem_neigh, never ring-expanded (see compute_nodal_derivative_at_vertex).
   subroutine gather_ls_neighbors(mesh, id_vert, n_neigh, neigh)
@@ -1708,5 +2576,492 @@ contains
     deallocate(t_num_xxx, t_num_yyy, t_num_zzz, t_num_xxy, t_num_xxz)
     deallocate(t_num_xyy, t_num_yyz, t_num_xzz, t_num_yzz, t_num_xyz)
   end subroutine apply_grad_bias_correction
+
+  ! Contracts the LAST m=(k-q) indices of the rank-k tensor D_k (flat, row-major, size d**k*nc_in
+  ! per cell) against the rank-m geometric tensor M_m (flat, row-major, size d**m per cell),
+  ! leaving a rank-q tensor (flat, size d**q*nc_in per cell). Since both operands are stored in the
+  ! FULL (redundant) flat convention already used for hess_flat/third_flat, this plain index-matched
+  ! sum reproduces the correct symmetric-contraction multinomial weights automatically -- no
+  ! separate combinatorial bookkeeping needed, unlike an independent-component (Hxx/Hxy/...)
+  ! representation.
+  subroutine contract_last_indices(d, nc_in, n_elems, k, m, D_k, M_m, corr_q)
+    implicit none
+
+    integer(kind=ENTIER), intent(in) :: d, nc_in, n_elems, k, m
+    real(kind=DOUBLE), dimension(d**k*nc_in, n_elems), intent(in) :: D_k
+    real(kind=DOUBLE), dimension(d**m, n_elems), intent(in) :: M_m
+    real(kind=DOUBLE), dimension(d**(k-m)*nc_in, n_elems), intent(out) :: corr_q
+
+    integer(kind=ENTIER) :: tq, tm, ic, n_tq, n_tm, off
+
+    n_tq = d**(k-m)
+    n_tm = d**m
+
+    corr_q = 0.0_DOUBLE
+    do tm = 0, n_tm - 1
+      do tq = 0, n_tq - 1
+        off = (tq*n_tm + tm) * nc_in
+        do ic = 1, nc_in
+          corr_q(tq*nc_in+ic, :) = corr_q(tq*nc_in+ic, :) + D_k(off+ic, :) * M_m(tm+1, :)
+        end do
+      end do
+    end do
+  end subroutine contract_last_indices
+
+  ! Corrects, in place, the cell-level Taylor coefficients D^(0)=phi,...,D^(k_max) held in
+  ! dfield(0:k_max)%val (each already built by the existing recursive GG/LS + linear-blend
+  ! pipeline: dfield(q)%val has shape (nc_in*d**q, n_elems), and is a RAW estimate of the CELL
+  ! AVERAGE of D^(q)phi over the cell, not its point value at the centroid x_c).
+  !
+  ! Taylor-expanding D^(q) about x_c and averaging over the cell:
+  !   avg(D^(q))_c = D^(q)(x_c) + sum_{m>=1} (1/m!) D^(q+m)(x_c) : M_c^(m)
+  ! M_c^(1)=0 identically (x_c is the exact quadrature centroid), so the m=1 ("adjacent order")
+  ! term always vanishes and, truncating at the highest available order k_max:
+  !   D^(q)(x_c) = avg(D^(q))_c - sum_{m=2}^{k_max-q} (1/m!) D^(q+m)(x_c) : M_c^(m)
+  ! This is applied incrementally for k=2,...,k_max: at each new top order k, one more term is
+  ! subtracted from every q=0,...,k-2 (q=k-1 is skipped -- its m=1 contraction is always zero),
+  ! using the RAW (never itself corrected) dfield(k)%val as the correction source -- matching Pont
+  ! et al. (2017, JCP 350) sec. 3.4's successive-correction idea, but entirely local to the cell:
+  ! no node/neighbor geometry is needed, only the cell's own moments (cell_moment_cache).
+  subroutine apply_local_taylor_correction(mesh, d, nc_in, k_max, dfield)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: d, nc_in, k_max
+    type(derivative_field_type), dimension(0:k_max), intent(inout) :: dfield
+
+    integer(kind=ENTIER) :: kk, q, m
+    real(kind=DOUBLE), dimension(:, :), allocatable :: corr
+
+    if (k_max < 2) return
+
+    call ensure_cell_moment_cache(mesh, k_max)
+
+    do kk = 2, k_max
+      do q = 0, kk - 2
+        m = kk - q
+        allocate(corr(nc_in*d**q, mesh%n_elems))
+        call contract_last_indices(d, nc_in, mesh%n_elems, kk, m, &
+          dfield(kk)%val, cell_moment_cache(m)%m, corr)
+        dfield(q)%val = dfield(q)%val - corr / fact_ratio(m, m)
+        deallocate(corr)
+      end do
+    end do
+  end subroutine apply_local_taylor_correction
+
+  ! Contracts the m geometric indices of H_m^(1)(v) (flat, layout t*3+i, t=0..3**m-1, i=1..3)
+  ! against the rank-m derivative tensor D_m_v (flat, layout t*nc_in+ic, same row-major
+  ! convention as hess_v/third_v), leaving the rank-1 (gradient-direction i, component ic) bias
+  ! bias_v(i,ic,vertex). Same "full flat tensor, plain index-matched sum" trick as
+  ! contract_last_indices: the symmetric-contraction multinomial weights fall out automatically.
+  subroutine contract_grad_node_bias(nc_in, m, n_vert, D_m_v, H_m1_v, bias_v)
+    implicit none
+
+    integer(kind=ENTIER), intent(in) :: nc_in, m, n_vert
+    real(kind=DOUBLE), dimension(3**m*nc_in, n_vert), intent(in) :: D_m_v
+    real(kind=DOUBLE), dimension(3**m*3, n_vert), intent(in) :: H_m1_v
+    real(kind=DOUBLE), dimension(3*nc_in, n_vert), intent(out) :: bias_v
+
+    integer(kind=ENTIER) :: t, i, ic, n_t
+
+    n_t = 3**m
+    bias_v = 0.0_DOUBLE
+    do t = 0, n_t - 1
+      do i = 1, 3
+        do ic = 1, nc_in
+          bias_v((i-1)*nc_in+ic, :) = bias_v((i-1)*nc_in+ic, :) &
+            + D_m_v(t*nc_in+ic, :) * H_m1_v(t*3+i, :)
+        end do
+      end do
+    end do
+  end subroutine contract_grad_node_bias
+
+  ! Corrects, in place, the cell-level gradient grad_cell using every higher true derivative
+  ! D^(2),...,D^(k_max) available at the vertex level (dfield_v(2:k_max)%val -- the per-vertex
+  ! nodal estimates already produced by compute_next_order_derivative's dphi_v_out), following
+  ! Pont et al. (2017, JCP 350) sec. 3.4, eq. 56-61 generalized to arbitrary order and folded into
+  ! ONE moment following Haider, Croisille & Courbet (2011) eq. 13:
+  !   (D phi)_v^corrected = (D phi)_v^raw - sum_{m=2}^{k_max} (1/m!) D^(m)(x_v) : H_m^(1)(v)
+  ! where H_m^(1)(v) = gg_grad_h1_cache(m) (see ensure_gg_gradient_h1_cache) is the SAME 1-exact
+  ! GG gradient operator applied to the geometric field {z_vK^(m)}_K (shifted_cell_moment_full)
+  ! instead of phi -- z_vK^(m) is neighbor K's moment about x_v, which already folds together the
+  ! node/stencil-geometry-driven bias AND neighbor K's own cell-average-vs-point-value gap into a
+  ! single quantity (see shifted_cell_moment_full's own header; an earlier version of this routine
+  ! computed these as two separate terms, the second needing an extra GG pass on a "gap" field --
+  ! no longer needed now that the cache itself accounts for it). Verified numerically to reproduce
+  ! the measured bias of a raw GG gradient to machine precision on isolated monomial test fields.
+  ! Not local to a single cell (needs the node's 1-ring), but nothing beyond the existing
+  ! gg_mat_inv_cache/gg_flux_*_cache stencil -- no new MPI exchange. Blended into cells via linear
+  ! sub_elem_volume weighting (no WENO yet).
+  ! GENERAL version: corrects a RAW order-k vertex derivative (built by ONE application of the GG
+  ! operator L_v to the order-(k-1) cell field, exactly what compute_next_order_derivative does at
+  ! every level) using every available higher-order vertex derivative
+  ! dfield_v(k+1)%val,...,dfield_v(k_max)%val. This is NOT specific to the gradient (k=1): since
+  ! L_v is THE SAME operator at every level of the aho_gg recursion (compute_next_order_derivative
+  ! always reuses gg_mat_inv_cache/gg_flux_w_cache, regardless of what field it is fed), the SAME
+  ! geometric cache gg_grad_h1_cache(m) used to correct the gradient applies unchanged to correct
+  ! ANY order k: treating D^(k-1)'s own d**(k-1) tensor components as independent scalar fields
+  ! (exactly like nc_in independent PDE variables), L_v's bias against a source of order (k-1+m)
+  ! is (1/m!) D^(k-1+m) : H_m^(1)(v), contracted over the LAST m indices and batched over the
+  ! first (k-1) -- eq:grad-bias-gg's own formula with nc_in replaced by nc_in*d**(k-1). Reusing
+  ! contract_grad_node_bias/gg_grad_h1_cache directly (no new geometric cache) lets every
+  ! intermediate order in the hierarchy (Hessian, third, ...) be node-corrected the same way the
+  ! gradient already was, not just the gradient -- see the tex writeup's degree-sweep diagnosis of
+  ! why correcting only the gradient stops being enough beyond degree 3.
+  subroutine compute_node_derivative_bias(mesh, d, nc_in, boundary_2d, k, k_max, dfield_v, bias_v_total)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: d, nc_in, k, k_max
+    logical, intent(in) :: boundary_2d
+    type(derivative_field_type), dimension(k+1:k_max), intent(in) :: dfield_v
+    real(kind=DOUBLE), dimension(nc_in*d**k, mesh%n_vert), intent(out) :: bias_v_total
+
+    integer(kind=ENTIER) :: m, nc_eff
+    real(kind=DOUBLE), dimension(:, :), allocatable :: bias_m
+
+    bias_v_total = 0.0_DOUBLE
+    if (k_max < k+1) return
+
+    call ensure_gg_gradient_h1_cache(mesh, boundary_2d, k_max-k+1)
+
+    nc_eff = nc_in * d**(k-1)
+    do m = 2, k_max-k+1
+      allocate(bias_m(nc_eff*d, mesh%n_vert))
+      call contract_grad_node_bias(nc_eff, m, mesh%n_vert, dfield_v(k-1+m)%val, gg_grad_h1_cache(m)%m, bias_m)
+      bias_v_total = bias_v_total + bias_m / fact_ratio(m, m)
+      deallocate(bias_m)
+    end do
+  end subroutine compute_node_derivative_bias
+
+  ! k=1 special case of compute_node_derivative_bias, kept for backward compatibility with
+  ! existing callers (apply_gradient_node_correction).
+  subroutine compute_gradient_node_bias(mesh, d, nc_in, boundary_2d, k_max, dfield_v, bias_v_total)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: d, nc_in, k_max
+    logical, intent(in) :: boundary_2d
+    type(derivative_field_type), dimension(2:k_max), intent(in) :: dfield_v
+    real(kind=DOUBLE), dimension(nc_in*d, mesh%n_vert), intent(out) :: bias_v_total
+
+    call compute_node_derivative_bias(mesh, d, nc_in, boundary_2d, 1_ENTIER, k_max, dfield_v, bias_v_total)
+  end subroutine compute_gradient_node_bias
+
+  ! Recombines a per-vertex quantity into cells via a WEIGHTED LEAST-SQUARES affine regression
+  ! (val_v(x) ~= val_cell + G.(x-x_c), same inverse-square-distance weight and basis convention as
+  ! the vertex-level LS fit of Section algo-dual) over each cell's own touching vertices, instead
+  ! of a naive weighted average. A naive average is only exact when the sampled quantity is
+  ! CONSTANT across the cell; a per-vertex derivative (gradient, Hessian, ...) generally varies
+  ! smoothly across a cell, so averaging even individually-exact vertex samples does not reproduce
+  ! their true value at x_c -- a discrete analogue of the cell-average-vs-point-value gap that
+  ! ensure_cell_moment_cache/apply_local_taylor_correction already remove for the continuous
+  ! volume-integral case. Falls back to a plain average over whatever valid vertices exist when a
+  ! cell has too few valid vertices for the fit (e.g. near a boundary).
+  subroutine recombine_derivative_regression(mesh, boundary_2d, n_comp, val_v, valid_v, val_cell_out)
+    use linear_solver_module, only: lu_factor_lapack, lu_solve_mat_lapack
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    logical, intent(in) :: boundary_2d
+    integer(kind=ENTIER), intent(in) :: n_comp
+    real(kind=DOUBLE), dimension(n_comp, mesh%n_vert), intent(in) :: val_v
+    logical, dimension(mesh%n_vert), intent(in) :: valid_v
+    real(kind=DOUBLE), dimension(n_comp, mesh%n_elems), intent(out) :: val_cell_out
+
+    integer(kind=ENTIER) :: i, kv, n_v, id_v, n_cand, n_basis, n_valid, cnt
+    real(kind=DOUBLE), dimension(4, 4) :: mat
+    real(kind=DOUBLE), dimension(4, n_comp) :: rhs
+    real(kind=DOUBLE), dimension(4) :: basis
+    integer(kind=ENTIER), dimension(4) :: ipiv
+    real(kind=DOUBLE), dimension(3) :: dx_v
+    real(kind=DOUBLE) :: weight
+    real(kind=DOUBLE), dimension(n_comp) :: s
+
+    n_cand = merge(2_ENTIER, 3_ENTIER, boundary_2d)
+    n_basis = 1 + n_cand
+    val_cell_out = 0.0_DOUBLE
+
+    do i = 1, mesh%n_elems
+      n_v = mesh%elem(i)%n_vert
+      n_valid = 0
+      do kv = 1, n_v
+        if (valid_v(mesh%elem(i)%vert(kv))) n_valid = n_valid + 1
+      end do
+
+      if (n_valid < n_basis) then
+        s = 0.0_DOUBLE; cnt = 0
+        do kv = 1, n_v
+          id_v = mesh%elem(i)%vert(kv)
+          if (.not. valid_v(id_v)) cycle
+          s = s + val_v(:, id_v)
+          cnt = cnt + 1
+        end do
+        if (cnt > 0) val_cell_out(:, i) = s / real(cnt, kind=DOUBLE)
+        cycle
+      end if
+
+      mat(1:n_basis, 1:n_basis) = 0.0_DOUBLE
+      rhs(1:n_basis, :) = 0.0_DOUBLE
+      do kv = 1, n_v
+        id_v = mesh%elem(i)%vert(kv)
+        if (.not. valid_v(id_v)) cycle
+        dx_v = mesh%vert(id_v)%coord - mesh%elem(i)%coord
+        weight = 1.0_DOUBLE / max(dot_product(dx_v, dx_v), 1.0e-24_DOUBLE)
+        basis(1) = 1.0_DOUBLE; basis(2) = dx_v(1); basis(3) = dx_v(2)
+        if (n_basis == 4) basis(4) = dx_v(3)
+        mat(1:n_basis, 1:n_basis) = mat(1:n_basis, 1:n_basis) &
+          + weight * spread(basis(1:n_basis), 2, n_basis) * spread(basis(1:n_basis), 1, n_basis)
+        rhs(1:n_basis, :) = rhs(1:n_basis, :) &
+          + weight * spread(basis(1:n_basis), 2, n_comp) * spread(val_v(:, id_v), 1, n_basis)
+      end do
+
+      call lu_factor_lapack(n_basis, mat(1:n_basis, 1:n_basis), ipiv(1:n_basis))
+      call lu_solve_mat_lapack(n_basis, mat(1:n_basis, 1:n_basis), ipiv(1:n_basis), n_comp, rhs(1:n_basis, :))
+
+      val_cell_out(:, i) = rhs(1, :)
+    end do
+  end subroutine recombine_derivative_regression
+
+  subroutine apply_gradient_node_correction(mesh, d, nc_in, boundary_2d, grad_cell, k_max, &
+      dfield_v, valid_v)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: d, nc_in, k_max
+    logical, intent(in) :: boundary_2d
+    real(kind=DOUBLE), dimension(nc_in*d, mesh%n_elems), intent(inout) :: grad_cell
+    type(derivative_field_type), dimension(2:k_max), intent(in) :: dfield_v
+    logical, dimension(mesh%n_vert), intent(in) :: valid_v
+
+    integer(kind=ENTIER) :: iv, j, id_elem, id_sub_elem
+    real(kind=DOUBLE), dimension(:, :), allocatable :: bias_v_total
+    real(kind=DOUBLE), dimension(:, :), allocatable :: bias_num
+    real(kind=DOUBLE), dimension(:), allocatable :: bias_den
+    real(kind=DOUBLE) :: sub_elem_volume
+
+    if (k_max < 2) return
+
+    allocate(bias_v_total(nc_in*d, mesh%n_vert))
+    call compute_gradient_node_bias(mesh, d, nc_in, boundary_2d, k_max, dfield_v, bias_v_total)
+
+    allocate(bias_num(nc_in*d, mesh%n_elems), bias_den(mesh%n_elems))
+    bias_num = 0.0_DOUBLE; bias_den = 0.0_DOUBLE
+
+    do iv = 1, mesh%n_vert
+      if (mesh%vert(iv)%is_bound) cycle
+      if (.not. valid_v(iv)) cycle
+      do j = 1, mesh%vert(iv)%n_sub_elems_neigh
+        id_sub_elem = mesh%vert(iv)%sub_elem_neigh(j)
+        id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+        sub_elem_volume = mesh%sub_elem(id_sub_elem)%volume
+        bias_num(:, id_elem) = bias_num(:, id_elem) + sub_elem_volume * bias_v_total(:, iv)
+        bias_den(id_elem) = bias_den(id_elem) + sub_elem_volume
+      end do
+    end do
+
+    do j = 1, mesh%n_elems
+      if (bias_den(j) <= 0.0_DOUBLE) cycle
+      grad_cell(:, j) = grad_cell(:, j) - bias_num(:, j) / bias_den(j)
+    end do
+
+    deallocate(bias_v_total, bias_num, bias_den)
+  end subroutine apply_gradient_node_correction
+
+  ! aho_cls (Haider, Croisille & Courbet 2011, "Efficient Implementation of High Order
+  ! Reconstruction in Finite Volume Methods"): contracts H_2^(1) (gg_grad_h1_cache(2), full flat,
+  ! layout t*3+i) with a rank-2 tensor E9 (full flat, layout (i-1)*3+j), leaving the rank-1
+  ! (direction i) result -- used to build the functional-identity matrix below.
+  pure function contract_geom_h2(Hcol, E9) result(vec3)
+    implicit none
+
+    real(kind=DOUBLE), dimension(27), intent(in) :: Hcol
+    real(kind=DOUBLE), dimension(9), intent(in) :: E9
+    real(kind=DOUBLE), dimension(3) :: vec3
+
+    integer(kind=ENTIER) :: t, i
+
+    vec3 = 0.0_DOUBLE
+    do t = 0, 8
+      do i = 1, 3
+        vec3(i) = vec3(i) + Hcol(t*3+i) * E9(t+1)
+      end do
+    end do
+  end function contract_geom_h2
+
+  ! aho_cls, step k=1->2: builds a GENUINELY 2-exact Hessian at every vertex, following Haider,
+  ! Croisille & Courbet (2011) eq. 15-18 ("functional identity"), adapted from their cell-based
+  ! setting to our vertex-based dual stencil. Unlike compute_next_order_derivative (which builds
+  ! the Hessian by re-applying the gradient operator to an already cell-blended gradient field --
+  ! NOT automatically 2-exact, hence apply_gradient_node_correction's after-the-fact fix), this
+  ! computes the Hessian directly from ONE-RING vertex data, exact from construction:
+  !
+  ! For a genuinely quadratic field u with true (constant) Hessian H, Taylor expansion gives, at
+  ! ANY vertex w: w_w^(1|1)[u] = grad(u)(x_w) + (1/2) H:H_2^(1)(w) exactly (no remainder, since u
+  ! has no degree-3+ content) -- this is exactly eq:grad-bias-gg with k_max=2. Subtracting this
+  ! relation at a neighbor v' from the same relation at v, and using grad(u)(x_v')-grad(u)(x_v) =
+  ! H.(x_v'-x_v) exactly (H constant), gives, for every neighbor v' of v:
+  !   w_v'^(1|1)[u] - w_v^(1|1)[u] = H.(x_v'-x_v) + (1/2) H : [H_2^(1)(v') - H_2^(1)(v)]
+  ! The right-hand side, as a function of a CANDIDATE tensor b in place of the true H, is a known
+  ! LINEAR map J_v(b) (one 3-vector per neighbor v', stacked) -- solving J_v(b) = {w_v'^(1|1)[u] -
+  ! w_v^(1|1)[u]}_v' for b (least squares via the normal equations, LU -- aho_fv's own SVD-vs-LU
+  ! check found them bit-identical) recovers b=H exactly whenever u truly is quadratic, and is the
+  ! leading-order (2+1=3rd-order-accurate) estimate of H otherwise. Needs only v's own 1-ring of
+  ! VERTICES (vv_neigh_cache) and the already-cached gg_grad_h1_cache(2) -- no 2-ring, no deeper
+  ! MPI ghost layer, unlike extending apply_gradient_node_correction's mechanism to q=2 would.
+  subroutine compute_2exact_hessian_aho_cls(mesh, boundary_2d, grad_v, valid_grad_v, hess_v_out, valid_out)
+    use linear_solver_module, only: lu_factor_lapack, lu_solve_mat_lapack
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    logical, intent(in) :: boundary_2d
+    real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(in) :: grad_v
+    logical, dimension(mesh%n_vert), intent(in) :: valid_grad_v
+    real(kind=DOUBLE), dimension(6, mesh%n_vert), intent(out) :: hess_v_out ! Hxx,Hxy,Hxz,Hyy,Hyz,Hzz
+    logical, dimension(mesh%n_vert), intent(out) :: valid_out
+
+    integer(kind=ENTIER) :: v, i, vp, ell, row, n_valid
+    real(kind=DOUBLE), dimension(:, :), allocatable :: Jmat
+    real(kind=DOUBLE), dimension(:), allocatable :: rhsvec
+    real(kind=DOUBLE), dimension(3) :: h, gcorr_v, gcorr_vp
+    real(kind=DOUBLE), dimension(9) :: E9
+    real(kind=DOUBLE), dimension(6, 6) :: normal_mat
+    real(kind=DOUBLE), dimension(6, 1) :: normal_rhs
+    integer(kind=ENTIER), dimension(6) :: ipiv
+    integer(kind=ENTIER), parameter :: basis_i(6) = (/1,1,1,2,2,3/)
+    integer(kind=ENTIER), parameter :: basis_j(6) = (/1,2,3,2,3,3/)
+
+    call ensure_vv_neighbor_cache(mesh)
+    call ensure_gg_gradient_h1_cache(mesh, boundary_2d, 2_ENTIER)
+
+    hess_v_out = 0.0_DOUBLE
+    valid_out = .false.
+
+    do v = 1, mesh%n_vert
+      if (mesh%vert(v)%is_bound) cycle
+      if (.not. valid_grad_v(v)) cycle
+
+      n_valid = 0
+      do i = vv_neigh_cache_start(v), vv_neigh_cache_start(v+1) - 1
+        if (valid_grad_v(vv_neigh_cache_list(i))) n_valid = n_valid + 1
+      end do
+      if (n_valid < 2) cycle
+
+      allocate(Jmat(3*n_valid, 6), rhsvec(3*n_valid))
+      row = 0
+      do i = vv_neigh_cache_start(v), vv_neigh_cache_start(v+1) - 1
+        vp = vv_neigh_cache_list(i)
+        if (.not. valid_grad_v(vp)) cycle
+        h = mesh%vert(vp)%coord - mesh%vert(v)%coord
+        do ell = 1, 6
+          E9 = 0.0_DOUBLE
+          E9((basis_i(ell)-1)*3 + basis_j(ell)) = 1.0_DOUBLE
+          E9((basis_j(ell)-1)*3 + basis_i(ell)) = 1.0_DOUBLE
+          gcorr_v  = contract_geom_h2(gg_grad_h1_cache(2)%m(:, v),  E9)
+          gcorr_vp = contract_geom_h2(gg_grad_h1_cache(2)%m(:, vp), E9)
+          Jmat(row*3+1, ell) = E9(1)*h(1) + E9(2)*h(2) + E9(3)*h(3) + 0.5_DOUBLE*(gcorr_vp(1)-gcorr_v(1))
+          Jmat(row*3+2, ell) = E9(4)*h(1) + E9(5)*h(2) + E9(6)*h(3) + 0.5_DOUBLE*(gcorr_vp(2)-gcorr_v(2))
+          Jmat(row*3+3, ell) = E9(7)*h(1) + E9(8)*h(2) + E9(9)*h(3) + 0.5_DOUBLE*(gcorr_vp(3)-gcorr_v(3))
+        end do
+        rhsvec(row*3+1:row*3+3) = grad_v(:, vp) - grad_v(:, v)
+        row = row + 1
+      end do
+
+      normal_mat = matmul(transpose(Jmat), Jmat)
+      normal_rhs(:, 1) = matmul(transpose(Jmat), rhsvec)
+      call lu_factor_lapack(6_ENTIER, normal_mat, ipiv)
+      call lu_solve_mat_lapack(6_ENTIER, normal_mat, ipiv, 1_ENTIER, normal_rhs)
+
+      hess_v_out(:, v) = normal_rhs(:, 1)
+      valid_out(v) = .true.
+      deallocate(Jmat, rhsvec)
+    end do
+  end subroutine compute_2exact_hessian_aho_cls
+
+  ! Builds discrete_vmom_cache(m), m=2..max_order: for each cell, mu_m^discrete(c) = the average
+  ! over its OWN corner vertices v of (x_v-x_c)^{tensor m}, as a full flat tensor of size 3**m
+  ! (same row-major convention as cell_moment_cache). Pure topology+geometry, cached once per
+  ! mesh -- unlike cell_moment_cache's quadrature, this is a plain average over mesh%elem(:)%vert.
+  subroutine ensure_discrete_vertex_moment_cache(mesh, max_order)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: max_order
+
+    integer(kind=ENTIER) :: i, kv, n_v, m, t, idx, r, dloc, id_v
+    real(kind=DOUBLE), dimension(3) :: dx_v
+    real(kind=DOUBLE) :: prodval
+
+    if (discrete_vmom_cache_n_elems == mesh%n_elems .and. discrete_vmom_cache_max_order >= max_order) return
+
+    if (allocated(discrete_vmom_cache)) deallocate(discrete_vmom_cache)
+    allocate(discrete_vmom_cache(2:max_order))
+    do m = 2, max_order
+      allocate(discrete_vmom_cache(m)%m(3**m, mesh%n_elems))
+      discrete_vmom_cache(m)%m = 0.0_DOUBLE
+    end do
+
+    do i = 1, mesh%n_elems
+      n_v = mesh%elem(i)%n_vert
+      do m = 2, max_order
+        do kv = 1, n_v
+          id_v = mesh%elem(i)%vert(kv)
+          dx_v = mesh%vert(id_v)%coord - mesh%elem(i)%coord
+          do t = 0, 3**m - 1
+            idx = t
+            prodval = 1.0_DOUBLE
+            do r = 1, m
+              dloc = mod(idx, 3) + 1
+              idx = idx / 3
+              prodval = prodval * dx_v(dloc)
+            end do
+            discrete_vmom_cache(m)%m(t+1, i) = discrete_vmom_cache(m)%m(t+1, i) + prodval
+          end do
+        end do
+        discrete_vmom_cache(m)%m(:, i) = discrete_vmom_cache(m)%m(:, i) / real(n_v, kind=DOUBLE)
+      end do
+    end do
+
+    discrete_vmom_cache_n_elems = mesh%n_elems
+    discrete_vmom_cache_max_order = max_order
+  end subroutine ensure_discrete_vertex_moment_cache
+
+  ! Corrects, in place, a cell-level quantity D^(q)_cell (built by recombining an already
+  ! node-exact per-vertex sample onto each cell's own corner vertices via an AFFINE regression,
+  ! recombine_derivative_regression -- which already removes the m=1 term, unlike a naive average)
+  ! using every available higher blended derivative D^(q+2)_cell,...,D^(k_max)_cell, following the
+  ! SAME Taylor argument and the SAME loop structure as apply_local_taylor_correction, but for a
+  ! DISCRETE average over a cell's corner vertices instead of a continuous volume integral:
+  !   avg_v(D^(q))_c = D^(q)(x_c) + D^(q+1)(x_c).mu_1^discrete(c) + sum_{m=2}^{k_max-q} (1/m!) D^(q+m)(x_c):mu_m^discrete(c)
+  ! The m=1 term is handled by the regression itself (mu_1^discrete(c) is NOT zero in general,
+  ! unlike the continuous case's exact centroid property, so it cannot simply be dropped -- an
+  ! affine fit is what removes it); this routine only ever needs m>=2. Verified to close exactly
+  ! the 1.53/1.54 residual measured between a corrected, individually-exact vertex gradient and
+  ! its cell recombination on a synthetic cubic field (100x20x20 test mesh) with q=1 (grad),
+  ! k_max=3 (using the third derivative, m=2): the formula (1/2!) T_cell : mu_2^discrete
+  ! reproduces it to the last digit by hand, and to ~1e-10 numerically over the whole deep-interior
+  ! mesh region.
+  subroutine apply_discrete_vertex_moment_correction(mesh, d, nc_in, q, k_max, q_val, dfield_cell)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: d, nc_in, q, k_max
+    real(kind=DOUBLE), dimension(nc_in*d**q, mesh%n_elems), intent(inout) :: q_val
+    type(derivative_field_type), dimension(q+2:k_max), intent(in) :: dfield_cell
+
+    integer(kind=ENTIER) :: m
+    real(kind=DOUBLE), dimension(:, :), allocatable :: corr
+
+    if (k_max < q+2) return
+    call ensure_discrete_vertex_moment_cache(mesh, k_max-q)
+
+    do m = 2, k_max - q
+      allocate(corr(nc_in*d**q, mesh%n_elems))
+      call contract_last_indices(d, nc_in, mesh%n_elems, q+m, m, dfield_cell(q+m)%val, &
+        discrete_vmom_cache(m)%m, corr)
+      q_val = q_val - corr / fact_ratio(m, m)
+      deallocate(corr)
+    end do
+  end subroutine apply_discrete_vertex_moment_correction
 
 end module arbitrary_high_order_module
