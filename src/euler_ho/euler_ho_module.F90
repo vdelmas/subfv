@@ -39,9 +39,18 @@ module euler_ho_module
   integer(kind=ENTIER), public :: n_sol_vtu  = 10
   logical, public :: compute_error            = .false.
   logical, public :: error_2d                 = .true.
-  logical, public :: use_aho_reconstruction   = .false.
+  ! Selects the reconstruction method: 0 = no aho reconstruction (ls_reconstruction
+  ! / order 1, the pre-aho default); 1 = aho_gg (Green-Gauss nodal fit), the only
+  ! supported aho variant -- aho_ls, aho_cls, and the pure cell-to-cell CLS variant
+  ! were removed 2026-09-22 (aho_ls/aho_cls never beat aho_gg; the cell-to-cell CLS
+  ! path was confirmed unstable in the real solver, see arbitrary-high-order memory).
+  integer(kind=ENTIER), public :: aho_method  = 0
+  ! Positivity safety net: if the linear (grad-only) reconstruction predicts negative rho or p
+  ! at any of a cell's own vertices, zero that cell's grad/hess/third entirely (forces a plain
+  ! first-order/constant state for that cell instead of extrapolating an unphysical one). See
+  ! apply_positivity_kill. Off by default -- opt in per case.
+  logical, public :: kill_recons              = .false.
   logical, public :: use_weno_blend           = .true.
-  logical, public :: use_green_gauss          = .false.
   logical, public :: use_cweno_center          = .false.
   real(kind=DOUBLE), public :: cweno_center_weight = 1000.0_DOUBLE
   integer(kind=ENTIER), public :: cweno_center_power = 4
@@ -60,6 +69,17 @@ module euler_ho_module
   integer(kind=ENTIER), parameter :: FLUX_RUSANOV = 0, FLUX_TWO_WAVE = 1, FLUX_THREE_WAVE = 2, &
     FLUX_MODIFIED_THREE_WAVE = 3
   integer(kind=ENTIER) :: flux_scheme_id = FLUX_RUSANOV
+
+  ! Per-face quadrature point/weight cache for face_flux_loop's order>=3 multi-point rule: face
+  ! geometry is static across the whole time-marching run, so face_quad_pts's own point/weight
+  ! generation (and the face_coords gather feeding it) only needs to run once per face, not once
+  ! per face per RK stage per iteration. CSR-style ragged storage (offset + flat arrays), keyed by
+  ! (n_faces, order) so a changed mesh or order forces a rebuild.
+  real(kind=DOUBLE), dimension(:, :), allocatable, save :: face_quad_pts_cache
+  real(kind=DOUBLE), dimension(:), allocatable, save :: face_quad_wts_cache
+  integer(kind=ENTIER), dimension(:), allocatable, save :: face_quad_offset_cache
+  integer(kind=ENTIER), save :: face_quad_cache_n_faces = -1
+  integer(kind=ENTIER), save :: face_quad_cache_order = -1
 
   integer(kind=ENTIER), public :: n_bc = 0
   character(len=255), dimension(MAX_BC), public :: bc_name = ''
@@ -169,7 +189,7 @@ contains
       init, sol_uniform, x1drp, sol_w_1drp_l, sol_w_1drp_r, &
       u_bg_vortex, v_bg_vortex, &
       gamma_gas, order, cfl, tmax, n_sol_vtu, &
-      compute_error, error_2d, use_aho_reconstruction, use_weno_blend, use_green_gauss, &
+      compute_error, error_2d, aho_method, kill_recons, use_weno_blend, &
       use_cweno_center, cweno_center_weight, cweno_center_power, use_grad_bias_correction, use_rk4, &
       use_max_lambda_dt, flux_scheme, &
       eps_weight_num, eps_weight_num_deep, weno_power, grad_norm_derate, &
@@ -225,6 +245,12 @@ contains
     real(kind=DOUBLE), parameter :: rho_post  = 1.376364_DOUBLE
     real(kind=DOUBLE), parameter :: p_post    = 1.569800_DOUBLE
     real(kind=DOUBLE), parameter :: vx_post   = -0.394729_DOUBLE
+    ! Triple-point shock interaction (init=7), canonical three-material setup.
+    real(kind=DOUBLE), parameter :: x_tp      = 1.0_DOUBLE
+    real(kind=DOUBLE), parameter :: y_tp      = 1.5_DOUBLE
+    real(kind=DOUBLE), parameter :: gamma_tp1 = 1.5_DOUBLE
+    real(kind=DOUBLE), parameter :: gamma_tp2 = 1.4_DOUBLE
+    real(kind=DOUBLE), parameter :: gamma_tp3 = 1.5_DOUBLE
 
     if (.not. allocated(gamma_arr)) allocate(gamma_arr(mesh%n_elems))
     gamma_arr = gamma_gas
@@ -259,6 +285,24 @@ contains
         else
           gamma_arr(i) = gamma_air
           w = [1.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 1.0_DOUBLE]
+        end if
+      case (7)
+        ! Triple-point shock interaction on [0,7]x[0,3], fluid at rest, reflecting
+        ! walls all around (Galera/Maire/Breil, JCP 2010). Three materials:
+        !   x <= 1          : rho=1,     p=1,   gamma=1.5  (driver)
+        !   x > 1, y <= 1.5 : rho=1,     p=0.1, gamma=1.4  (dense, slow shock)
+        !   x > 1, y > 1.5  : rho=0.125, p=0.1, gamma=1.5  (light, fast shock)
+        ! The shock outruns itself across y=1.5, and the resulting shear layer
+        ! rolls up into the vortex at the triple point.
+        if (xc(1) <= x_tp) then
+          gamma_arr(i) = gamma_tp1
+          w = [1.0_DOUBLE,   0.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 1.0_DOUBLE]
+        else if (xc(2) <= y_tp) then
+          gamma_arr(i) = gamma_tp2
+          w = [1.0_DOUBLE,   0.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 0.1_DOUBLE]
+        else
+          gamma_arr(i) = gamma_tp3
+          w = [0.125_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 0.1_DOUBLE]
         end if
       case default
         w = sol_uniform
@@ -320,9 +364,15 @@ contains
       hess = 0.0_DOUBLE
     end if
 
+    if (aho_method /= 0 .and. aho_method /= 1) then
+      print *, 'FATAL: aho_method must be 0 (off, ls_reconstruction) or 1 (aho_gg) -- ', &
+        'aho_ls/aho_cls/the cell-to-cell CLS variant have been removed'
+      error stop 1
+    end if
+
     if (order >= 4) then
-      if (.not. use_aho_reconstruction) then
-        print *, 'FATAL: order>=4 requires use_aho_reconstruction=.true.'
+      if (aho_method == 0) then
+        print *, 'FATAL: order>=4 requires aho_method = 1 (aho_gg)'
         error stop 1
       end if
       allocate(third(5, 3, 3, 3, mesh%n_elems))
@@ -330,7 +380,7 @@ contains
     end if
 
     if (order >= 2) then
-      if (use_aho_reconstruction) then
+      if (aho_method /= 0) then
         call aho_reconstruction(mesh, prim, grad, hess, third, num_procs, mpi_send_recv)
       else
         call ls_reconstruction(mesh, prim, grad, hess)
@@ -565,7 +615,7 @@ contains
   ! ================================================================
 
   ! Cell-centred weighted least-squares polynomial reconstruction over vertex-neighbours.
-  ! Tops out at order 3 (no cubic basis); order>=4 requires use_aho_reconstruction.
+  ! Tops out at order 3 (no cubic basis); order>=4 requires aho_method /= 0.
   subroutine ls_reconstruction(mesh, prim, grad, hess)
     implicit none
 
@@ -802,13 +852,15 @@ contains
     real(kind=DOUBLE), dimension(:), allocatable :: grad_oi_v
     real(kind=DOUBLE), dimension(:, :), allocatable :: hess_v_local, third_v_local
     logical, dimension(:), allocatable :: valid_hess_v_local, valid_third_v_local
+    real(kind=DOUBLE), dimension(:, :), allocatable :: grad_v
+    logical, dimension(:), allocatable :: valid_grad_v
     logical :: need_hess_v
 
     do_exchange = present(num_procs)
     if (do_exchange) do_exchange = num_procs > 1
 
     aho_module_use_weno_blend = use_weno_blend
-    aho_module_use_green_gauss = use_green_gauss
+    aho_module_use_green_gauss = .true.
     aho_module_use_cweno_center = use_cweno_center
     aho_module_cweno_center_weight = cweno_center_weight
     aho_module_cweno_center_power = cweno_center_power
@@ -827,6 +879,10 @@ contains
     if (use_cweno_center) then
       call compute_next_order_derivative_cweno(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, &
         prim, grad_flat)
+    else if (order >= 4 .and. present(third) .and. use_grad_bias_correction) then
+      call compute_next_order_derivative(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, &
+        prim, grad_flat, deriv_order=1_ENTIER, oi_v_out=grad_oi_v, &
+        dphi_v_out=grad_v, valid_v_out=valid_grad_v)
     else
       call compute_next_order_derivative(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, &
         prim, grad_flat, deriv_order=1_ENTIER, oi_v_out=grad_oi_v)
@@ -886,10 +942,17 @@ contains
               allocate(valid_third_v(size(valid_third_v_local)))
               third_v = third_v_local
               valid_third_v = valid_third_v_local
-              ! Corrects grad_flat in place, then re-exchanges: a rank's ghost copy
-              ! of a neighbour's cell must not keep the pre-correction value.
-              call apply_grad_bias_correction(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, &
-                grad_flat, hess_v, third_v, valid_hess_v, valid_third_v, grad_oi_v)
+              ! RESTORED 2026-09-22 per user report: this original, hand-derived correction
+              ! (accounts for each neighbor's own cell-average-vs-point-value gap via its second
+              ! moment, AND the cell-blend curvature bias from averaging several vertex samples of
+              ! a curved gradient field) is the version that actually reached order 4 -- corrects
+              ! ONLY grad_flat in place; hess/third are left at their raw (uncorrected) values.
+              ! This session tried two generic eq.13-based alternatives (directly correcting hess
+              ! via a z^(m)-contraction operator, and correcting grad then rebuilding hess/third
+              ! from it) -- both compiled and looked locally plausible, but neither moved the
+              ! observed vortex convergence rate past ~3, so they are reverted in favor of this.
+              call apply_grad_bias_correction(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, grad_flat, &
+                hess_v, third_v, valid_hess_v, valid_third_v, grad_oi_v)
               if (do_exchange) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 15_ENTIER, grad_flat)
             else
               call compute_next_order_derivative(mesh, 3_ENTIER, 45_ENTIER, boundary_2d, &
@@ -924,6 +987,8 @@ contains
       end do
     end do
 
+    if (kill_recons) call apply_positivity_kill(mesh, prim, grad, hess, third)
+
     deallocate(grad_flat)
     if (allocated(grad_oi_v)) deallocate(grad_oi_v)
     if (allocated(hess_v)) deallocate(hess_v)
@@ -931,6 +996,49 @@ contains
     if (allocated(third_v)) deallocate(third_v)
     if (allocated(valid_third_v)) deallocate(valid_third_v)
   end subroutine aho_reconstruction
+
+  ! kill_recons safety net: if the linear (grad-only) reconstruction predicts negative rho or p
+  ! at any of a cell's own vertices, zero that cell's grad/hess/third entirely -- forces a
+  ! first-order/constant reconstruction for that cell rather than extrapolating a
+  ! positivity-violating state. See the wall-node-reconstruction-todo memory: this is the
+  ! previously-proposed "expedient" fix for the missing cell-average positivity limiter, now
+  ! generalized to any cell (not just wall-adjacent ones).
+  subroutine apply_positivity_kill(mesh, prim, grad, hess, third)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: prim
+    real(kind=DOUBLE), dimension(5, 3, mesh%n_elems), intent(inout) :: grad
+    real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(inout) :: hess
+    real(kind=DOUBLE), dimension(:, :, :, :, :), allocatable, intent(inout), optional :: third
+
+    integer(kind=ENTIER) :: i, k, id_vert
+    real(kind=DOUBLE), dimension(3) :: dx
+    real(kind=DOUBLE) :: rho_v, p_v
+    logical :: bad
+
+    do i = 1, mesh%n_elems
+      if (mesh%elem(i)%is_ghost) cycle
+      bad = .false.
+      do k = 1, mesh%elem(i)%n_vert
+        id_vert = mesh%elem(i)%vert(k)
+        dx = mesh%vert(id_vert)%coord - mesh%elem(i)%coord
+        rho_v = prim(1, i) + dot_product(grad(1, :, i), dx)
+        p_v   = prim(5, i) + dot_product(grad(5, :, i), dx)
+        if (rho_v <= 0.0_DOUBLE .or. p_v <= 0.0_DOUBLE) then
+          bad = .true.
+          exit
+        end if
+      end do
+      if (bad) then
+        grad(:, :, i) = 0.0_DOUBLE
+        if (allocated(hess)) hess(:, :, :, i) = 0.0_DOUBLE
+        if (present(third)) then
+          if (allocated(third)) third(:, :, :, :, i) = 0.0_DOUBLE
+        end if
+      end if
+    end do
+  end subroutine apply_positivity_kill
 
   ! Solves ATA_in*x=rhs_in (a Gram/normal matrix), dropping directions whose entire
   ! row/column is zero (no information in the data) rather than giving up on the
@@ -1047,6 +1155,78 @@ contains
     end do
   end subroutine gauss_solve
 
+  ! Builds face_quad_pts_cache/face_quad_wts_cache/face_quad_offset_cache once per (mesh, order):
+  ! face_flux_loop's order>=3 branch used to regenerate each face's quadrature rule from scratch
+  ! on every call (every RK stage, every iteration) even though face geometry never changes during
+  ! a run -- this precomputes it once and face_flux_loop just looks it up.
+  subroutine ensure_face_quad_cache(mesh)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+
+    integer(kind=ENTIER) :: iface, k, iv, n_fvert, n_qpts, total_qpts, pos
+    real(kind=DOUBLE), dimension(:, :), allocatable :: face_coords, qpts_local
+    real(kind=DOUBLE), dimension(:), allocatable :: qwts_local
+    logical :: use_face_quad
+
+    if (face_quad_cache_n_faces == mesh%n_faces .and. face_quad_cache_order == order) return
+
+    if (allocated(face_quad_offset_cache)) deallocate(face_quad_offset_cache)
+    allocate(face_quad_offset_cache(mesh%n_faces + 1))
+    face_quad_offset_cache(1) = 1
+
+    do iface = 1, mesh%n_faces
+      n_fvert = mesh%face(iface)%n_vert
+      use_face_quad = order >= 3 .and. n_fvert > 0 .and. allocated(mesh%face(iface)%vert)
+      if (use_face_quad) then
+        allocate(face_coords(3, n_fvert))
+        do k = 1, n_fvert
+          iv = mesh%face(iface)%vert(k)
+          face_coords(:, k) = mesh%vert(iv)%coord
+        end do
+        call face_quad_pts(int(n_fvert, ENTIER), face_coords, int(order - 1, ENTIER), &
+          qpts_local, qwts_local)
+        deallocate(face_coords)
+        n_qpts = size(qwts_local)
+        deallocate(qpts_local, qwts_local)
+      else
+        n_qpts = 1
+      end if
+      face_quad_offset_cache(iface + 1) = face_quad_offset_cache(iface) + n_qpts
+    end do
+
+    total_qpts = face_quad_offset_cache(mesh%n_faces + 1) - 1
+    if (allocated(face_quad_pts_cache)) deallocate(face_quad_pts_cache)
+    if (allocated(face_quad_wts_cache)) deallocate(face_quad_wts_cache)
+    allocate(face_quad_pts_cache(3, total_qpts), face_quad_wts_cache(total_qpts))
+
+    do iface = 1, mesh%n_faces
+      n_fvert = mesh%face(iface)%n_vert
+      pos = face_quad_offset_cache(iface)
+      use_face_quad = order >= 3 .and. n_fvert > 0 .and. allocated(mesh%face(iface)%vert)
+      if (use_face_quad) then
+        allocate(face_coords(3, n_fvert))
+        do k = 1, n_fvert
+          iv = mesh%face(iface)%vert(k)
+          face_coords(:, k) = mesh%vert(iv)%coord
+        end do
+        call face_quad_pts(int(n_fvert, ENTIER), face_coords, int(order - 1, ENTIER), &
+          qpts_local, qwts_local)
+        deallocate(face_coords)
+        n_qpts = size(qwts_local)
+        face_quad_pts_cache(:, pos:pos+n_qpts-1) = qpts_local
+        face_quad_wts_cache(pos:pos+n_qpts-1) = qwts_local
+        deallocate(qpts_local, qwts_local)
+      else
+        face_quad_pts_cache(:, pos) = mesh%face(iface)%coord
+        face_quad_wts_cache(pos) = mesh%face(iface)%area
+      end if
+    end do
+
+    face_quad_cache_n_faces = mesh%n_faces
+    face_quad_cache_order = order
+  end subroutine ensure_face_quad_cache
+
   subroutine face_flux_loop(mesh, sol, prim, grad, hess, rhs, sum_lambda, t, third)
     implicit none
 
@@ -1060,17 +1240,15 @@ contains
     real(kind=DOUBLE), intent(in) :: t
     real(kind=DOUBLE), dimension(:, :, :, :, :), allocatable, intent(in), optional :: third
 
-    integer(kind=ENTIER) :: iface, il, ir, iv, k, n_fvert, n_qpts, q
+    integer(kind=ENTIER) :: iface, il, ir, n_fvert, n_qpts, q, qpos
     real(kind=DOUBLE), dimension(3) :: norm, xface
-    real(kind=DOUBLE), dimension(:, :), allocatable :: face_coords, qpts
-    real(kind=DOUBLE), dimension(:),    allocatable :: qwts
-    real(kind=DOUBLE), dimension(3, 1) :: qpts_single
-    real(kind=DOUBLE), dimension(1)    :: qwts_single
     real(kind=DOUBLE) :: qwt
     real(kind=DOUBLE), dimension(5) :: wL, wR, flux
     real(kind=DOUBLE) :: lambda, gL, gR, face_lambda_accum
     real(kind=DOUBLE) :: flux_rgm1, Gl_rgm1, Gr_rgm1
-    logical :: is_zface, use_face_quad
+    logical :: is_zface
+
+    call ensure_face_quad_cache(mesh)
 
     do iface = 1, mesh%n_faces
       il   = mesh%face(iface)%left_neigh
@@ -1093,38 +1271,13 @@ contains
       is_zface = boundary_2d .and. abs(abs(norm(3)) - 1.0_DOUBLE) < 1.0e-6_DOUBLE
       if (is_zface) cycle
 
-      ! Order 2 (affine reconstruction) is exact with a single centroid-point flux;
-      ! only order>=3 needs the multi-point face rule (see quadrature degree note below).
-      use_face_quad = order >= 3 .and. n_fvert > 0 .and. allocated(mesh%face(iface)%vert)
-
-      if (use_face_quad) then
-        allocate(face_coords(3, n_fvert))
-        do k = 1, n_fvert
-          iv = mesh%face(iface)%vert(k)
-          face_coords(:, k) = mesh%vert(iv)%coord
-        end do
-        ! order-1: reconstructed state has polynomial degree order-1, quadrature
-        ! degree must match that, not the solver's own convergence order.
-        call face_quad_pts(int(n_fvert, ENTIER), face_coords, &
-          int(order - 1, ENTIER), qpts, qwts)
-        deallocate(face_coords)
-        n_qpts = size(qwts)
-      else
-        ! Fixed-size local arrays, no alloc/dealloc: this is the hot path.
-        n_qpts = 1
-        qpts_single(:, 1) = mesh%face(iface)%coord
-        qwts_single(1)    = mesh%face(iface)%area
-      end if
+      n_qpts = face_quad_offset_cache(iface + 1) - face_quad_offset_cache(iface)
 
       face_lambda_accum = 0.0_DOUBLE
       do q = 1, n_qpts
-        if (use_face_quad) then
-          xface = qpts(:, q)
-          qwt   = qwts(q)
-        else
-          xface = qpts_single(:, q)
-          qwt   = qwts_single(q)
-        end if
+        qpos  = face_quad_offset_cache(iface) + q - 1
+        xface = face_quad_pts_cache(:, qpos)
+        qwt   = face_quad_wts_cache(qpos)
 
         wL = reconstruct(prim, grad, hess, il, xface, mesh%elem(il)%coord, gL, third)
         if (ir > 0) then
@@ -1184,8 +1337,6 @@ contains
           end if
         end if
       end if
-
-      if (use_face_quad) deallocate(qpts, qwts)
     end do
   end subroutine face_flux_loop
 
@@ -1286,14 +1437,15 @@ contains
     real(kind=DOUBLE), dimension(5) :: w
 
     real(kind=DOUBLE), dimension(3) :: dx
-    real(kind=DOUBLE), dimension(5) :: w_try, w_prev
+    real(kind=DOUBLE), dimension(5) :: w_try, w_prev, grad_term
     integer(kind=ENTIER) :: j, k, l
 
     dx = xq - xc
     w  = prim(:, i)
+    grad_term = matmul(grad(:, :, i), dx)
 
     if (order >= 2) then
-      w_try = w + matmul(grad(:, :, i), dx)
+      w_try = w + grad_term
       if (physical_state(w_try, w, g)) w = w_try
     end if
 
@@ -1302,10 +1454,18 @@ contains
         print *, 'FATAL: reconstruct() called at order>=3 without compute_cell_moments.'
         error stop 1
       end if
-      w_try = prim(:, i) + matmul(grad(:, :, i), dx)
+      ! Schwarz symmetry: dx(j)*dx(k) and cell_moment(j,k,i) both commute exactly in j,k (the
+      ! latter by construction -- see compute_cell_moments), so the off-diagonal (j,k) and (k,j)
+      ! terms of the original 3x3 sum share the same (dx(j)*dx(k) - cell_moment(j,k,i)) factor.
+      ! Summing hess(:,j,k,i)+hess(:,k,j,i) once and reusing that factor is EXACT algebra (not an
+      ! approximation assuming hess itself is perfectly symmetric) -- 6 vector terms instead of 9.
+      w_try = prim(:, i) + grad_term
       do j = 1, 3
-        do k = 1, 3
-          w_try = w_try + 0.5_DOUBLE * hess(:, j, k, i) &
+        w_try = w_try + 0.5_DOUBLE * hess(:, j, j, i) * (dx(j) * dx(j) - cell_moment(j, j, i))
+      end do
+      do j = 1, 2
+        do k = j + 1, 3
+          w_try = w_try + 0.5_DOUBLE * (hess(:, j, k, i) + hess(:, k, j, i)) &
             * (dx(j) * dx(k) - cell_moment(j, k, i))
         end do
       end do
@@ -1318,16 +1478,30 @@ contains
           print *, 'FATAL: reconstruct() called at order>=4 without cell_moment3 filled.'
           error stop 1
         end if
+        ! Same exact regrouping for the fully symmetric third-order term: dx(j)*dx(k)*dx(l) and
+        ! cell_moment3(j,k,l,i) commute in all 3 indices (again by construction), so the 27-term
+        ! sum collapses to 10 sorted-index groups, each summing third(:,.,.,.,i) over its distinct
+        ! permutations (1 for jjj, 3 for jjk, 6 for jkl) against one shared dx-moment factor.
         w_prev = w
         w_try = w_prev
         do j = 1, 3
+          w_try = w_try + (1.0_DOUBLE / 6.0_DOUBLE) * third(:, j, j, j, i) &
+            * (dx(j) * dx(j) * dx(j) - cell_moment3(j, j, j, i))
+        end do
+        do j = 1, 3
           do k = 1, 3
-            do l = 1, 3
-              w_try = w_try + (1.0_DOUBLE / 6.0_DOUBLE) * third(:, j, k, l, i) &
-                * (dx(j) * dx(k) * dx(l) - cell_moment3(j, k, l, i))
-            end do
+            if (j == k) cycle
+            ! (j,j,k) pattern: 3 permutations jjk, jkj, kjj.
+            w_try = w_try + (1.0_DOUBLE / 6.0_DOUBLE) &
+              * (third(:, j, j, k, i) + third(:, j, k, j, i) + third(:, k, j, j, i)) &
+              * (dx(j) * dx(j) * dx(k) - cell_moment3(j, j, k, i))
           end do
         end do
+        ! (1,2,3) pattern: all 6 permutations.
+        w_try = w_try + (1.0_DOUBLE / 6.0_DOUBLE) &
+          * (third(:, 1, 2, 3, i) + third(:, 1, 3, 2, i) + third(:, 2, 1, 3, i) &
+             + third(:, 2, 3, 1, i) + third(:, 3, 1, 2, i) + third(:, 3, 2, 1, i)) &
+          * (dx(1) * dx(2) * dx(3) - cell_moment3(1, 2, 3, i))
         if (physical_state(w_try, w_prev, g)) w = w_try
       end if
     end if
