@@ -50,6 +50,20 @@ module euler_ho_module
   ! first-order/constant state for that cell instead of extrapolating an unphysical one). See
   ! apply_positivity_kill. Off by default -- opt in per case.
   logical, public :: kill_recons              = .false.
+
+  ! Shock-alignment node movement folded into the time loop (see
+  ! shock_adapt_move_module). Off by default: a run with n_adapt_cycles = 0 is
+  ! bit-for-bit the old fixed-mesh behaviour. The cycles are spaced a fixed
+  ! number of ITERATIONS apart rather than waiting for a steady state, because
+  ! this case never reaches one -- the wake stays unsteady at these
+  ! resolutions, so "converged, then adapt" has no meaning here.
+  integer(kind=ENTIER), public :: n_adapt_cycles     = 0
+  integer(kind=ENTIER), public :: adapt_start_iter   = 2000
+  integer(kind=ENTIER), public :: adapt_interval_iter = 300
+  real(kind=DOUBLE), public :: adapt_grad_threshold  = 0.3_DOUBLE
+  real(kind=DOUBLE), public :: adapt_max_move_frac   = 0.4_DOUBLE
+  real(kind=DOUBLE), public :: adapt_relax           = 0.5_DOUBLE
+
   logical, public :: use_weno_blend           = .true.
   logical, public :: use_cweno_center          = .false.
   real(kind=DOUBLE), public :: cweno_center_weight = 1000.0_DOUBLE
@@ -81,6 +95,16 @@ module euler_ho_module
   integer(kind=ENTIER), save :: face_quad_cache_n_faces = -1
   integer(kind=ENTIER), save :: face_quad_cache_order = -1
 
+  ! Persistent buffers for aho_reconstruction's packed grad/hess/third arrays -- previously
+  ! allocated and deallocated fresh every single call (every RK stage; third_flat alone is
+  ! 135*n_elems*8 bytes, tens of MB on a real 3D mesh), a major and entirely avoidable source of
+  ! minor page faults (profiled: ~46 million over one run, System time comparable to User time).
+  ! order is a namelist constant for the whole run, so which of these are actually needed never
+  ! changes mid-run -- guarded on n_elems alone, same pattern as the WENO buffers in
+  ! arbitrary_high_order_module.
+  real(kind=DOUBLE), dimension(:, :), allocatable, save :: grad_flat_buf, hess_flat_buf, third_flat_buf
+  integer(kind=ENTIER), save :: aho_flat_buf_n_elems = -1
+
   integer(kind=ENTIER), public :: n_bc = 0
   character(len=255), dimension(MAX_BC), public :: bc_name = ''
   character(len=255), dimension(MAX_BC), public :: bc_type = ''
@@ -107,6 +131,7 @@ module euler_ho_module
   public :: sync_gamma_arr
   public :: compute_error_vortex
   public :: test_reconstruction_exactness
+  public :: invalidate_face_quad_cache
   public :: compute_cell_moments
   public :: reconstruct, ls_reconstruction, aho_reconstruction
   public :: setup_wall_mirror
@@ -193,7 +218,9 @@ contains
       use_cweno_center, cweno_center_weight, cweno_center_power, use_grad_bias_correction, use_rk4, &
       use_max_lambda_dt, flux_scheme, &
       eps_weight_num, eps_weight_num_deep, weno_power, grad_norm_derate, &
-      grad_norm_derate_gg, use_alt_gg_weight, eps_weight_num_gg, eps_weight_num_deep_gg
+      grad_norm_derate_gg, use_alt_gg_weight, eps_weight_num_gg, eps_weight_num_deep_gg, &
+      n_adapt_cycles, adapt_start_iter, adapt_interval_iter, &
+      adapt_grad_threshold, adapt_max_move_frac, adapt_relax
 
     open(newunit=funit, file=trim(adjustl(filename)))
     read(nml=INPUT_PARAM, unit=funit)
@@ -844,7 +871,6 @@ contains
     integer(kind=ENTIER), intent(in), optional :: num_procs
     type(mpi_send_recv_type), intent(inout), optional :: mpi_send_recv
 
-    real(kind=DOUBLE), dimension(:, :), allocatable :: grad_flat, hess_flat, third_flat
     integer(kind=ENTIER) :: e, v, dir1, dir2, dir3
     logical :: do_exchange
     real(kind=DOUBLE), dimension(:, :), allocatable :: hess_v, third_v
@@ -873,7 +899,19 @@ contains
     aho_module_eps_weight_num_gg = eps_weight_num_gg
     aho_module_eps_weight_num_deep_gg = eps_weight_num_deep_gg
 
-    allocate(grad_flat(15, mesh%n_elems))
+    if (aho_flat_buf_n_elems /= mesh%n_elems) then
+      if (allocated(grad_flat_buf)) deallocate(grad_flat_buf, hess_flat_buf, third_flat_buf)
+      ! Always sized to their full (order-4) extent regardless of the run's own order -- a fixed,
+      ! one-time ~50MB for a 32k-element mesh, trivial next to what it replaces (reallocating up
+      ! to the 135-row buffer fresh every RK stage).
+      allocate(grad_flat_buf(15, mesh%n_elems))
+      allocate(hess_flat_buf(45, mesh%n_elems))
+      allocate(third_flat_buf(135, mesh%n_elems))
+      aho_flat_buf_n_elems = mesh%n_elems
+    end if
+
+    associate (grad_flat => grad_flat_buf, hess_flat => hess_flat_buf, third_flat => third_flat_buf)
+
     allocate(grad_oi_v(mesh%n_vert))
     grad_oi_v = 0.0_DOUBLE
     if (use_cweno_center) then
@@ -892,7 +930,6 @@ contains
 
     ! grad_flat is unpacked into grad only after the order-4 bias correction below.
     if (order >= 3 .and. allocated(hess)) then
-      allocate(hess_flat(45, mesh%n_elems))
       if (use_cweno_center) then
         call compute_next_order_derivative_cweno(mesh, 3_ENTIER, 15_ENTIER, boundary_2d, &
           grad_flat, hess_flat)
@@ -927,7 +964,6 @@ contains
 
       if (order >= 4 .and. present(third)) then
         if (allocated(third)) then
-          allocate(third_flat(135, mesh%n_elems))
           if (use_cweno_center) then
             call compute_next_order_derivative_cweno(mesh, 3_ENTIER, 45_ENTIER, boundary_2d, &
               hess_flat, third_flat)
@@ -973,10 +1009,8 @@ contains
               end do
             end do
           end do
-          deallocate(third_flat)
         end if
       end if
-      deallocate(hess_flat)
     end if
 
     do e = 1, mesh%n_elems
@@ -989,12 +1023,12 @@ contains
 
     if (kill_recons) call apply_positivity_kill(mesh, prim, grad, hess, third)
 
-    deallocate(grad_flat)
     if (allocated(grad_oi_v)) deallocate(grad_oi_v)
     if (allocated(hess_v)) deallocate(hess_v)
     if (allocated(valid_hess_v)) deallocate(valid_hess_v)
     if (allocated(third_v)) deallocate(third_v)
     if (allocated(valid_third_v)) deallocate(valid_third_v)
+    end associate
   end subroutine aho_reconstruction
 
   ! kill_recons safety net: if the linear (grad-only) reconstruction predicts negative rho or p
@@ -1154,6 +1188,23 @@ contains
       x(ii) = x(ii) / aug(ii, ii)
     end do
   end subroutine gauss_solve
+
+  ! Forces the next ensure_face_quad_cache call to regenerate the quadrature
+  ! points from the current face geometry.
+  !
+  ! The cache is keyed on (n_faces, order), which assumes what the comment
+  ! below states: that face geometry never changes during a run. A solver that
+  ! MOVES nodes breaks that assumption without changing either key, so the
+  ! quadrature points stay frozen at their pre-move positions while the fluxes
+  ! keep being integrated on them. That silently destroys the solution at
+  ! order >= 2 (order 1 survives, since it never evaluates a reconstruction
+  ! away from the cell average). Call this after move_mesh/compute_geometry_mesh.
+  subroutine invalidate_face_quad_cache()
+    implicit none
+
+    face_quad_cache_n_faces = -1
+    face_quad_cache_order = -1
+  end subroutine invalidate_face_quad_cache
 
   ! Builds face_quad_pts_cache/face_quad_wts_cache/face_quad_offset_cache once per (mesh, order):
   ! face_flux_loop's order>=3 branch used to regenerate each face's quadrature rule from scratch

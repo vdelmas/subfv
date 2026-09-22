@@ -148,6 +148,22 @@ module arbitrary_high_order_module
   integer(kind=ENTIER), save :: cell_moment_cache_max_order = 0
   type(cell_moment_ptr_type), dimension(:), allocatable, save :: cell_moment_cache ! indexed 2:max_order
 
+  ! Persistent scratch buffers for compute_next_order_derivative's WENO-blend accumulation --
+  ! previously allocated and zeroed fresh on EVERY call (3x per RK stage: grad/hess/third, nc_out
+  ! up to 135), a real allocator + first-touch-page-fault cost on large meshes (profiled: memset
+  ! alone was ~9% of total runtime on a 6000-vertex tet mesh). Sized once to the largest nc_out
+  ! actually used (135, from third's nc_in=45, d=3) and reused via a (1:nc_out,:) slice --
+  ! assumed-shape dummies in accumulate_weno_contribution/scatter_weno_weighted/
+  ! rescue_zero_weight_cell accept that slice by descriptor, no copy.
+  integer(kind=ENTIER), parameter :: WENO_BUF_MAX_NC_OUT = 135
+  real(kind=DOUBLE), dimension(:, :), allocatable, save :: weno_num_buf
+  real(kind=DOUBLE), dimension(:), allocatable, save :: weno_den_buf
+  real(kind=DOUBLE), dimension(:, :), allocatable, save :: dphi_v_cache_buf
+  logical, dimension(:), allocatable, save :: valid_cache_buf
+  real(kind=DOUBLE), dimension(:), allocatable, save :: oi_cache_buf
+  integer(kind=ENTIER), save :: weno_buf_n_elems = -1
+  integer(kind=ENTIER), save :: weno_buf_n_vert = -1
+
   ! Discrete analogue of cell_moment_cache: mu_m^discrete(c) = average over the cell's own corner
   ! vertices of (x_v-x_c)^{tensor m}, for averaging a per-vertex SAMPLE (not a continuous field)
   ! over a cell's corners. See apply_discrete_vertex_moment_correction.
@@ -321,21 +337,35 @@ contains
     real(kind=DOUBLE), dimension(:), allocatable, intent(out), optional :: oi_v_out
 
     integer(kind=ENTIER) :: nc_out, id_vert, id_elem, deriv_order_eff
-    real(kind=DOUBLE), dimension(:, :), allocatable :: weno_num
-    real(kind=DOUBLE), dimension(:), allocatable :: weno_den
-    real(kind=DOUBLE), dimension(:, :), allocatable :: dphi_v_cache
-    logical, dimension(:), allocatable :: valid_cache
-    real(kind=DOUBLE), dimension(:), allocatable :: oi_cache
 
     nc_out = nc_in*d
     deriv_order_eff = 1
     if (present(deriv_order)) deriv_order_eff = deriv_order
 
-    allocate(weno_num(nc_out, mesh%n_elems))
-    allocate(weno_den(mesh%n_elems))
-    allocate(dphi_v_cache(nc_out, mesh%n_vert))
-    allocate(valid_cache(mesh%n_vert))
-    allocate(oi_cache(mesh%n_vert))
+    ! nc_out cycles through a small fixed set of values (15/45/135 for grad/hess/third) every RK
+    ! stage; resized once to the largest ever requested (135 in production; a test-only caller in
+    ! arbitrary_high_order_main.F90 could ask for more, hence the max() rather than a hardcoded
+    ! bound) and reused via a (1:nc_out,:) ASSOCIATE alias -- unlike POINTER association this adds
+    ! no indirection (the compiler substitutes the slice expression at compile time), so it avoids
+    ! both the allocate/deallocate/first-touch cost this used to pay every single call AND any
+    ! aliasing-analysis penalty a real pointer would add.
+    if (weno_buf_n_elems /= mesh%n_elems .or. weno_buf_n_vert /= mesh%n_vert &
+        .or. (allocated(weno_num_buf) .and. size(weno_num_buf, 1) < nc_out)) then
+      if (allocated(weno_num_buf)) then
+        deallocate(weno_num_buf, weno_den_buf, dphi_v_cache_buf, valid_cache_buf, oi_cache_buf)
+      end if
+      allocate(weno_num_buf(max(WENO_BUF_MAX_NC_OUT, nc_out), mesh%n_elems))
+      allocate(weno_den_buf(mesh%n_elems))
+      allocate(dphi_v_cache_buf(max(WENO_BUF_MAX_NC_OUT, nc_out), mesh%n_vert))
+      allocate(valid_cache_buf(mesh%n_vert))
+      allocate(oi_cache_buf(mesh%n_vert))
+      weno_buf_n_elems = mesh%n_elems
+      weno_buf_n_vert = mesh%n_vert
+    end if
+
+    associate (weno_num => weno_num_buf(1:nc_out, :), weno_den => weno_den_buf, &
+        dphi_v_cache => dphi_v_cache_buf(1:nc_out, :), valid_cache => valid_cache_buf, &
+        oi_cache => oi_cache_buf)
     weno_num = 0.0_DOUBLE
     weno_den = 0.0_DOUBLE
 
@@ -407,8 +437,7 @@ contains
       allocate(oi_v_out(mesh%n_vert))
       oi_v_out = oi_cache
     end if
-
-    deallocate(weno_num, weno_den, dphi_v_cache, valid_cache, oi_cache)
+    end associate
   end subroutine compute_next_order_derivative
 
   ! CWENO variant: also accumulates a linear (unweighted) num/den and a volume-weighted OI average, folded back with weight cweno_center_weight/(eps+OI_c**power) -- see use_cweno_center.
@@ -2001,7 +2030,6 @@ contains
 
     integer(kind=ENTIER) :: iv, j, id_elem, id_sub_elem, ic, i
     integer(kind=ENTIER) :: n_neigh, n_basis, n_cand
-    integer(kind=ENTIER), dimension(:), allocatable :: neigh
     real(kind=DOUBLE), dimension(4, 4) :: mat
     real(kind=DOUBLE), dimension(4, nc_in) :: rhs
     real(kind=DOUBLE), dimension(4) :: basis
@@ -2094,13 +2122,14 @@ contains
           Hyz(ic) = 0.5_DOUBLE*(hess_v(5*nc_in+ic, iv) + hess_v(7*nc_in+ic, iv))
         end do
 
+        ! Index neigh_cache_list directly instead of copying this vertex's neighbor slice into a
+        ! freshly allocate()'d local array every single vertex (n_vert allocate/deallocate cycles
+        ! per call, a real cost on a tet mesh where a vertex's neigh_by_vert stencil is large).
         n_neigh = neigh_cache_start(iv+1) - neigh_cache_start(iv)
-        allocate(neigh(n_neigh))
-        neigh = neigh_cache_list(neigh_cache_start(iv):neigh_cache_start(iv+1)-1)
         mat(1:n_basis, 1:n_basis) = 0.0_DOUBLE
         rhs(1:n_basis, :) = 0.0_DOUBLE
         do j = 1, n_neigh
-          id_elem = neigh(j)
+          id_elem = neigh_cache_list(neigh_cache_start(iv)+j-1)
           dx_v = mesh%elem(id_elem)%coord - mesh%vert(iv)%coord
           weight = 1.0_DOUBLE / max(dot_product(dx_v, dx_v), 1.0e-24_DOUBLE)
           dxx = dx_v(1); dyy = dx_v(2); dzz = dx_v(3)
@@ -2134,7 +2163,6 @@ contains
             rhs(1:n_basis, ic) = rhs(1:n_basis, ic) + weight*basis(1:n_basis)*moment_j(ic)
           end do
         end do
-        deallocate(neigh)
 
         call lu_factor_lapack(n_basis, mat(1:n_basis, 1:n_basis), ipiv(1:n_basis))
         call lu_solve_mat_lapack(n_basis, mat(1:n_basis, 1:n_basis), ipiv(1:n_basis), nc_in, rhs(1:n_basis, :))
