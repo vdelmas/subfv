@@ -74,6 +74,8 @@ module ns_global_data_module
   integer, parameter :: SCHEME_WIP                     = 7  ! "WIP"
   integer, parameter :: SCHEME_USI3D                   = 9  ! "USI3D"
   integer, parameter :: SCHEME_MULTI_POINT_VILAR       = 10 ! "multi_point_vilar"
+  integer, parameter :: SCHEME_WIP2                    = 11 ! "WIP2"
+  integer, parameter :: SCHEME_WIP2_NOLM               = 12 ! "WIP2_NOLM" (theta=1, reference)
   integer, parameter :: SCHEME_ZB                   = 42 ! "ZB_*_*"
   ! ZB advection sub-scheme IDs
   integer, parameter :: SCHEME_ADV_AR1D     = 1  ! "AR1D"
@@ -295,6 +297,10 @@ contains
       scheme_id = SCHEME_MULTI_POINT_VILAR
     else if (t == "WIP") then
       scheme_id = SCHEME_WIP
+    else if (t == "WIP2") then
+      scheme_id = SCHEME_WIP2
+    else if (t == "WIP2_NOLM") then
+      scheme_id = SCHEME_WIP2_NOLM
     else if (t == "USI3D") then
       scheme_id = SCHEME_USI3D
     else if (t(1:2) == "ZB") then

@@ -83,6 +83,18 @@ target_link_libraries(ale PUBLIC core)
 set_target_properties(ale PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mod/ale)
 target_include_directories(ale PUBLIC ${CMAKE_BINARY_DIR}/mod/ale)
 
+# ── Shock-adaptive node-movement library ──────────────────────────────────────
+# Self-contained (own first-order face-loop Euler solver + 2-state Riemann
+# fluxes, own copy, no dependency on ns/euler_ho/ale): minimal, local node
+# movement near a detected shock, X-Mesh-style. Only links core.
+add_library(shock_adapt STATIC
+  src/shock_adapt/shock_adapt_global_data_module.F90
+  src/shock_adapt/shock_adapt_module.F90
+)
+target_link_libraries(shock_adapt PUBLIC core)
+set_target_properties(shock_adapt PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mod/shock_adapt)
+target_include_directories(shock_adapt PUBLIC ${CMAKE_BINARY_DIR}/mod/shock_adapt)
+
 # ── High-order Euler library ──────────────────────────────────────────────────
 add_library(euler_ho STATIC
   src/euler_ho/euler_ho_module.F90
@@ -104,6 +116,11 @@ target_include_directories(arbitrary_high_order PUBLIC ${CMAKE_BINARY_DIR}/mod/a
 # comparison against its own ls_reconstruction.
 target_link_libraries(euler_ho PUBLIC arbitrary_high_order)
 
+# shock_adapt reuses arbitrary_high_order_module's Green-Gauss reconstruction
+# for its own optional order=2 mode (still only pulls in core transitively,
+# so shock_adapt's independence from ns/lagrange/euler_ho is preserved).
+target_link_libraries(shock_adapt PUBLIC arbitrary_high_order)
+
 # ── Exécutables ───────────────────────────────────────────────────────────────
 add_executable(subfvns           src/ns/ns_main.F90)
 add_executable(subfvshear        src/shear/shear_main.F90)
@@ -114,6 +131,7 @@ add_executable(subfvrbf          src/rbf/rbf_main.F90)
 add_executable(subfveulerho      src/euler_ho/euler_ho_main.F90)
 add_executable(subfvahotest      src/arbitrary_high_order/arbitrary_high_order_main.F90)
 add_executable(subfvale          src/ale/ale_main.F90)
+add_executable(subfvshockadapt   src/shock_adapt/shock_adapt_main.F90)
 
 target_link_libraries(subfvns          ns)
 target_link_libraries(subfvshear       ns)
@@ -124,8 +142,9 @@ target_link_libraries(subfvrbf         rbf)
 target_link_libraries(subfveulerho     euler_ho)
 target_link_libraries(subfvahotest     arbitrary_high_order)
 target_link_libraries(subfvale         ale)
+target_link_libraries(subfvshockadapt  shock_adapt)
 
-install(TARGETS subfvns subfvshear subfvacoustic subfvlagrange subfvgreshoconv subfvrbf subfvale
+install(TARGETS subfvns subfvshear subfvacoustic subfvlagrange subfvgreshoconv subfvrbf subfvale subfvshockadapt
   RUNTIME DESTINATION bin
 )
 

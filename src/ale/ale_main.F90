@@ -62,6 +62,17 @@ program main
   real(kind=DOUBLE), dimension(3) :: piston_vel, no_tmp
   logical :: has_air, has_bub, is_bubble_iface, is_piston_vert, has_lateral_bound_face
   integer(kind=ENTIER) :: wall_dir
+  ! Exact axis-aligned unit normals, keyed by wall_dir (1=+x,2=-x,3=+y,4=-y):
+  ! the raw sub-face normal computed from mesh geometry is only numerically
+  ! close to axis-aligned (mesh generation/geometry round-off), and using it
+  ! as-is for a sliding wall's RBF constraint leaves a small residual
+  ! velocity component perpendicular to the wall instead of exactly zero.
+  ! Snapping to the exact axis vector (once we already know which wall this
+  ! is, from the same classification used for the wall_stride counters)
+  ! removes that residual.
+  real(kind=DOUBLE), dimension(3, 4), parameter :: axis_normal = reshape( &
+    [1.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, -1.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, &
+     0.0_DOUBLE, 1.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, -1.0_DOUBLE, 0.0_DOUBLE], [3, 4])
 
   call MPI_INIT(mpi_ierr)
   call MPI_COMM_SIZE(MPI_COMM_WORLD, num_procs, mpi_ierr)
@@ -246,7 +257,7 @@ program main
         if (has_lateral_bound_face) then
           k = k + 1
           imp_vert(k) = i
-          no_rbf(:, k) = no_tmp
+          no_rbf(:, k) = axis_normal(:, wall_dir)
           ! delta_imp stays 0 here: a static wall's sliding value along its
           ! normal.
         end if
@@ -309,6 +320,17 @@ program main
       do j = nimp_bubble + 1, nimp
         wp(:, imp_vert(j)) = piston_vel
       end do
+      ! Sliding wall points: the RBF fit only *targets* zero velocity along
+      ! the local normal (delta_imp=0 there), it doesn't guarantee it
+      ! exactly at every evaluation -- CG tolerance and the interpolation
+      ! itself leave a small residual normal-component velocity, which
+      ! integrates into the node slowly drifting off the wall over many
+      ! timesteps. Project it out explicitly so these nodes are mathematically
+      ! guaranteed to stay exactly on their wall.
+      do j = nimp + 1, n_rbf
+        wp(:, imp_vert(j)) = wp(:, imp_vert(j)) &
+          - dot_product(wp(:, imp_vert(j)), no_rbf(:, j))*no_rbf(:, j)
+      end do
     else
       print*, "Unknown ale_grid_velocity: '", trim(ale_grid_velocity), "'"
       error stop
@@ -324,6 +346,17 @@ program main
 
     call compute_rhs_ale(mesh, sol, gamma_arr, wp, rhs, sum_lambda, vp)
     call compute_dt_ale(mesh, sum_lambda, cfl, dt)
+    ! A crushed (zero/negative-volume) cell eventually turns dt into NaN
+    ! (0/0 or a negative sound speed upstream); left unchecked, "t < tmax"
+    ! with a NaN t is simply false in IEEE754, so the loop below would exit
+    ! silently with a clean "success" exit code and a NaN-filled final vtu,
+    ! looking exactly like a normal completion at a much later time. Fail
+    ! loudly instead (observed once, coarse mesh, tmax=1.0, t~0.91: dt
+    ! collapsed smoothly for ~2000 iterations then finally hit exactly 0).
+    if (dt /= dt .or. dt <= 0.0_DOUBLE) then
+      print*, "[-] ale_main: invalid dt at iter=", iter, "t=", t, "dt=", dt
+      error stop
+    end if
     if (t + dt > tmax) dt = tmax - t
 
     do i = 1, mesh%n_elems

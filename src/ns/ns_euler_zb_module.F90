@@ -2910,6 +2910,178 @@ contains
     end do
   end subroutine compute_rhs_around_vert_WIP
 
+  ! WIP2: nodal pressure built from the per-sub-face acoustic solver (as in LPF,
+  ! which measured ~450x lower low-Mach floor than the one-sided LPP form because
+  ! its energy-flux velocity is symmetric, hence conservative), with the velocity
+  ! jump scaled by theta = min(1, Ma_node).
+  !
+  ! The jump term -theta*(vnr-vnl) is the "divv" contribution: it is what couples
+  ! the multi-D velocity field into the nodal pressure (and what keeps the Gresho
+  ! vortex alive on quads), but unscaled it is O(Ma) relative to p, one power short
+  ! of the incompressible limit -- the measured consequence is the L2_rho floor.
+  ! Scaling it by Ma restores O(Ma^2) while leaving theta=1 (i.e. the unmodified
+  ! acoustic solver) everywhere the flow is transonic or faster.
+  ! The pressure jump inside vstar is deliberately NOT scaled: it carries the
+  ! pressure/velocity coupling that the low-Mach limit needs.
+  subroutine compute_rhs_around_vert_WIP2(mesh, sol, grad, &
+      nsen, flux_sum_vert, sum_lambda_vert, &
+      id_vert, second_order, low_mach)
+    use ns_global_data_module, only: boundary_2d
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(:, :, :), intent(in) :: grad
+    integer(kind=ENTIER), intent(in) :: nsen
+    real(kind=DOUBLE), dimension(nsen), intent(inout) :: sum_lambda_vert
+    real(kind=DOUBLE), dimension(5, nsen), intent(inout) :: flux_sum_vert
+    integer(kind=ENTIER), intent(in) :: id_vert
+    logical, intent(in) :: second_order
+    logical, intent(in) :: low_mach
+
+    integer(kind=ENTIER) :: j, id_sub_face, id_sub_elem, id_elem
+    integer(kind=ENTIER) :: le, re, lse, rse, lse_loc, rse_loc
+    real(kind=DOUBLE), dimension(3) :: norm, v_p
+
+    real(kind=DOUBLE) :: pp, pbar_f, denomsum, weight, invlamb
+    real(kind=DOUBLE) :: lambda_l, lambda_r, lambda_lts
+    real(kind=DOUBLE) :: rhol, rhor, pl, pr, vnl, vnr, al, ar
+    real(kind=DOUBLE) :: a_p, ma_node, theta, corr, vstar
+    real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, sol_w
+    real(kind=DOUBLE), dimension(5) :: sol_l, sol_r, sol_m
+    real(kind=DOUBLE), dimension(5) :: ff_lag, ff_adv, fminus, fplus
+
+    rse_loc = 0
+
+    ! nodal Mach number (volume-weighted), drives the low-Mach scaling
+    a_p = 0.0_DOUBLE
+    v_p = 0.0_DOUBLE
+    do j = 1, mesh%vert(id_vert)%n_sub_elems_neigh
+      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
+      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+      sol_w = conserv_to_primit(sol(:, id_elem))
+      a_p = a_p + mesh%sub_elem(id_sub_elem)%volume * sound_speed_w(sol_w)
+      v_p = v_p + mesh%sub_elem(id_sub_elem)%volume * sol_w(2:4)
+    end do
+    a_p = a_p / mesh%vert(id_vert)%volume
+    v_p = v_p / mesh%vert(id_vert)%volume
+    ma_node = norm2(v_p) / a_p
+
+    if (low_mach) then
+      theta = min(1.0_DOUBLE, ma_node)
+    else
+      theta = 1.0_DOUBLE
+    end if
+
+    ! carbuncle / shock sensor, same as WIP
+    call compute_corr_ducros(mesh, id_vert, sol, grad, corr, second_order)
+
+    ! --- nodal pressure with the Mach-scaled velocity-jump (divv) term ---
+    pp = 0.0_DOUBLE
+    denomsum = 0.0_DOUBLE
+    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
+      norm = mesh%sub_face(id_sub_face)%norm
+
+      call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
+        second_order, sol_w_l, sol_w_r)
+
+      rhol = sol_w_l(1)
+      vnl = dot_product(sol_w_l(2:4), norm)
+      pl = sol_w_l(5)
+      al = sound_speed_w(sol_w_l)
+
+      rhor = sol_w_r(1)
+      vnr = dot_product(sol_w_r(2:4), norm)
+      pr = sol_w_r(5)
+      ar = sound_speed_w(sol_w_r)
+
+      lambda_l = max(al*rhol, sqrt(rhol*max(0.0_DOUBLE, pr - pl)), -rhol*(vnr - vnl))
+      lambda_r = max(ar*rhor, sqrt(rhor*max(0.0_DOUBLE, pl - pr)), -rhor*(vnr - vnl))
+
+      invlamb = 1.0_DOUBLE/lambda_l + 1.0_DOUBLE/lambda_r
+      pbar_f = (pl/lambda_l + pr/lambda_r - theta*(vnr - vnl))/invlamb
+
+      weight = mesh%sub_face(id_sub_face)%area*invlamb
+      if (re <= 0) weight = 0.5_DOUBLE*weight
+      pp = pp + weight*pbar_f
+      denomsum = denomsum + weight
+    end do
+    pp = pp / denomsum
+
+    ! --- flux assembly ---
+    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
+      lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
+      lse_loc = mesh%sub_elem(lse)%id_loc_around_node
+      rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
+      if (rse > 0) then
+        rse_loc = mesh%sub_elem(rse)%id_loc_around_node
+      end if
+      norm = mesh%sub_face(id_sub_face)%norm
+
+      call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
+        second_order, sol_w_l, sol_w_r)
+
+      sol_l = primit_to_conserv(sol_w_l)
+      rhol = sol_w_l(1)
+      vnl = dot_product(sol_w_l(2:4), norm)
+      pl = sol_w_l(5)
+      al = sound_speed_w(sol_w_l)
+
+      sol_r = primit_to_conserv(sol_w_r)
+      rhor = sol_w_r(1)
+      vnr = dot_product(sol_w_r(2:4), norm)
+      pr = sol_w_r(5)
+      ar = sound_speed_w(sol_w_r)
+
+      lambda_l = max(al*rhol, sqrt(rhol*max(0.0_DOUBLE, pr - pl)), -rhol*(vnr - vnl))
+      lambda_r = max(ar*rhor, sqrt(rhor*max(0.0_DOUBLE, pl - pr)), -rhor*(vnr - vnl))
+
+      ! symmetric, impedance-weighted interface velocity (conservative: fplus=fminus)
+      vstar = (lambda_l*vnl + lambda_r*vnr - (pr - pl))/(lambda_l + lambda_r)
+
+      sol_m = 0.5_DOUBLE*(sol_r + sol_l)
+
+      ff_lag(1) = 0.0_DOUBLE
+      ff_lag(2:4) = pp * norm
+      ff_lag(5) = pp * vstar
+
+      ff_adv = vstar*sol_m - 0.5_DOUBLE*(abs(vstar) + corr)*(sol_r - sol_l)
+
+      fminus = ff_adv + ff_lag
+      fplus = fminus
+
+      if (boundary_2d &
+        .and. abs(mesh%sub_face(id_sub_face)%norm(3)) > 1e-3) then
+        fminus = 0.0_DOUBLE
+        fplus = 0.0_DOUBLE
+      end if
+
+      lambda_lts = max(abs(vnl), abs(vnr)) + max(al, ar)
+
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
+          + mesh%sub_face(id_sub_face)%area*lambda_lts
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) &
+          + mesh%sub_face(id_sub_face)%area*fminus
+
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+            + mesh%sub_face(id_sub_face)%area*lambda_lts
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) &
+            - mesh%sub_face(id_sub_face)%area*fplus
+        end if
+        end if
+      end if
+    end do
+  end subroutine compute_rhs_around_vert_WIP2
+
   subroutine compute_rhs_around_vert_usi3d(mesh, sol, grad, &
       nsen, flux_sum_vert, sum_lambda_vert, &
       id_vert, vp, h_p, second_order)
