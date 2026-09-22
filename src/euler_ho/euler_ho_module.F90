@@ -275,6 +275,9 @@ contains
     ! Triple-point shock interaction (init=7), canonical three-material setup.
     real(kind=DOUBLE), parameter :: x_tp      = 1.0_DOUBLE
     real(kind=DOUBLE), parameter :: y_tp      = 1.5_DOUBLE
+    ! Lax-Liu 2D Riemann: the point where the four quadrants meet.
+    real(kind=DOUBLE), parameter :: x_r2d     = 0.8_DOUBLE
+    real(kind=DOUBLE), parameter :: y_r2d     = 0.8_DOUBLE
     real(kind=DOUBLE), parameter :: gamma_tp1 = 1.5_DOUBLE
     real(kind=DOUBLE), parameter :: gamma_tp2 = 1.4_DOUBLE
     real(kind=DOUBLE), parameter :: gamma_tp3 = 1.5_DOUBLE
@@ -330,6 +333,26 @@ contains
         else
           gamma_arr(i) = gamma_tp3
           w = [0.125_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 0.1_DOUBLE]
+        end if
+      case (8)
+        ! 2D Riemann problem, Lax-Liu configuration 3, on [0,1]^2 with the
+        ! four constant states meeting at (x_r2d, y_r2d) = (0.8, 0.8) and
+        ! transmissive boundaries. Each pair of adjacent quadrants is a pure
+        ! 1D Riemann problem producing a left-facing shock; the four shocks
+        ! collide near the centre and drive a mushroom-shaped jet down the
+        ! diagonal, whose slip lines roll up into Kelvin-Helmholtz vortices.
+        ! Those roll-ups are the point of the case: they are absent at first
+        ! order and only emerge as the reconstruction order rises, so the
+        ! same mesh and the same time give a direct visual read on the
+        ! scheme's resolving power. Run to tmax=0.8.
+        if (xc(1) > x_r2d .and. xc(2) > y_r2d) then
+          w = [1.5_DOUBLE,    0.0_DOUBLE,   0.0_DOUBLE,   0.0_DOUBLE, 1.5_DOUBLE]
+        else if (xc(1) <= x_r2d .and. xc(2) > y_r2d) then
+          w = [0.5323_DOUBLE, 1.206_DOUBLE, 0.0_DOUBLE,   0.0_DOUBLE, 0.3_DOUBLE]
+        else if (xc(1) <= x_r2d .and. xc(2) <= y_r2d) then
+          w = [0.138_DOUBLE,  1.206_DOUBLE, 1.206_DOUBLE, 0.0_DOUBLE, 0.029_DOUBLE]
+        else
+          w = [0.5323_DOUBLE, 0.0_DOUBLE,   1.206_DOUBLE, 0.0_DOUBLE, 0.3_DOUBLE]
         end if
       case default
         w = sol_uniform

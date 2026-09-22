@@ -83,6 +83,18 @@ target_link_libraries(ale PUBLIC core)
 set_target_properties(ale PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mod/ale)
 target_include_directories(ale PUBLIC ${CMAKE_BINARY_DIR}/mod/ale)
 
+# ── Shared node-movement algorithm ────────────────────────────────────────────
+# The shock-alignment node movement itself, with no solver state in it: both
+# the standalone shock_adapt solver and euler_ho drive it, so it lives on its
+# own rather than being duplicated (the curvature fit and the MPI vertex
+# exchange are subtle enough that two copies would drift apart).
+add_library(shock_adapt_move STATIC
+  src/shock_adapt/shock_adapt_move_module.F90
+)
+target_link_libraries(shock_adapt_move PUBLIC core)
+set_target_properties(shock_adapt_move PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mod/shock_adapt_move)
+target_include_directories(shock_adapt_move PUBLIC ${CMAKE_BINARY_DIR}/mod/shock_adapt_move)
+
 # ── Shock-adaptive node-movement library ──────────────────────────────────────
 # Self-contained (own first-order face-loop Euler solver + 2-state Riemann
 # fluxes, own copy, no dependency on ns/euler_ho/ale): minimal, local node
@@ -91,7 +103,7 @@ add_library(shock_adapt STATIC
   src/shock_adapt/shock_adapt_global_data_module.F90
   src/shock_adapt/shock_adapt_module.F90
 )
-target_link_libraries(shock_adapt PUBLIC core)
+target_link_libraries(shock_adapt PUBLIC core shock_adapt_move)
 set_target_properties(shock_adapt PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mod/shock_adapt)
 target_include_directories(shock_adapt PUBLIC ${CMAKE_BINARY_DIR}/mod/shock_adapt)
 
@@ -115,6 +127,9 @@ target_include_directories(arbitrary_high_order PUBLIC ${CMAKE_BINARY_DIR}/mod/a
 # arbitrary_high_order_module (use_aho_reconstruction), for a like-for-like
 # comparison against its own ls_reconstruction.
 target_link_libraries(euler_ho PUBLIC arbitrary_high_order)
+
+# euler_ho can fold shock-alignment node movement into its time loop.
+target_link_libraries(euler_ho PUBLIC shock_adapt_move)
 
 # shock_adapt reuses arbitrary_high_order_module's Green-Gauss reconstruction
 # for its own optional order=2 mode (still only pulls in core transitively,

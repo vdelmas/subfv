@@ -22,7 +22,8 @@ program euler_ho_main
   real(kind=DOUBLE), allocatable :: k1(:, :), k2(:, :), k3(:, :), k4(:, :)
   real(kind=DOUBLE), allocatable :: sum_lambda(:)
   real(kind=DOUBLE) :: t, dt, h_err, l2err
-  integer(kind=ENTIER) :: iter, i_sol_vtu
+  real(kind=DOUBLE), allocatable :: adapt_orig_scale(:), adapt_cum_disp(:, :)
+  integer(kind=ENTIER) :: iter, i_sol_vtu, nan_local
   character(len=255) :: input_file
 
   call MPI_INIT(mpi_ierr)
@@ -143,6 +144,26 @@ program euler_ho_main
 
     if (me == 0 .and. mod(iter, 100) == 0) print *, "iter=", iter, "t=", t, "dt=", dt
 
+    ! A diverged run used to march to tmax and exit 0, so a NaN solution looked
+    ! like a success in the logs and only showed up as a blank figure.
+    !
+    ! Test the SOLUTION, not dt: compute_dt takes a min over cells, and
+    ! gfortran's min returns the non-NaN operand, so NaN cells are silently
+    ! skipped and dt stays finite all the way to tmax. Guarding on dt looked
+    ! right and caught nothing.
+    if (mod(iter, 50) == 0) then
+      nan_local = 0
+      if (any(sol /= sol)) nan_local = 1
+      call MPI_ALLREDUCE(MPI_IN_PLACE, nan_local, 1, MPI_INTEGER8, MPI_MAX, &
+        MPI_COMM_WORLD, mpi_ierr)
+      if (nan_local /= 0) then
+        if (me == 0) print *, "[-] solution contains NaN at iter", iter, " -- diverged"
+        call MPI_ABORT(MPI_COMM_WORLD, 2, mpi_ierr)
+      end if
+    end if
+
+    call maybe_adapt_mesh()
+
     if (n_sol_vtu > 1) then
       if (t >= real(i_sol_vtu, DOUBLE) * tmax / real(n_sol_vtu - 1, DOUBLE)) then
         call write_vtu(mesh, sol, me, i_sol_vtu)
@@ -164,6 +185,86 @@ program euler_ho_main
   call MPI_FINALIZE(mpi_ierr)
 
 contains
+
+  ! One shock-alignment node-movement cycle, if this iteration is due for one.
+  !
+  ! Cycles are triggered on iteration count, not on a residual: this case has
+  ! an unsteady wake and never settles, so there is no steady state to wait
+  ! for. The flow only needs to be roughly established (adapt_start_iter)
+  ! before the density gradient marks a meaningful front.
+  subroutine maybe_adapt_mesh()
+    use shock_adapt_move_module, only: compute_shock_sensor_grad_rho, &
+      build_vert_adjacency, compute_node_displacement_curvature, move_mesh, &
+      min_elem_volume, mpi_memory_exchange_vert, compute_local_scale
+    use arbitrary_high_order_module, only: invalidate_geometry_caches
+    implicit none
+
+    integer(kind=ENTIER) :: n_done, n_moved, n_moved_tot, i
+    real(kind=DOUBLE) :: max_disp, max_disp_tot, vmin
+    real(kind=DOUBLE), allocatable :: rho(:), node_sensor(:), disp(:, :)
+    logical, allocatable :: node_flagged(:)
+    integer(kind=ENTIER), allocatable :: n_neigh(:), vneigh(:, :)
+
+    if (n_adapt_cycles <= 0) return
+    if (iter < adapt_start_iter) return
+    n_done = (iter - adapt_start_iter)/adapt_interval_iter
+    if (n_done >= n_adapt_cycles) return
+    if (mod(iter - adapt_start_iter, adapt_interval_iter) /= 0) return
+
+    allocate(rho(mesh%n_elems), node_sensor(mesh%n_vert))
+    allocate(node_flagged(mesh%n_vert), disp(3, mesh%n_vert))
+    allocate(n_neigh(mesh%n_vert), vneigh(16, mesh%n_vert))
+
+    do i = 1, mesh%n_elems
+      rho(i) = sol(1, i)
+    end do
+
+    call compute_shock_sensor_grad_rho(mesh, rho, adapt_grad_threshold, node_sensor, node_flagged)
+    call build_vert_adjacency(mesh, n_neigh, vneigh)
+    ! Freeze the pre-movement length scale on the first cycle: the cumulative
+    ! cap must be measured against the mesh we started from, not the one the
+    ! previous cycles already compressed.
+    if (.not. allocated(adapt_orig_scale)) then
+      allocate(adapt_orig_scale(mesh%n_vert), adapt_cum_disp(3, mesh%n_vert))
+      call compute_local_scale(mesh, adapt_orig_scale)
+      adapt_cum_disp = 0.0_DOUBLE
+    end if
+
+    call compute_node_displacement_curvature(mesh, node_flagged, n_neigh, vneigh, &
+      adapt_max_move_frac, adapt_relax, disp, n_moved, max_disp, &
+      adapt_orig_scale, adapt_cum_disp)
+    call move_mesh(mesh, disp)
+
+    ! A vertex on a partition cut is is_ghost=.false. on BOTH ranks sharing it,
+    ! so each computed its own displacement from its own side's stencil; the
+    ! exchange averages them so the two sides agree on one position.
+    if (num_procs > 1) call mpi_memory_exchange_vert(mesh, mpi_send_recv)
+
+    call compute_geometry_mesh(mesh, .true., boundary_2d)
+    ! Every geometry cache is keyed on a size (n_vert/n_elems/n_faces) that a
+    ! move does not change, so without these two the reconstruction and the
+    ! face quadrature silently keep using the pre-move geometry.
+    call invalidate_geometry_caches()
+    call invalidate_face_quad_cache()
+    if (order >= 3) call compute_cell_moments(mesh)
+
+    vmin = min_elem_volume(mesh)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, vmin, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
+    n_moved_tot = n_moved
+    call MPI_ALLREDUCE(MPI_IN_PLACE, n_moved_tot, 1, MPI_INTEGER8, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+    max_disp_tot = max_disp
+    call MPI_ALLREDUCE(MPI_IN_PLACE, max_disp_tot, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD, mpi_ierr)
+
+    if (me == 0) print *, "[adapt] cycle", n_done + 1, "iter=", iter, "t=", t, &
+      "moved=", n_moved_tot, "max_disp=", max_disp_tot, "min_vol=", vmin
+
+    if (vmin <= 0.0_DOUBLE) then
+      if (me == 0) print *, "[-] adapt produced a non-positive cell volume, stopping"
+      call MPI_ABORT(MPI_COMM_WORLD, 1, mpi_ierr)
+    end if
+
+    deallocate(rho, node_sensor, node_flagged, disp, n_neigh, vneigh)
+  end subroutine maybe_adapt_mesh
 
   subroutine write_vtu(mesh, sol, me, idx)
     use euler_ho_module, only: compute_prim, gamma_arr, boundary_2d
