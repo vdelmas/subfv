@@ -1,4 +1,4 @@
-module silvia_module
+module silvia_base_module
   use precision_module
   use mesh_module
   use quadrature_module
@@ -124,6 +124,7 @@ module silvia_module
   logical :: init_gresho = .FALSE.
   logical :: init_potential_flow_2d = .FALSE.
   logical :: init_potential_flow_3d = .FALSE.
+  logical :: compute_error = .FALSE.
   logical :: error_2d = .FALSE.
   real(kind=DOUBLE) :: error_2d_h = 0.025_DOUBLE
   logical :: thermal_couette = .false. !Computes error
@@ -188,6 +189,8 @@ module silvia_module
   public :: primit_to_conserv
   public :: conserv_to_primit
   public :: print_bcs
+  public :: count_elems
+  public :: face_geometry
 
   ! Cache of each cell's own second geometric moment about its centroid,
   ! M_jk(i) = (1/V_i) * int_cell (x_j - xc_j)(x_k - xc_k) dV -- a pure
@@ -231,7 +234,8 @@ contains
       init_double_mach, &
       init_triple_point, &
       init_1drp, sol_w_1drp_l, sol_w_1drp_r, x1drp, &
-      error_2d, error_2d_h, &
+      compute_error, error_2d, error_2d_h, &
+      n_iter_write_sol, &
       init_restart, restart_file, id_vtk_restart, &
       compute_coeffs, pinf, rhoinf, vinf, coeffs_surf, &
       plot_solution_dat, &
@@ -336,39 +340,6 @@ contains
     w(5) = w(1)**gamma
   end subroutine sol_isentropic_vortex
 
-  ! subroutine compute_error_isentropic(mesh, sol, t)
-  !   use ns_global_data_module, only: error_2d, error_2d_h
-  !   use ns_euler_primitives_module, only: conserv_to_primit
-  !   implicit none
-
-  !   type(mesh_type), intent(in) :: mesh
-  !   real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
-  !   real(kind=DOUBLE), intent(in) :: t
-
-  !   integer(kind=ENTIER) :: i
-  !   real(kind=DOUBLE) :: error, volume
-  !   real(kind=DOUBLE), dimension(5) :: wexact, wsol
-
-  !   error = 0.0_DOUBLE
-  !   volume = 0.0_DOUBLE
-  !   do i = 1, mesh%n_elems
-  !     if (abs(mesh%elem(i)%coord(1)) < 3.0_DOUBLE &
-  !       .and. abs(mesh%elem(i)%coord(2)) < 3.0_DOUBLE &
-  !       .and. abs(mesh%elem(i)%coord(3)) < 3.0_DOUBLE) then
-  !       call sol_isentropic_vortex(mesh%elem(i)%coord, wexact, t)
-  !       wsol = conserv_to_primit(sol(:, i))
-  !       error = error + mesh%elem(i)%volume*(wsol(1) - wexact(1))**2
-  !       volume = volume + mesh%elem(i)%volume
-  !     end if
-  !   end do
-
-  !   if (error_2d) then
-  !     print *, "Error Vortex: ", sqrt((volume/error_2d_h)/mesh%n_elems), sqrt(error)
-  !   else
-  !     print *, "Error Vortex: ", (volume/mesh%n_elems)**(1.0_DOUBLE/3.0_DOUBLE), sqrt(error)
-  !   end if
-  ! end subroutine compute_error_isentropic
-
   subroutine init_sol(mesh, sol)
     type(mesh_type), intent(in)    :: mesh
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(out) :: sol
@@ -399,7 +370,7 @@ contains
       end do
     else if (init_gresho) then
       do i = 1, mesh%n_elems
-        call sol_gresho_mach(mesh%elem(i)%coord, w, 1.0e-5_DOUBLE)
+        call sol_gresho_mach(mesh%elem(i)%coord, w, 1.0_DOUBLE)
         sol(:, i) = primit_to_conserv(w)
       end do
     end if
@@ -413,8 +384,9 @@ contains
 
     dt = huge(1.0_DOUBLE)
     do i = 1, mesh%n_elems
-      if (.not. mesh%elem(i)%is_ghost .and. sum_lambda(i) > 0.0_DOUBLE) then
+      if (.not. mesh%elem(i)%is_ghost .and. sum_lambda(i) > 0.0_DOUBLE) then 
         dt_i = cfl * mesh%elem(i)%volume / sum_lambda(i)
+        ! print*, 'elem=', i, 'sum_lambda=', sum_lambda(i), 'dt_i=',dt_i
         dt = min(dt, dt_i)
       end if
     end do
@@ -494,14 +466,13 @@ contains
         wL = prim(:, il)
         if (ir > 0) then
           wR = prim(:, ir)
-          if (mesh%elem(ir)%is_ghost) then
-            print*, 'found ghost!'
-          end if
+          ! if (mesh%elem(ir)%is_ghost) then
+          !   print*, 'found ghost!'
+          ! end if
         else
           ! Boundary: reconstruct left then apply BC
           ! here is outflowsupersonic
           wR = wL
-          
           !wR = ghost_prim(xface, norm, wL, -ir, t)
         end if
 
@@ -515,19 +486,11 @@ contains
         ! flux = two_wave_flux(wL, wR, norm) * qwts(q)
         flux = rusanov(wL, wR, norm) * qwts(q)
         
-        do iloop = 1,5
-          if (abs(flux(iloop))>1e10) then
-            print*, 'face between ', iL, 'and ', iR, '- flux=',flux
-            print*, 'centers are', mesh%elem(il)%coord, ' and', mesh%elem(ir)%coord 
-            print*, 'face coords', mesh%face(iface)%coord
-            exit
-          end if
-        end do
-        ! case default
-        !   flux = rusanov(wL, wR, norm) * qwts(q)
-        ! end select
         lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
                      abs(dot_product(wR(2:4), norm)) + cs(wR)) * qwts(q)
+
+        ! print*, 'q=', q, 'qwts(q)=', qwts(q), 'lam=', lambda
+        ! print*, 'rho=', wL(1), 'u=', wL(2:4), 'p=', wL(5), 'cs=', cs(wL)
 
         rhs(:, il)  = rhs(:, il)  - flux
         sum_lambda(il) = sum_lambda(il) + lambda
@@ -540,6 +503,25 @@ contains
       deallocate(qpts, qwts)
     end do
   end subroutine face_flux_loop
+
+  subroutine face_geometry(mesh)
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER) :: iface, il, ir
+    real(kind=DOUBLE), dimension(3) :: norm
+    real(kind=DOUBLE) :: area, nabs
+  
+    do iface = 1, mesh%n_faces
+      il   = mesh%face(iface)%left_neigh
+      ir   = mesh%face(iface)%right_neigh
+      ! Skip ghost-owned faces
+      if (mesh%elem(il)%is_ghost) cycle
+
+      norm = mesh%face(iface)%norm
+      nabs = sqrt(norm(1)**2+norm(2)**2+norm(3)**2)
+      area = mesh%face(iface)%area
+      print*, 'face area=', area, 'norm abs=', nabs
+    end do
+  end subroutine face_geometry
 
   ! Ghost cell primitive state for boundary condition
   ! function ghost_prim(xf, norm, wL, id_bc, t) result(wR)
@@ -679,4 +661,23 @@ contains
       end if
     end do
   end subroutine print_bcs
-end module silvia_module
+
+  subroutine count_elems(mesh,n_elems_loc,n_elems_ghost)
+    implicit none
+    
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(inout) :: n_elems_loc,n_elems_ghost
+    integer(kind=ENTIER) :: i
+
+    n_elems_loc=0
+    n_elems_ghost=0
+    do i=1,mesh%n_elems
+      if (mesh%elem(i)%is_ghost) then
+        n_elems_ghost=n_elems_ghost+1
+        cycle
+      end if
+      n_elems_loc=n_elems_loc+1
+    end do
+  end subroutine count_elems
+
+end module silvia_base_module

@@ -7,7 +7,10 @@ program main
     use mesh_geometry_module
     use mesh_connectivity_module
     use io_module
-    use silvia_module
+    use silvia_base_module
+    use silvia_reconstruction_module
+    use silvia_errors_module
+  
     implicit none
 
     integer :: funit
@@ -16,9 +19,10 @@ program main
     type(mpi_send_recv_type) :: mpi_send_recv
 
     integer(kind=ENTIER) :: i, le, re, i_bc
-    integer(kind=ENTIER) :: iter
+    integer(kind=ENTIER) :: iter, iter_write_sol
+    integer(kind=ENTIER) :: n_elems_loc, n_elems_ghost, n_elems_tot
     
-    real(kind=DOUBLE) :: area
+    real(kind=DOUBLE) :: area, h_err, l2err
     real(kind=DOUBLE), dimension(3) :: n
     real(kind=DOUBLE), dimension(:,:), allocatable :: sol, sol_w
     real(kind=DOUBLE), dimension(:,:), allocatable :: rhs
@@ -48,23 +52,64 @@ program main
     end do
 
     call init_sol(mesh, sol)
+    if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)
+    
+    ! call face_geometry(mesh)
 
     t=0.0_DOUBLE
     iter=0
-    call write_vtu(mesh, sol, 0, iter)
-    do while (t<tmax .AND. iter<n_max_iter)
+    iter_write_sol = 0
+    call write_vtu(mesh, sol, me, iter_write_sol)
+    ! iter_write_sol = 1
+    
+    ! do while (t<tmax .AND. iter<n_max_iter)
+    do while (t<tmax)  
+      call mpi_barrier(mpi_comm_world, mpi_ierr)
       do i=1, mesh%n_elems
         sol_w(:,i) = conserv_to_primit(sol(:,i))
       end do
+
       call compute_rhs(mesh, sol, sol_w, rhs, sum_lambda, t)
       call compute_dt(mesh, sum_lambda, dt)
+      call MPI_ALLREDUCE(MPI_IN_PLACE, dt, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
+
       sol = sol + dt * rhs
+      if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)
+
+      ! Periodic output
+      if (n_iter_write_sol > 1) then
+        if (t >= real(iter_write_sol, DOUBLE) * tmax / real(n_iter_write_sol - 1, DOUBLE)) then
+          call write_vtu(mesh, sol, me, iter_write_sol)
+          if (compute_error) then
+            call compute_error_test(mesh, sol, t, 1.0_DOUBLE, h_err, l2err)
+            call MPI_ALLREDUCE(MPI_IN_PLACE, h_err, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+            call MPI_ALLREDUCE(MPI_IN_PLACE, l2err, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+            if (me == 0) print *, "t=", t, "h=", h_err, "L2(rho)=", l2err
+          end if
+          iter_write_sol = iter_write_sol + 1
+        end if
+      end if
       
-      print*, 'iter=', iter, ' dt=', dt, ' time=', t
+      ! print*, 'iter=', iter, ' dt=', dt, ' time=', t
       t = t + dt
       iter = iter + 1
-      call write_vtu(mesh, sol, 0, iter)
+      ! call write_vtu(mesh, sol, 0, iter)
     end do
+
+    call count_elems(mesh,n_elems_loc,n_elems_ghost)
+    print*, "rank", me, "n_elems_locali", n_elems_loc, "n_elems_ghost", n_elems_ghost
+
+    call MPI_ALLREDUCE(n_elems_loc, n_elems_tot, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+    print*, "rank", me, "n_elems_totali", n_elems_tot      
+
+    ! Final output
+    call write_vtu(mesh, sol, me, -1)
+    if (compute_error) then
+      call compute_error_test(mesh, sol, t, 1.0_DOUBLE, h_err, l2err)
+      call MPI_ALLREDUCE(MPI_IN_PLACE, h_err, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE, l2err, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+      if (me == 0) print *, "FINAL t=", t, "h=", h_err, "L2(rho)=", l2err
+    end if
 
     call MPI_FINALIZE(mpi_ierr)
 contains
