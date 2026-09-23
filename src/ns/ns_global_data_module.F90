@@ -76,6 +76,8 @@ module ns_global_data_module
   integer, parameter :: SCHEME_MULTI_POINT_VILAR       = 10 ! "multi_point_vilar"
   integer, parameter :: SCHEME_WIP2                    = 11 ! "WIP2"
   integer, parameter :: SCHEME_WIP2_NOLM               = 12 ! "WIP2_NOLM" (theta=1, reference)
+  integer, parameter :: SCHEME_THREE_WAVE_ENTHALPY     = 15 ! "three_wave_enthalpy" (enthalpy-preserving three_wave)
+  integer, parameter :: SCHEME_MULTI_POINT_ENTHALPY    = 16 ! "multi_point_enthalpy" (enthalpy-preserving multi_point)
   integer, parameter :: SCHEME_ZB                   = 42 ! "ZB_*_*"
   ! ZB advection sub-scheme IDs
   integer, parameter :: SCHEME_ADV_AR1D     = 1  ! "AR1D"
@@ -289,6 +291,10 @@ contains
       scheme_id = SCHEME_TWO_WAVE
     else if (t == "modified_three_wave") then
       scheme_id = SCHEME_MODIFIED_THREE_WAVE
+    else if (t == "three_wave_enthalpy") then
+      scheme_id = SCHEME_THREE_WAVE_ENTHALPY
+    else if (t == "multi_point_enthalpy") then
+      scheme_id = SCHEME_MULTI_POINT_ENTHALPY
     else if (t == "multi_point_pressure") then
       scheme_id = SCHEME_MULTI_POINT_PRESSURE
     else if (t == "multi_point_pressure_ph") then

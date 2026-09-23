@@ -371,6 +371,7 @@ contains
       SCHEME_MULTI_POINT, SCHEME_MULTI_POINT_ISO, SCHEME_MULTI_POINT_PRESSURE, &
       SCHEME_MULTI_POINT_PRESSURE_PH, &
       SCHEME_THREE_WAVE, SCHEME_TWO_WAVE, SCHEME_MODIFIED_THREE_WAVE, &
+      SCHEME_THREE_WAVE_ENTHALPY, SCHEME_MULTI_POINT_ENTHALPY, &
       SCHEME_MULTI_POINT_VILAR
     use linear_solver_module
     use mpi
@@ -425,7 +426,10 @@ contains
     warea = minval(warea)/warea
 
     select case (scheme_id)
-    case (SCHEME_MULTI_POINT)
+    case (SCHEME_MULTI_POINT, SCHEME_MULTI_POINT_ENTHALPY)
+      ! The nodal velocity comes from the paper's linear system (16), which involves only the
+      ! slopes and the face velocities -- no energy -- so the enthalpy-preserving variant
+      ! shares this step with multi_point unchanged.
       lambda(:, :) = 0.0_DOUBLE
       if( mesh%vert(id_vert)%is_bound .and. exclude_bound_vert) then
         v_vert = 0.0_DOUBLE
@@ -520,6 +524,30 @@ contains
       case (SCHEME_MODIFIED_THREE_WAVE)
         call modified_three_wave(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
           mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
+      case (SCHEME_THREE_WAVE_ENTHALPY)
+        call three_wave_enthalpy(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+          mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
+      case (SCHEME_MULTI_POINT_ENTHALPY)
+        ! Mirrors the SCHEME_MULTI_POINT branch, except that the boundary-vertex fallback is
+        ! the enthalpy-preserving 1D solver rather than two_wave: the paper applies the
+        ! one-dimensional scheme at boundary nodes ("ensuring conservation, which is critical
+        ! for accuracy"), and falling back to two_wave there would reintroduce an enthalpy
+        ! defect on exactly the wall cells the property is wanted on.
+        if( mesh%vert(id_vert)%is_bound .and. exclude_bound_vert) then
+          call three_wave_enthalpy(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+            mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
+        else
+          if (is_wall(re) ) then
+            call multi_point_enthalpy(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+              mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), 0.0_DOUBLE, &
+              lambda(1, j), lambda(2, j), sl, sr)
+          else
+            call multi_point_enthalpy(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+              mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), &
+              dot_product(v_vert, mesh%sub_face(id_sub_face)%norm), &
+              lambda(1, j), lambda(2, j), sl, sr)
+          end if
+        end if
       case (SCHEME_MULTI_POINT_VILAR)
         call multi_point_vilar(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
           mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sol_p_vilar, sl, sr)

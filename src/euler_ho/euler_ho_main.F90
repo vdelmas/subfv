@@ -278,7 +278,7 @@ contains
 
     integer(kind=ENTIER) :: fn_v, fn_pv
     character(len=255) :: fname
-    real(kind=DOUBLE), allocatable :: prim_loc(:, :), rho(:), p(:), temp(:)
+    real(kind=DOUBLE), allocatable :: prim_loc(:, :), rho(:), p(:), temp(:), h_tot(:)
     real(kind=DOUBLE), allocatable :: centroid(:, :), velocity(:, :)
     real(kind=DOUBLE), parameter :: r_gas = 287.0_DOUBLE
     integer(kind=ENTIER) :: i, iv
@@ -292,13 +292,19 @@ contains
     allocate(prim_loc(5, mesh%n_elems))
     call compute_prim(mesh, sol, prim_loc)
 
-    allocate(rho(mesh%n_elems), p(mesh%n_elems), temp(mesh%n_elems))
+    allocate(rho(mesh%n_elems), p(mesh%n_elems), temp(mesh%n_elems), h_tot(mesh%n_elems))
     allocate(centroid(3, mesh%n_elems), velocity(3, mesh%n_elems))
     do i = 1, mesh%n_elems
       rho(i) = prim_loc(1, i)
       velocity(:, i) = prim_loc(2:4, i)
       p(i)   = prim_loc(5, i)
       temp(i) = p(i) / (max(rho(i), 1.0e-16_DOUBLE) * r_gas)
+      ! Total enthalpy h = e + p/rho = gamma/(gamma-1) p/rho + |u|^2/2. A Riemann invariant of
+      ! the steady Euler equations along streamlines, hence uniformly h_inf for a steady flow fed
+      ! by a uniform inflow -- the diagnostic that separates an enthalpy-preserving Riemann solver
+      ! (flux_scheme='three_wave_enthalpy') from one that is not.
+      h_tot(i) = gamma_arr(i) / (gamma_arr(i) - 1.0_DOUBLE) * p(i) / max(rho(i), 1.0e-16_DOUBLE) &
+        + 0.5_DOUBLE * dot_product(prim_loc(2:4, i), prim_loc(2:4, i))
       centroid(:, i) = mesh%elem(i)%coord
     end do
 
@@ -339,6 +345,7 @@ contains
     call write_file_vtu_cell_vector(mesh, trim(adjustl(fname)), fn_v, fn_pv, velocity, 'velocity')
     call write_file_vtu_cell_scalar(mesh, trim(adjustl(fname)), fn_v, fn_pv, p,   'p')
     call write_file_vtu_cell_scalar(mesh, trim(adjustl(fname)), fn_v, fn_pv, temp, 'T')
+    call write_file_vtu_cell_scalar(mesh, trim(adjustl(fname)), fn_v, fn_pv, h_tot, 'H')
     call write_file_vtu_cell_scalar(mesh, trim(adjustl(fname)), fn_v, fn_pv, gamma_arr, 'gamma')
     call write_file_vtu_cell_vector(mesh, trim(adjustl(fname)), fn_v, fn_pv, centroid, 'Centroid')
     call write_file_vtu_cell_vector(mesh, trim(adjustl(fname)), fn_v, fn_pv, grad_rho_cell, 'grad_rho_cell')
@@ -348,7 +355,7 @@ contains
     call write_file_vtu_end_vert_data(mesh, trim(adjustl(fname)), fn_v, fn_pv)
     call close_file_vtu(mesh, trim(adjustl(fname)), fn_v, fn_pv)
 
-    deallocate(prim_loc, rho, p, temp, centroid, velocity)
+    deallocate(prim_loc, rho, p, temp, h_tot, centroid, velocity)
     deallocate(dphi_cell, dphi_v, valid_v, grad_rho_cell, grad_rho_vert)
   end subroutine write_vtu
 

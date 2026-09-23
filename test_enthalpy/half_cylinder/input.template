@@ -1,0 +1,35 @@
+&INPUT_PARAM
+  meshfile_path=''
+  meshfile='MESH_PLACEHOLDER'
+  boundary_2d = .true.
+
+  ! Hypersonic M_inf = 20 half-cylinder, non-dimensionalised exactly as in Tallois' paper
+  ! (sec. 6.2): (rho, ux, uy, p) = (1, M_inf*sqrt(gamma), 0, 1), gamma = 7/5.
+  ! Total enthalpy of the free stream is therefore
+  !   h_inf = gamma/(gamma-1) * p/rho + |u|^2/2 = 3.5 + 280 = 283.5,
+  ! and the exact steady solution has h == h_inf in the WHOLE domain, bow shock included.
+  ! That uniformity is what separates 'three_wave' from 'three_wave_enthalpy'.
+  init = 0
+  sol_uniform = 1.0, 23.6643191324, 0.0, 0.0, 1.0
+  gamma_gas = 1.4
+
+  order = ORDER_PLACEHOLDER
+  cfl = 0.5
+  tmax = TMAX_PLACEHOLDER
+  flux_scheme = 'FLUX_PLACEHOLDER'
+
+  n_bc = 3
+  bc_name = 'in_surf', 'cyl_surf', 'out_surf'
+  bc_type = 'freestream', 'wall', 'outflowsupersonic'
+  bc_val =  1.0, 23.6643191324, 0.0, 0.0, 1.0,
+            0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0
+
+  aho_method = 0
+  use_weno_blend = .false.
+  use_cweno_center = .false.
+  use_max_lambda_dt = .true.
+
+  n_sol_vtu = 10
+  compute_error = .false.
+/

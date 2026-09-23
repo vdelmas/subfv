@@ -74,6 +74,110 @@ contains
     lr_flux(:, 2) = -lr_flux(:, 1)
   end subroutine three_wave
 
+  ! Reference:
+  !   L. Tallois, "Enthalpy preserving Simple Riemann solvers for steady hypersonic flows",
+  !   CEA-CESTA preprint, June 2026 (papers/talois.pdf), section 5.
+  !
+  ! Enthalpy-preserving ("MGallice-1D") variant of three_wave -- the Gallice-solver
+  ! transcription of the Haenel et al. energy-flux-splitting condition. Same solver as
+  ! euler_ho_module's three_wave_enthalpy_flux; see the long comment there for the derivation
+  ! and the two properties checked analytically.
+  !
+  ! In short: for a steady Euler solution the total enthalpy h = e + p/rho is constant along
+  ! streamlines, so h == h_inf everywhere downstream of a uniform inflow, shocks included.
+  ! three_wave above (like HLLC/Roe/Rusanov) does not reproduce that discretely and leaves an h
+  ! undershoot inside a stationary shock, which pollutes the energy distribution of the whole
+  ! subsonic pocket behind a bow shock -- and, for Navier-Stokes, any boundary-layer criterion
+  ! based on total enthalpy.
+  !
+  ! The change is purely a change of the variable the Simple solver is written in: same 3-wave
+  ! structure, same Lagrangian slopes lambda_l/lambda_r, same v_et, same rho_et, but the energy
+  ! slot of EVERY state of the solver -- the two outer states sol_l/sol_r as well as the two
+  ! star states -- carries rho*h instead of rho*e. The physical fluxes fl/fr stay the true Euler
+  ! fluxes, so only the dissipation term changes. With h_l = h_r = h_inf every energy component
+  ! is then h_inf times the matching density component, and the assembly factors exactly as
+  ! flux(5) = h_inf * flux(1): Haenel's condition, i.e. total enthalpy transported as a passive
+  ! scalar and preserved through a stationary shock to machine precision.
+  !
+  ! Caveat at second order: the paper additionally reconstructs h itself and feeds the
+  ! reconstructed h to the solver. Here h is rebuilt from the reconstructed (rho, u, p), so with
+  ! second_order=.true. the reconstruction errors of rho/u/p no longer cancel exactly and h is
+  ! preserved only to truncation order. At first order the preservation is exact.
+  !
+  ! Entropy stability is NOT claimed: as for flux vector splitting schemes, no slope condition is
+  ! known that guarantees it for this modification (Tallois, Remark 3).
+  subroutine three_wave_enthalpy(sol_w_l, sol_w_r, n, lr_flux, sl, sr)
+    implicit none
+
+    real(kind=DOUBLE), dimension(5), intent(in) :: sol_w_l, sol_w_r
+    real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), dimension(5) :: sol_l, sol_r
+    real(kind=DOUBLE), dimension(5, 2), intent(inout) :: lr_flux
+    real(kind=DOUBLE), intent(inout) :: sl, sr
+
+    real(kind=DOUBLE) :: rhol, rhor, vn_l, vn_r
+    real(kind=DOUBLE) :: pl, pr, rhol_et, rhor_et
+    real(kind=DOUBLE) :: v_et, el, er, al, ar, hl, hr
+    real(kind=DOUBLE) :: v_bar
+    real(kind=DOUBLE) :: lambda_l, lambda_r
+    real(kind=DOUBLE), dimension(5) :: fl, fr, sol_l_et, sol_r_et
+    real(kind=DOUBLE), dimension(5) :: sol_l_h, sol_r_h
+
+    rhol = sol_w_l(1)
+    vn_l = dot_product(sol_w_l(2:4), n)
+    pl = sol_w_l(5)
+    sol_l = primit_to_conserv(sol_w_l)
+    el = sol_l(5)/rhol
+    al = sound_speed_w(sol_w_l)
+    hl = el + pl/rhol
+
+    rhor = sol_w_r(1)
+    vn_r = dot_product(sol_w_r(2:4), n)
+    pr = sol_w_r(5)
+    sol_r = primit_to_conserv(sol_w_r)
+    er = sol_r(5)/rhor
+    ar = sound_speed_w(sol_w_r)
+    hr = er + pr/rhor
+
+    fl(1)   = vn_l*sol_l(1)
+    fl(2:4) = vn_l*sol_l(2:4) + pl*n
+    fl(5)   = (sol_l(5) + pl)*vn_l
+
+    fr(1)   = vn_r*sol_r(1)
+    fr(2:4) = vn_r*sol_r(2:4) + pr*n
+    fr(5)   = (sol_r(5) + pr)*vn_r
+
+    ! The solver's own outer states: sol_l/sol_r with the energy slot replaced by rho*h.
+    ! These -- not sol_l/sol_r -- are what the dissipation term must difference.
+    sol_l_h(1:4) = sol_l(1:4); sol_l_h(5) = rhol*hl
+    sol_r_h(1:4) = sol_r(1:4); sol_r_h(5) = rhor*hr
+
+    lambda_l = max(al*rhol, sqrt(rhol*max(0.0_DOUBLE, pr - pl)), -rhol*(vn_r - vn_l))
+    lambda_r = max(ar*rhor, sqrt(rhor*max(0.0_DOUBLE, pl - pr)), -rhor*(vn_r - vn_l))
+    v_bar = (lambda_l*vn_l + lambda_r*vn_r - (pr - pl))/(lambda_r + lambda_l)
+    v_et = v_bar
+
+    rhol_et = 1.0_DOUBLE/(1.0_DOUBLE/rhol + (v_et - vn_l)/lambda_l)
+    sol_l_et(1)   = rhol_et
+    sol_l_et(2:4) = rhol_et*(sol_w_l(2:4) + (v_et - vn_l)*n)
+    sol_l_et(5)   = rhol_et*hl
+
+    rhor_et = 1.0_DOUBLE/(1.0_DOUBLE/rhor + (vn_r - v_et)/lambda_r)
+    sol_r_et(1)   = rhor_et
+    sol_r_et(2:4) = rhor_et*(sol_w_r(2:4) + (v_et - vn_r)*n)
+    sol_r_et(5)   = rhor_et*hr
+
+    sl = vn_l - lambda_l/rhol
+    sr = vn_r + lambda_r/rhor
+
+    lr_flux(:, 1) = 0.5_DOUBLE*(fl + fr) - 0.5_DOUBLE* &
+      (abs(sl)*(sol_l_et - sol_l_h) + &
+      abs(v_et)*(sol_r_et - sol_l_et) + &
+      abs(sr)*(sol_r_h - sol_r_et))
+
+    lr_flux(:, 2) = -lr_flux(:, 1)
+  end subroutine three_wave_enthalpy
+
   subroutine modified_three_wave(sol_w_l, sol_w_r, n, lr_flux, sl, sr)
     implicit none
 
@@ -284,6 +388,127 @@ contains
 
     lr_flux(:, 2) = -lr_flux(:, 2)
   end subroutine multi_point
+
+  ! Reference:
+  !   L. Tallois, "Enthalpy preserving Simple Riemann solvers for steady hypersonic flows",
+  !   CEA-CESTA preprint, June 2026 (papers/talois.pdf), section 5.
+  !
+  ! Enthalpy-preserving ("MGallice-2D") variant of multi_point.
+  !
+  ! multi_point above is the paper's multidimensional Gallice-2D solver: the same
+  ! Simple solver as three_wave except that the intermediate normal velocity is the NODAL
+  ! velocity projected on the face (v_et = vn_nodal, from the unconventional consistency
+  ! condition (9)) rather than the face value v_bar. Because the two one-sided fluxes around a
+  ! node are then not opposite, multi_point carries the extra non-classical term
+  ! -/+ 1/2 (pr_bar - pl_bar) (0, n, v_et).
+  !
+  ! The modification is the same as in three_wave_enthalpy: the energy slot of EVERY state of
+  ! the solver -- the two outer states and the two star states -- carries rho*h instead of
+  ! rho*e, physical fluxes fl/fr untouched. Nothing else changes: the slopes lambda_l/lambda_r
+  ! and the nodal velocity (compute_lambdas_and_solve_nodal_velocity, i.e. the paper's linear
+  ! system (16)) involve no energy and are reused as-is.
+  !
+  ! ONE EXTRA CHANGE the 1D case does not have, and it is not a detail: the non-classical term
+  ! loses its energy component. That term is 1/2 [ sum_k Lambda_k dU_k - (fr - fl) ], the defect
+  ! of the solver from the classical integral-form consistency. Rewriting the solver in rho*h
+  ! makes every energy state equal to (its own density state) x h_{l or r}, and the density
+  ! components telescope to rho_r vn_r - rho_l vn_l, so the energy defect collapses to
+  !
+  !     sum_k Lambda_k dU~_k (5) - (fr(5) - fl(5)) = 0   exactly,
+  !
+  ! whereas for multi_point it is -(pr_bar - pl_bar) v_et. The momentum defect is unchanged at
+  ! -(pr_bar - pl_bar) n, since the momentum states are the same. Hence the correction vector
+  ! below is (0, n, 0), NOT (0, n, v_et) -- keeping the v_et component would reintroduce a
+  ! one-sided energy dissipation and destroy the preservation property.
+  !
+  ! With that, if h_l = h_r = h_inf every energy component is h_inf times the matching density
+  ! component in BOTH the symmetric part and the correction, so flux(5) = h_inf * flux(1) on
+  ! each side of the face: Haenel's condition, i.e. total enthalpy preserved through a
+  ! stationary shock to machine precision. Same order >= 2 caveat and same absence of an
+  ! entropy-stability guarantee as three_wave_enthalpy -- see the comment there.
+  subroutine multi_point_enthalpy(sol_w_l, sol_w_r, n, lr_flux, vn_nodal, &
+      lambda_l, lambda_r, sl, sr)
+    implicit none
+
+    real(kind=DOUBLE), intent(in) :: vn_nodal
+    real(kind=DOUBLE), dimension(5), intent(in) :: sol_w_l, sol_w_r
+    real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), dimension(5) :: sol_l, sol_r
+    real(kind=DOUBLE), intent(inout) :: lambda_l, lambda_r
+    real(kind=DOUBLE), dimension(5, 2), intent(inout) :: lr_flux
+    real(kind=DOUBLE), intent(inout) :: sl, sr
+
+    real(kind=DOUBLE) :: rhol, rhor, vn_l, vn_r
+    real(kind=DOUBLE) :: pl, pr, rhol_et, rhor_et
+    real(kind=DOUBLE) :: v_et, el, er, hl, hr
+    real(kind=DOUBLE) :: pl_bar, pr_bar
+    real(kind=DOUBLE), dimension(5) :: fl, fr
+    real(kind=DOUBLE), dimension(5) :: sol_l_et, sol_r_et, sol_l_h, sol_r_h
+    real(kind=DOUBLE), dimension(5) :: sym_flux, nonclassical
+
+    rhol = sol_w_l(1)
+    vn_l = dot_product(sol_w_l(2:4), n)
+    pl = sol_w_l(5)
+    sol_l = primit_to_conserv(sol_w_l)
+    el = sol_l(5)/rhol
+    hl = el + pl/rhol
+
+    rhor = sol_w_r(1)
+    vn_r = dot_product(sol_w_r(2:4), n)
+    pr = sol_w_r(5)
+    sol_r = primit_to_conserv(sol_w_r)
+    er = sol_r(5)/rhor
+    hr = er + pr/rhor
+
+    fl(1)   = vn_l*sol_l(1)
+    fl(2:4) = vn_l*sol_l(2:4) + pl*n
+    fl(5)   = (sol_l(5) + pl)*vn_l
+
+    fr(1)   = vn_r*sol_r(1)
+    fr(2:4) = vn_r*sol_r(2:4) + pr*n
+    fr(5)   = (sol_r(5) + pr)*vn_r
+
+    ! The solver's own outer states: sol_l/sol_r with the energy slot replaced by rho*h.
+    sol_l_h(1:4) = sol_l(1:4); sol_l_h(5) = rhol*hl
+    sol_r_h(1:4) = sol_r(1:4); sol_r_h(5) = rhor*hr
+
+    v_et = vn_nodal
+
+    rhol_et = 1.0_DOUBLE/(1.0_DOUBLE/rhol + (v_et - vn_l)/lambda_l)
+    pl_bar = pl - lambda_l*(v_et - vn_l)
+
+    sol_l_et(1)   = rhol_et
+    sol_l_et(2:4) = rhol_et*(sol_w_l(2:4) + (v_et - vn_l)*n)
+    sol_l_et(5)   = rhol_et*hl
+
+    rhor_et = 1.0_DOUBLE/(1.0_DOUBLE/rhor + (vn_r - v_et)/lambda_r)
+    pr_bar = pr + lambda_r*(v_et - vn_r)
+
+    sol_r_et(1)   = rhor_et
+    sol_r_et(2:4) = rhor_et*(sol_w_r(2:4) + (v_et - vn_r)*n)
+    sol_r_et(5)   = rhor_et*hr
+
+    if (rhol_et < 0.0_DOUBLE .or. rhor_et < 0.0_DOUBLE) then
+      print *, "Negative specific volume MPCC (enthalpy) !", rhol_et, rhor_et
+      print *, rhol, rhor
+      print *, lambda_l, lambda_r
+      error stop
+    end if
+
+    sl = vn_l - lambda_l/rhol
+    sr = vn_r + lambda_r/rhor
+
+    sym_flux = 0.5_DOUBLE*(fl + fr) - 0.5_DOUBLE* &
+      (abs(sl)*(sol_l_et - sol_l_h) + &
+      abs(v_et)*(sol_r_et - sol_l_et) + &
+      abs(sr)*(sol_r_h - sol_r_et))
+
+    ! (0, n, 0) and not (0, n, v_et) -- see the header comment.
+    nonclassical = 0.5_DOUBLE*(pr_bar - pl_bar)*(/0.0_DOUBLE, n, 0.0_DOUBLE/)
+
+    lr_flux(:, 1) = sym_flux - nonclassical
+    lr_flux(:, 2) = -(sym_flux + nonclassical)
+  end subroutine multi_point_enthalpy
 
   subroutine compute_lambdas_and_solve_nodal_velocity(mesh, id_vert, sol_w_lr, lambda, v_bars, v_node, p_bound)
     use ns_global_data_module, only: bc_style, boundary_2d

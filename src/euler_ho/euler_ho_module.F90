@@ -81,7 +81,7 @@ module euler_ho_module
   logical, public :: use_alt_gg_weight = .false.
   character(len=32), public :: flux_scheme    = 'three_wave'
   integer(kind=ENTIER), parameter :: FLUX_RUSANOV = 0, FLUX_TWO_WAVE = 1, FLUX_THREE_WAVE = 2, &
-    FLUX_MODIFIED_THREE_WAVE = 3
+    FLUX_MODIFIED_THREE_WAVE = 3, FLUX_THREE_WAVE_ENTHALPY = 4
   integer(kind=ENTIER) :: flux_scheme_id = FLUX_RUSANOV
 
   ! Per-face quadrature point/weight cache for face_flux_loop's order>=3 multi-point rule: face
@@ -231,6 +231,8 @@ contains
       flux_scheme_id = FLUX_THREE_WAVE
     case ('modified_three_wave')
       flux_scheme_id = FLUX_MODIFIED_THREE_WAVE
+    case ('three_wave_enthalpy')
+      flux_scheme_id = FLUX_THREE_WAVE_ENTHALPY
     case ('two_wave')
       flux_scheme_id = FLUX_TWO_WAVE
     case default
@@ -1365,6 +1367,8 @@ contains
           flux = three_wave_flux(wL, wR, norm, gL, gR) * qwt
         case (FLUX_MODIFIED_THREE_WAVE)
           flux = modified_three_wave_flux(wL, wR, norm, gL, gR) * qwt
+        case (FLUX_THREE_WAVE_ENTHALPY)
+          flux = three_wave_enthalpy_flux(wL, wR, norm, gL, gR) * qwt
         case (FLUX_TWO_WAVE)
           flux = two_wave_flux(wL, wR, norm, gL, gR) * qwt
         case default
@@ -1761,6 +1765,106 @@ contains
       abs(v_star)*(uR_star - uL_star) + &
       abs(sR_wave)*(uR - uR_star))
   end function three_wave_flux
+
+  ! Reference:
+  !   L. Tallois, "Enthalpy preserving Simple Riemann solvers for steady hypersonic flows",
+  !   CEA-CESTA preprint, June 2026 (papers/talois.pdf), section 5.
+  !
+  ! Enthalpy-preserving ("MGallice-1D") variant of three_wave_flux -- itself a Gallice-solver
+  ! transcription of the Haenel et al. energy-flux-splitting condition.
+  !
+  ! Motivation: for a steady Euler solution the total enthalpy h = e + p/rho is a Riemann
+  ! invariant along streamlines, so h == h_inf everywhere downstream of a uniform inflow, shocks
+  ! included. Godunov-type solvers (Rusanov/HLL/HLLC, and three_wave_flux with them) do NOT
+  ! reproduce that at the discrete level: they leave an h undershoot inside a stationary shock,
+  ! which pollutes the energy distribution of the whole subsonic pocket behind a bow shock.
+  !
+  ! The fix is local to this function and is *only* a change of the variable the Simple solver is
+  ! written in: the same 3-wave structure, the same Lagrangian slopes lambdaL/lambdaR (17), the
+  ! same u* (15), the same rho*, but the energy slot of every state of the solver -- the two outer
+  ! states as well as the two star states -- carries rho*h instead of rho*e. The physical fluxes
+  ! fL/fR are untouched and stay the true Euler fluxes, so only the dissipation term changes:
+  !
+  !     U~_l = (rho_l, rho_l u_l, rho_l h_l),    U~*_s = rho*_s (1, u_s + (u*-un_s) n, h_s).
+  !
+  ! Two properties worth stating, both checked analytically on this exact state set:
+  !
+  ! 1. Consistency with the integral form still holds, sum_k Lambda_k (U~_{k+1} - U~_k) = fR - fL,
+  !    because every energy component is (its own density component) x h_{l or r} and the density
+  !    components telescope to rho_r un_r - rho_l un_l. Hence the solver is a genuine Godunov-type
+  !    solver (so the symmetric assembly below is the right one) and U~(U,U) = U~ is uniform, i.e.
+  !    the flux is consistent at a constant state.
+  ! 2. Haenel's condition: if h_l = h_r = h_inf then EVERY energy component equals h_inf times the
+  !    matching density component, so the whole assembly factors as F(5) = h_inf * F(1) -- the
+  !    energy dissipation is exactly h_inf times the mass dissipation. Total enthalpy is therefore
+  !    transported as a passive scalar and preserved through a stationary shock to machine
+  !    precision.
+  !
+  ! Caveat at order >= 2: the paper additionally reconstructs h itself and feeds the reconstructed
+  ! h to the solver. Here h is rebuilt from the reconstructed (rho, u, p), so at order >= 2 the
+  ! reconstruction errors of rho/u/p no longer cancel exactly and h is preserved only to
+  ! truncation order, not to machine precision. At order 1 (the paper's own half-cylinder setup)
+  ! the preservation is exact.
+  !
+  ! Entropy stability is NOT claimed: as for flux vector splitting schemes, no slope condition is
+  ! known that guarantees it for this modification (Tallois, Remark 3).
+  pure function three_wave_enthalpy_flux(wL, wR, n, gL, gR) result(F)
+    implicit none
+
+    real(kind=DOUBLE), dimension(5), intent(in) :: wL, wR
+    real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), intent(in) :: gL, gR
+    real(kind=DOUBLE), dimension(5) :: F
+
+    real(kind=DOUBLE), dimension(5) :: uL, uR, fL, fR
+    real(kind=DOUBLE), dimension(5) :: uL_ent, uR_ent, uL_star, uR_star
+    real(kind=DOUBLE) :: rhoL, rhoR, vnL, vnR, pL, pR, eL, eR, aL, aR, hL, hR
+    real(kind=DOUBLE) :: lambdaL, lambdaR, v_star
+    real(kind=DOUBLE) :: rhoL_star, rhoR_star, sL_wave, sR_wave
+
+    rhoL = wL(1); vnL = dot_product(wL(2:4), n); pL = wL(5)
+    uL = primit_to_conserv(wL, gL); eL = uL(5)/rhoL; aL = cs(wL, gL)
+    hL = eL + pL/rhoL
+
+    rhoR = wR(1); vnR = dot_product(wR(2:4), n); pR = wR(5)
+    uR = primit_to_conserv(wR, gR); eR = uR(5)/rhoR; aR = cs(wR, gR)
+    hR = eR + pR/rhoR
+
+    fL(1)   = vnL*uL(1)
+    fL(2:4) = vnL*uL(2:4) + pL*n
+    fL(5)   = (uL(5) + pL)*vnL
+
+    fR(1)   = vnR*uR(1)
+    fR(2:4) = vnR*uR(2:4) + pR*n
+    fR(5)   = (uR(5) + pR)*vnR
+
+    ! The solver's own outer states: identical to uL/uR except that the energy slot carries the
+    ! total enthalpy. These -- not uL/uR -- are what the dissipation term must difference.
+    uL_ent(1:4) = uL(1:4); uL_ent(5) = rhoL*hL
+    uR_ent(1:4) = uR(1:4); uR_ent(5) = rhoR*hR
+
+    lambdaL = max(aL*rhoL, sqrt(rhoL*max(0.0_DOUBLE, pR - pL)), -rhoL*(vnR - vnL))
+    lambdaR = max(aR*rhoR, sqrt(rhoR*max(0.0_DOUBLE, pL - pR)), -rhoR*(vnR - vnL))
+    v_star  = (lambdaL*vnL + lambdaR*vnR - (pR - pL)) / (lambdaR + lambdaL)
+
+    rhoL_star = 1.0_DOUBLE / (1.0_DOUBLE/rhoL + (v_star - vnL)/lambdaL)
+    uL_star(1)   = rhoL_star
+    uL_star(2:4) = rhoL_star*(wL(2:4) + (v_star - vnL)*n)
+    uL_star(5)   = rhoL_star*hL
+
+    rhoR_star = 1.0_DOUBLE / (1.0_DOUBLE/rhoR + (vnR - v_star)/lambdaR)
+    uR_star(1)   = rhoR_star
+    uR_star(2:4) = rhoR_star*(wR(2:4) + (v_star - vnR)*n)
+    uR_star(5)   = rhoR_star*hR
+
+    sL_wave = vnL - lambdaL/rhoL
+    sR_wave = vnR + lambdaR/rhoR
+
+    F = 0.5_DOUBLE*(fL + fR) - 0.5_DOUBLE * ( &
+      abs(sL_wave)*(uL_star - uL_ent) + &
+      abs(v_star)*(uR_star - uL_star) + &
+      abs(sR_wave)*(uR_ent - uR_star))
+  end function three_wave_enthalpy_flux
 
   ! Modified 3-wave solver (Toro-family HLLC variant): blends a SINGLE shared tangential
   ! velocity between both star states, instead of three_wave_flux's plain carry-through of
