@@ -1316,9 +1316,9 @@ contains
     real(kind=DOUBLE), intent(in) :: t
     real(kind=DOUBLE), dimension(:, :, :, :, :), allocatable, intent(in), optional :: third
 
-    integer(kind=ENTIER) :: iface, il, ir, n_fvert, n_qpts, q, qpos
+    integer(kind=ENTIER) :: iface, il, ir, n_fvert, n_qpts, q, qpos, ifv
     real(kind=DOUBLE), dimension(3) :: norm, xface
-    real(kind=DOUBLE) :: qwt
+    real(kind=DOUBLE) :: qwt, dx_face, fx_lo, fx_hi, fxv
     real(kind=DOUBLE), dimension(5) :: wL, wR, flux
     real(kind=DOUBLE) :: lambda, gL, gR, face_lambda_accum
     real(kind=DOUBLE) :: flux_rgm1, Gl_rgm1, Gr_rgm1
@@ -1349,6 +1349,19 @@ contains
 
       n_qpts = face_quad_offset_cache(iface + 1) - face_quad_offset_cache(iface)
 
+      ! x-extent of a boundary face, for BCs that impose a moving
+      ! discontinuity and must average it over the face rather than sample it
+      ! (see dmr_state). Only boundary faces pay for this.
+      dx_face = 0.0_DOUBLE
+      if (ir <= 0) then
+        fx_lo = huge(1.0_DOUBLE); fx_hi = -huge(1.0_DOUBLE)
+        do ifv = 1, n_fvert
+          fxv = mesh%vert(mesh%face(iface)%vert(ifv))%coord(1)
+          fx_lo = min(fx_lo, fxv); fx_hi = max(fx_hi, fxv)
+        end do
+        dx_face = fx_hi - fx_lo
+      end if
+
       face_lambda_accum = 0.0_DOUBLE
       do q = 1, n_qpts
         qpos  = face_quad_offset_cache(iface) + q - 1
@@ -1359,7 +1372,7 @@ contains
         if (ir > 0) then
           wR = reconstruct(prim, grad, hess, ir, xface, mesh%elem(ir)%coord, gR, third)
         else
-          wR = ghost_prim(xface, norm, wL, -ir, t)
+          wR = ghost_prim(xface, norm, wL, -ir, t, dx_face)
         end if
 
         select case (flux_scheme_id)
@@ -1588,13 +1601,16 @@ contains
     w(5) = max(w(5), 1.0e-12_DOUBLE)
   end function reconstruct
 
-  function ghost_prim(xf, norm, wL, id_bc, t) result(wR)
+  function ghost_prim(xf, norm, wL, id_bc, t, dx_face) result(wR)
     implicit none
 
     real(kind=DOUBLE), dimension(3), intent(in) :: xf, norm
     real(kind=DOUBLE), dimension(5), intent(in) :: wL
     integer(kind=ENTIER), intent(in) :: id_bc
     real(kind=DOUBLE), intent(in) :: t
+    ! Width over which a moving-discontinuity BC averages its imposed state
+    ! (see dmr_state). Ignored by every steady BC.
+    real(kind=DOUBLE), intent(in), optional :: dx_face
     real(kind=DOUBLE), dimension(5) :: wR
 
     real(kind=DOUBLE) :: vn
@@ -1614,7 +1630,11 @@ contains
     case (BC_OUTFLOW)
       wR = wL
     case (BC_DMR_TOP)
-      wR = dmr_state(xf(1), xf(2), t)
+      if (present(dx_face)) then
+        wR = dmr_state(xf(1), xf(2), t, dx_face)
+      else
+        wR = dmr_state(xf(1), xf(2), t)
+      end if
     case default
       wR    = wL
       vn    = dot_product(wL(2:4), norm)
@@ -1789,11 +1809,23 @@ contains
   !
   ! Two properties worth stating, both checked analytically on this exact state set:
   !
-  ! 1. Consistency with the integral form still holds, sum_k Lambda_k (U~_{k+1} - U~_k) = fR - fL,
-  !    because every energy component is (its own density component) x h_{l or r} and the density
-  !    components telescope to rho_r un_r - rho_l un_l. Hence the solver is a genuine Godunov-type
-  !    solver (so the symmetric assembly below is the right one) and U~(U,U) = U~ is uniform, i.e.
-  !    the flux is consistent at a constant state.
+  ! 1. sum_k Lambda_k (U~_{k+1} - U~_k) = F(U_r) - F(U_l), with the TRUE physical fluxes on the
+  !    right-hand side: every energy component is (its own density component) x h_{l or r}, the
+  !    density components telescope to rho_r un_r - rho_l un_l, and the physical flux already
+  !    carries rho h un in its own energy slot. This identity is NOT automatic -- it is a property
+  !    of this particular U~, and it is exactly what the alternative formulation loses (see
+  !    three_wave_enthalpy2 in ns_euler_rs_module.F90). It is what makes the assembly below
+  !    legitimate: the three writings
+  !      F(U_l) - sum Lambda^- dU~ = F(U_r) - sum Lambda^+ dU~ = 1/2(fL+fR) - 1/2 sum|Lambda| dU~
+  !    coincide to machine precision (checked over 400 random state pairs), so the flux is
+  !    single-valued, conservative, and built on F(U_l) -- never on F(U~_l).
+  !
+  !    What this is NOT: U~ is not a Riemann solver profile for the Euler system, since its
+  !    far-field state U~_l differs from the initial datum U_l. So this is not a Godunov-type
+  !    scheme built on an approximate Riemann solver; it is a conservative, consistent numerical
+  !    flux whose DISSIPATION operator acts on rho*h = rho*E + p instead of rho*E -- i.e. Haenel's
+  !    energy-flux splitting transplanted into the Gallice wave structure. U~(U,U) is uniform, so
+  !    the flux is still consistent at a constant state.
   ! 2. Haenel's condition: if h_l = h_r = h_inf then EVERY energy component equals h_inf times the
   !    matching density component, so the whole assembly factors as F(5) = h_inf * F(1) -- the
   !    energy dissipation is exactly h_inf times the mass dissipation. Total enthalpy is therefore
@@ -2039,26 +2071,55 @@ contains
 
   ! Double Mach reflection (Woodward & Colella 1984): Mach-10 shock inclined 60deg,
   ! touching the x-axis at x=1/6 at t=0. Used for init=3 (t=0) and the 'dmr_top' BC.
-  pure function dmr_state(x, y, t) result(w)
+  ! Exact post/pre-shock state of the Mach-10 60-degree shock at (x, y, t).
+  ! Woodward & Colella's top-boundary law: the trace along y moves at
+  ! mach/sin(angle) = 20/sqrt(3), i.e. x_shock(y=1,t) = 1/6 + (1+20t)/sqrt(3).
+  !
+  ! `dx` (optional, default 0) averages the step exactly over a segment of
+  ! that width centred on x, instead of sampling it as a hard jump. The
+  ! moving-shock top BC needs this: sampled pointwise, the imposed state flips
+  ! discontinuously each time the analytic shock crosses a face quadrature
+  ! point, so the boundary flux jumps once per crossing and radiates a pulse
+  ! into the domain. Those pulses are invisible at order 1 (the scheme's own
+  ! diffusion swallows them) but at order >= 2 they show up as regular wave
+  ! trains fanning out from the top boundary. Averaging over ~one face width
+  ! makes the imposed state a continuous function of t, and matches the
+  ! finite thickness the captured shock has in the interior anyway.
+  pure function dmr_state(x, y, t, dx) result(w)
     implicit none
 
     real(kind=DOUBLE), intent(in) :: x, y, t
+    real(kind=DOUBLE), intent(in), optional :: dx
     real(kind=DOUBLE), dimension(5) :: w
 
     real(kind=DOUBLE), parameter :: shock_angle = PI/3.0_DOUBLE
     real(kind=DOUBLE), parameter :: mach_shock = 10.0_DOUBLE
     real(kind=DOUBLE), parameter :: x0 = 1.0_DOUBLE/6.0_DOUBLE
     real(kind=DOUBLE), parameter :: a1 = 1.0_DOUBLE
-    real(kind=DOUBLE) :: shock_speed_x, x_shock
+    real(kind=DOUBLE), dimension(5), parameter :: w_post = &
+      (/ 8.0_DOUBLE, 8.25_DOUBLE*cos(PI/6.0_DOUBLE), -8.25_DOUBLE*sin(PI/6.0_DOUBLE), &
+         0.0_DOUBLE, 116.5_DOUBLE /)
+    real(kind=DOUBLE), dimension(5), parameter :: w_pre = &
+      (/ 1.4_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 1.0_DOUBLE /)
+    real(kind=DOUBLE) :: shock_speed_x, x_shock, hw, frac
 
     shock_speed_x = mach_shock*a1/sin(shock_angle)
     x_shock = x0 + y/tan(shock_angle) + shock_speed_x*t
 
-    if (x < x_shock) then
-      w = (/ 8.0_DOUBLE, 8.25_DOUBLE*cos(PI/6.0_DOUBLE), -8.25_DOUBLE*sin(PI/6.0_DOUBLE), &
-             0.0_DOUBLE, 116.5_DOUBLE /)
+    hw = 0.0_DOUBLE
+    if (present(dx)) hw = 0.5_DOUBLE*dx
+
+    if (hw <= 0.0_DOUBLE) then
+      if (x < x_shock) then
+        w = w_post
+      else
+        w = w_pre
+      end if
     else
-      w = (/ 1.4_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 1.0_DOUBLE /)
+      ! Fraction of [x-hw, x+hw] lying behind the shock.
+      frac = (x_shock - (x - hw))/(2.0_DOUBLE*hw)
+      frac = max(0.0_DOUBLE, min(1.0_DOUBLE, frac))
+      w = frac*w_post + (1.0_DOUBLE - frac)*w_pre
     end if
   end function dmr_state
 

@@ -80,7 +80,10 @@ program euler_ho_main
     if (use_rk4) then
       ! k1=L(u0); k2=L(u0+dt/2*k1); k3=L(u0+dt/2*k2); k4=L(u0+dt*k3);
       ! u^{n+1}=u0+dt/6*(k1+2k2+2k3+k4). Every stage's compute_rhs uses the
-      ! step's start time t (not each stage's own substage time), as SSP-RK3 does too.
+      ! Each stage uses its own substage time. That only matters for a
+      ! time-dependent BC (t reaches nothing else in compute_rhs), but there
+      ! it matters a lot: holding t at the step start makes a moving-shock
+      ! boundary first-order in time whatever the spatial order.
       call compute_prim(mesh, sol, prim)
       call compute_rhs(mesh, sol, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
       dt = min(dt, compute_dt(mesh, sum_lambda))
@@ -90,27 +93,28 @@ program euler_ho_main
       call sync_gamma_arr(mesh, sol1)
 
       call compute_prim(mesh, sol1, prim)
-      call compute_rhs(mesh, sol1, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+      call compute_rhs(mesh, sol1, prim, rhs, sum_lambda, t + 0.5_DOUBLE*dt, num_procs, mpi_send_recv)
       k2 = rhs
       sol2 = sol + 0.5_DOUBLE * dt * k2
       if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 6_ENTIER, sol2)
       call sync_gamma_arr(mesh, sol2)
 
       call compute_prim(mesh, sol2, prim)
-      call compute_rhs(mesh, sol2, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+      call compute_rhs(mesh, sol2, prim, rhs, sum_lambda, t + 0.5_DOUBLE*dt, num_procs, mpi_send_recv)
       k3 = rhs
       sol3 = sol + dt * k3
       if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 6_ENTIER, sol3)
       call sync_gamma_arr(mesh, sol3)
 
       call compute_prim(mesh, sol3, prim)
-      call compute_rhs(mesh, sol3, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+      call compute_rhs(mesh, sol3, prim, rhs, sum_lambda, t + dt, num_procs, mpi_send_recv)
       k4 = rhs
       sol = sol + (dt / 6.0_DOUBLE) * (k1 + 2.0_DOUBLE * k2 + 2.0_DOUBLE * k3 + k4)
       if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 6_ENTIER, sol)
       call sync_gamma_arr(mesh, sol)
     else
-      ! SSP-RK3 (Shu-Osher 1988). Ghost cells are refreshed after every stage:
+      ! SSP-RK3 (Shu-Osher 1988), stage times t, t+dt, t+dt/2 -- see the RK4
+      ! note above on why the substage time matters. Ghost cells are refreshed after every stage:
       ! compute_rhs's flux stencil reads the neighbour rank's sol at the next
       ! stage, and without this exchange a partition boundary silently behaves
       ! like a wall holding its t=0 value forever.
@@ -122,13 +126,13 @@ program euler_ho_main
       call sync_gamma_arr(mesh, sol1)
 
       call compute_prim(mesh, sol1, prim)
-      call compute_rhs(mesh, sol1, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+      call compute_rhs(mesh, sol1, prim, rhs, sum_lambda, t + dt, num_procs, mpi_send_recv)
       sol2 = 0.75_DOUBLE * sol + 0.25_DOUBLE * (sol1 + dt * rhs)
       if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 6_ENTIER, sol2)
       call sync_gamma_arr(mesh, sol2)
 
       call compute_prim(mesh, sol2, prim)
-      call compute_rhs(mesh, sol2, prim, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+      call compute_rhs(mesh, sol2, prim, rhs, sum_lambda, t + 0.5_DOUBLE*dt, num_procs, mpi_send_recv)
       sol  = (1.0_DOUBLE/3.0_DOUBLE) * sol &
            + (2.0_DOUBLE/3.0_DOUBLE) * (sol2 + dt * rhs)
       if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 6_ENTIER, sol)
