@@ -173,7 +173,10 @@ contains
     use mpi
     use ns_global_data_module, only: bc_style, scheme, exclude_bound_vert, &
       scheme_id, scheme_adv_id, scheme_lag_id, &
-      SCHEME_ZB, SCHEME_WIP, SCHEME_WIP2, SCHEME_WIP2_NOLM, SCHEME_USI3D, &
+      SCHEME_ZB, SCHEME_WIP, SCHEME_WIP2, SCHEME_WIP2_NOLM, SCHEME_WIP2_AADV, SCHEME_WIP2_HYB, &
+      SCHEME_WIP2_EJUMP, SCHEME_WIP2_EDIV, SCHEME_WIP2_EMAX, &
+      SCHEME_WIP2_ENTH, SCHEME_WIP2_ENTH_EJUMP, &
+      SCHEME_WIP2_TP, SCHEME_WIP2_TP_ENTH, SCHEME_USI3D, &
       SCHEME_ADV_AR1D, SCHEME_ADV_AM, SCHEME_ADV_AMISO, &
       SCHEME_ADV_ARMD, SCHEME_ADV_ARMDU, &
       SCHEME_ADV_ARMDMAT, SCHEME_ADV_ARMDUMAT, &
@@ -194,6 +197,7 @@ contains
     logical, intent(in) :: second_order
 
     integer(kind=ENTIER) :: j, idse, ide, id_vert, nsfn, nsen, max_nsen
+    integer(kind=ENTIER) :: adv_mode, eps_mode
     real(kind=DOUBLE), dimension(3) :: v_vert
     real(kind=DOUBLE), dimension(:), allocatable :: sum_lambda_vert
     real(kind=DOUBLE), dimension(:, :), allocatable :: flux_sum_vert
@@ -308,15 +312,39 @@ contains
           sum_lambda(ide) = sum_lambda(ide) + sum_lambda_vert(j)
         end do
       end do
-    else if (scheme_id == SCHEME_WIP2 .or. scheme_id == SCHEME_WIP2_NOLM) then
+    else if (scheme_id == SCHEME_WIP2 .or. scheme_id == SCHEME_WIP2_NOLM &
+        .or. scheme_id == SCHEME_WIP2_AADV .or. scheme_id == SCHEME_WIP2_HYB &
+        .or. scheme_id == SCHEME_WIP2_EJUMP .or. scheme_id == SCHEME_WIP2_EDIV &
+        .or. scheme_id == SCHEME_WIP2_EMAX .or. scheme_id == SCHEME_WIP2_ENTH &
+        .or. scheme_id == SCHEME_WIP2_ENTH_EJUMP .or. scheme_id == SCHEME_WIP2_TP &
+        .or. scheme_id == SCHEME_WIP2_TP_ENTH) then
       do id_vert = 1, mesh%n_vert
         nsfn = mesh%vert(id_vert)%n_sub_faces_neigh
         nsen = mesh%vert(id_vert)%n_sub_elems_neigh
         sum_lambda_vert(1:nsen) = 0.0_DOUBLE
         flux_sum_vert(:, 1:nsen) = 0.0_DOUBLE
+        if (scheme_id == SCHEME_WIP2_AADV) then
+          adv_mode = 1
+        else if (scheme_id == SCHEME_WIP2_HYB) then
+          adv_mode = 2
+        else
+          adv_mode = 0
+        end if
+        if (scheme_id == SCHEME_WIP2_EJUMP .or. scheme_id == SCHEME_WIP2_ENTH_EJUMP) then
+          eps_mode = 1
+        else if (scheme_id == SCHEME_WIP2_EDIV) then
+          eps_mode = 2
+        else if (scheme_id == SCHEME_WIP2_EMAX) then
+          eps_mode = 3
+        else
+          eps_mode = 0
+        end if
         call compute_rhs_around_vert_WIP2(mesh, sol, grad, &
           nsen, flux_sum_vert, sum_lambda_vert, &
-          id_vert, second_order, scheme_id == SCHEME_WIP2)
+          id_vert, second_order, scheme_id == SCHEME_WIP2, adv_mode, eps_mode, &
+          scheme_id == SCHEME_WIP2_ENTH .or. scheme_id == SCHEME_WIP2_ENTH_EJUMP &
+          .or. scheme_id == SCHEME_WIP2_TP_ENTH, &
+          scheme_id == SCHEME_WIP2_TP .or. scheme_id == SCHEME_WIP2_TP_ENTH)
 
         do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
           idse = mesh%vert(id_vert)%sub_elem_neigh(j)
@@ -371,7 +399,7 @@ contains
       SCHEME_MULTI_POINT, SCHEME_MULTI_POINT_ISO, SCHEME_MULTI_POINT_PRESSURE, &
       SCHEME_MULTI_POINT_PRESSURE_PH, &
       SCHEME_THREE_WAVE, SCHEME_TWO_WAVE, SCHEME_MODIFIED_THREE_WAVE, &
-      SCHEME_THREE_WAVE_ENTHALPY, SCHEME_MULTI_POINT_ENTHALPY, &
+      SCHEME_THREE_WAVE_ENTHALPY, SCHEME_MULTI_POINT_ENTHALPY, SCHEME_THREE_WAVE_ENTHALPY2, &
       SCHEME_MULTI_POINT_VILAR
     use linear_solver_module
     use mpi
@@ -526,6 +554,9 @@ contains
           mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
       case (SCHEME_THREE_WAVE_ENTHALPY)
         call three_wave_enthalpy(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+          mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
+      case (SCHEME_THREE_WAVE_ENTHALPY2)
+        call three_wave_enthalpy2(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
           mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
       case (SCHEME_MULTI_POINT_ENTHALPY)
         ! Mirrors the SCHEME_MULTI_POINT branch, except that the boundary-vertex fallback is

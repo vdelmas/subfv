@@ -2925,7 +2925,7 @@ contains
   ! pressure/velocity coupling that the low-Mach limit needs.
   subroutine compute_rhs_around_vert_WIP2(mesh, sol, grad, &
       nsen, flux_sum_vert, sum_lambda_vert, &
-      id_vert, second_order, low_mach)
+      id_vert, second_order, low_mach, adv_mode, eps_mode, enth_fix, tp_fix)
     use ns_global_data_module, only: boundary_2d
     implicit none
 
@@ -2938,6 +2938,39 @@ contains
     integer(kind=ENTIER), intent(in) :: id_vert
     logical, intent(in) :: second_order
     logical, intent(in) :: low_mach
+    ! 0 -> WIP's Rusanov-at-vstar advection with the Ducros sensor
+    !      (best low-Mach slope, least accurate on Sedov)
+    ! 1 -> AMISO advection: nodal upwind state blended with a pressure-corrected
+    !      central flux (best on Sedov, slope drops below 1)
+    ! 2 -> shock-sensor blend of the two: AMISO where the Ducros indicator says
+    !      "shock", Rusanov-at-vstar where the flow is smooth/vortical
+    integer(kind=ENTIER), intent(in) :: adv_mode
+    ! Which eps_p carbuncle sensor feeds the advection viscosity. These are the
+    ! four candidates of tex/wip.tex; Vincent's note there is that they give very
+    ! different wall heat fluxes, because the term must fire inside the shock and
+    ! NOT in the boundary layer or at the stagnation point.
+    ! 0 -> compute_corr_ducros       (c) Ducros filter          [4*a_p]
+    ! 1 -> compute_corr_pressure     (d) normalised p jump      [2*a_p]
+    ! 2 -> compute_corr2             (a) -div(v) only           [1*a_p]
+    ! 3 -> compute_corr_pressure_div (b) max(p jump, -div v)    [4*a_p]
+    integer(kind=ENTIER), intent(in) :: eps_mode
+    ! Haenel / MGallice enthalpy preservation (Tallois, papers/talois.pdf, eq 22-23):
+    ! the energy dissipation of the flux must equal the total enthalpy times the
+    ! mass dissipation, else total enthalpy is not preserved across the bow shock.
+    ! Since rho*E = rho*h - p, replacing d(rho*E) by h_bar*d(rho) in the dissipation
+    ! is exactly that condition. Tallois shows the unmodified multidimensional
+    ! (Gallice-2D) solver puts the density maximum off the stagnation point, which
+    ! is what ruins a wall heat flux.
+    logical, intent(in) :: enth_fix
+    ! Tallois PhD section 6.3.3, eq (6.3.3.2): the MULTIDIMENSIONAL low-Mach
+    ! correction. p_l^theta = theta_n*[p_l - lambda_l*(u_n - u_l).n] + (1-theta_n)*q_n
+    ! with theta_n = min(1, |u_n|/a). Here q_n (eq 6.3.3.1) is exactly this code's
+    ! nodal pressure pp, so the low-Mach end (theta_n->0) reproduces WIP2_NOLM
+    ! bit-for-bit, and the shock end (theta_n->1) becomes the one-sided GLACE
+    ! nodal pressure flux built on the nodal velocity. Crucially BOTH ends are
+    ! nodal, so unlike a convex blend with the 1D flux the multidimensional
+    ! character is never lost -- that is the thesis's stated reason for this form.
+    logical, intent(in) :: tp_fix
 
     integer(kind=ENTIER) :: j, id_sub_face, id_sub_elem, id_elem
     integer(kind=ENTIER) :: le, re, lse, rse, lse_loc, rse_loc
@@ -2949,7 +2982,18 @@ contains
     real(kind=DOUBLE) :: a_p, ma_node, theta, corr, vstar
     real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, sol_w
     real(kind=DOUBLE), dimension(5) :: sol_l, sol_r, sol_m
-    real(kind=DOUBLE), dimension(5) :: ff_lag, ff_adv, fminus, fplus
+    real(kind=DOUBLE), dimension(5) :: ff_lag, ff_lag_l, ff_lag_r, ff_adv, fminus, fplus
+
+    ! AMISO advection workspace
+    real(kind=DOUBLE) :: min_apf, sum_area_a, lambda_a, wpcf, rhom, am, vm
+    real(kind=DOUBLE), dimension(5) :: sol_p, u_bar, ff_a, fadv_minus, fadv_plus
+    ! shock-sensor blend workspace
+    logical :: need_amiso, need_ducros
+    real(kind=DOUBLE) :: corr_a, w_shock
+    real(kind=DOUBLE) :: h_l, h_r, h_bar
+    real(kind=DOUBLE) :: theta_n, pflux_l, pflux_r, vn_node
+    real(kind=DOUBLE), dimension(3) :: u_node
+    real(kind=DOUBLE), dimension(5) :: djump
 
     rse_loc = 0
 
@@ -2973,8 +3017,89 @@ contains
       theta = 1.0_DOUBLE
     end if
 
-    ! carbuncle / shock sensor, same as WIP
-    call compute_corr_ducros(mesh, id_vert, sol, grad, corr, second_order)
+    ! nodal velocity + its Mach, needed by the Tallois multidimensional correction
+    theta_n = 0.0_DOUBLE
+    u_node = 0.0_DOUBLE
+    if (tp_fix) then
+      call compute_nodal_velocity_LVP(mesh, id_vert, sol, grad, u_node, second_order)
+      theta_n = min(1.0_DOUBLE, norm2(u_node)/a_p)
+    end if
+
+    ! carbuncle / shock sensor: each advection variant keeps its own, so that
+    ! switching adv_mode reproduces that family's behaviour exactly
+    need_ducros = (adv_mode == 0 .or. adv_mode == 2)
+
+    corr = 0.0_DOUBLE
+    corr_a = 0.0_DOUBLE
+    if (need_ducros) then
+      select case (eps_mode)
+      case (1)
+        call compute_corr_pressure(mesh, id_vert, sol, grad, corr, second_order)
+      case (2)
+        call compute_corr2(mesh, id_vert, sol, grad, corr, second_order)
+      case (3)
+        call compute_corr_pressure_div(mesh, id_vert, sol, grad, corr, second_order)
+      case default
+        call compute_corr_ducros(mesh, id_vert, sol, grad, corr, second_order)
+      end select
+    end if
+
+    ! Blend weight: compute_corr_ducros returns corr = w * 4 * a_p, where w is
+    ! its dimensionless [0,1] shock indicator (Ducros filter gated by Mach and
+    ! by compression). Recover w by dividing out the 4*a_p it multiplied in,
+    ! so the blend follows the same sensor the dissipation already uses.
+    ! NB: this divides out compute_corr_ducros's own 4*a_p, so it is only valid
+    ! for eps_mode == 0 -- the only blended scheme (WIP2_HYB) is registered so.
+    w_shock = 0.0_DOUBLE
+    if (adv_mode == 2) then
+      w_shock = min(1.0_DOUBLE, max(0.0_DOUBLE, corr/(4.0_DOUBLE*a_p)))
+    end if
+
+    ! With w_shock == 0 the AMISO contribution is multiplied by zero, so skip
+    ! it entirely (exactly equivalent, and it is the common case: the sensor
+    ! only fires at shocks, leaving most of a mesh on the Ducros branch alone).
+    need_amiso = (adv_mode == 1) .or. (adv_mode == 2 .and. w_shock > 0.0_DOUBLE)
+    if (need_amiso) call compute_corr2(mesh, id_vert, sol, grad, corr_a, second_order)
+
+    ! --- AMISO advection: nodal upwind state sol_p (first pass) ---
+    if (need_amiso) then
+      min_apf = huge(1.0_DOUBLE)
+      do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+        id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+        re = mesh%sub_face(id_sub_face)%right_elem_neigh
+        if (re > 0) then
+          min_apf = min(min_apf, mesh%sub_face(id_sub_face)%area)
+        end if
+      end do
+
+      sol_p = 0.0_DOUBLE
+      sum_area_a = 0.0_DOUBLE
+      do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+        id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+        le = mesh%sub_face(id_sub_face)%left_elem_neigh
+        re = mesh%sub_face(id_sub_face)%right_elem_neigh
+        norm = mesh%sub_face(id_sub_face)%norm
+
+        call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
+          second_order, sol_w_l, sol_w_r)
+
+        vnl = dot_product(sol_w_l(2:4), norm)
+        vnr = dot_product(sol_w_r(2:4), norm)
+        lambda_a = max(1e-8_DOUBLE, -vnl, vnr) + corr_a
+
+        sol_l = primit_to_conserv(sol_w_l)
+        sol_r = primit_to_conserv(sol_w_r)
+        u_bar = sol_l*0.5_DOUBLE*(1.0_DOUBLE + vnl/lambda_a) &
+              + sol_r*0.5_DOUBLE*(1.0_DOUBLE - vnr/lambda_a)
+
+        if (re > 0) then
+          wpcf = min_apf/mesh%sub_face(id_sub_face)%area
+          sol_p = sol_p + mesh%sub_face(id_sub_face)%area*wpcf*lambda_a*u_bar
+          sum_area_a = sum_area_a + mesh%sub_face(id_sub_face)%area*wpcf*lambda_a
+        end if
+      end do
+      sol_p = sol_p / sum_area_a
+    end if
 
     ! --- nodal pressure with the Mach-scaled velocity-jump (divv) term ---
     pp = 0.0_DOUBLE
@@ -3048,13 +3173,83 @@ contains
       sol_m = 0.5_DOUBLE*(sol_r + sol_l)
 
       ff_lag(1) = 0.0_DOUBLE
-      ff_lag(2:4) = pp * norm
-      ff_lag(5) = pp * vstar
+      if (tp_fix) then
+        ! one-sided GLACE pressure at the shock end, nodal pressure at the
+        ! low-Mach end; energy velocity blends the same way so theta_n=0 is
+        ! exactly the WIP2_NOLM flux.
+        vn_node = dot_product(u_node, norm)
+        pflux_l = theta_n*(pl - lambda_l*(vn_node - vnl)) + (1.0_DOUBLE - theta_n)*pp
+        pflux_r = theta_n*(pr + lambda_r*(vn_node - vnr)) + (1.0_DOUBLE - theta_n)*pp
+        ff_lag(5) = 0.0_DOUBLE
+      else
+        ff_lag(2:4) = pp * norm
+        ff_lag(5) = pp * vstar
+      end if
 
-      ff_adv = vstar*sol_m - 0.5_DOUBLE*(abs(vstar) + corr)*(sol_r - sol_l)
+      ! jump used by the advection dissipation
+      djump = sol_r - sol_l
+      if (enth_fix) then
+        h_l = (sol_l(5) + pl)/rhol
+        h_r = (sol_r(5) + pr)/rhor
+        h_bar = 0.5_DOUBLE*(h_l + h_r)
+        djump(5) = h_bar*(rhor - rhol)
+      end if
 
-      fminus = ff_adv + ff_lag
-      fplus = fminus
+      ! Rusanov-at-vstar advection (WIP form)
+      if (need_ducros) then
+        ff_adv = vstar*sol_m - 0.5_DOUBLE*(abs(vstar) + corr)*djump
+      end if
+
+      ! AMISO advection (asymmetric by construction: the nodal upwind state
+      ! sol_p is approached from each side, so fadv_minus /= fadv_plus)
+      if (need_amiso) then
+        rhom = 0.5_DOUBLE*(rhol + rhor)
+        am = 0.5_DOUBLE*(al + ar)
+        vm = 0.5_DOUBLE*(vnr + vnl) - 0.5_DOUBLE/(rhom*am)*(pr - pl)
+        lambda_a = max(1e-8_DOUBLE, -vnl, vnr) + corr_a
+        ff_a = vm*sol_m - 0.5_DOUBLE*(abs(vm) + corr_a)*djump
+
+        if (re > 0) then
+          wpcf = min_apf/mesh%sub_face(id_sub_face)%area * (1.0_DOUBLE/3.0_DOUBLE)
+          fadv_minus = wpcf*(sol_l*vnl - lambda_a*(sol_p - sol_l)) &
+            + (1.0_DOUBLE - wpcf)*ff_a
+          fadv_plus = wpcf*(sol_r*vnr + lambda_a*(sol_p - sol_r)) &
+            + (1.0_DOUBLE - wpcf)*ff_a
+        else
+          fadv_minus = ff_a
+          fadv_plus = ff_a
+        end if
+      end if
+
+      if (tp_fix) then
+        ! per-side Lagrange flux (the GLACE part is one-sided by construction)
+        ff_lag_l(1) = 0.0_DOUBLE
+        ff_lag_l(2:4) = pflux_l * norm
+        ff_lag_l(5) = pflux_l * (theta_n*vn_node + (1.0_DOUBLE - theta_n)*vstar)
+        ff_lag_r(1) = 0.0_DOUBLE
+        ff_lag_r(2:4) = pflux_r * norm
+        ff_lag_r(5) = pflux_r * (theta_n*vn_node + (1.0_DOUBLE - theta_n)*vstar)
+      else
+        ff_lag_l = ff_lag
+        ff_lag_r = ff_lag
+      end if
+
+      select case (adv_mode)
+      case (1)
+        fminus = fadv_minus + ff_lag_l
+        fplus = fadv_plus + ff_lag_r
+      case (2)
+        if (need_amiso) then
+          fminus = (1.0_DOUBLE - w_shock)*ff_adv + w_shock*fadv_minus + ff_lag_l
+          fplus = (1.0_DOUBLE - w_shock)*ff_adv + w_shock*fadv_plus + ff_lag_r
+        else
+          fminus = ff_adv + ff_lag_l
+          fplus = ff_adv + ff_lag_r
+        end if
+      case default
+        fminus = ff_adv + ff_lag_l
+        fplus = ff_adv + ff_lag_r
+      end select
 
       if (boundary_2d &
         .and. abs(mesh%sub_face(id_sub_face)%norm(3)) > 1e-3) then
