@@ -10,6 +10,13 @@ module lagrange_module
   implicit none
 
   real(kind=DOUBLE), parameter :: gamma = 7.0_DOUBLE/5.0_DOUBLE
+
+  ! Taylor-Green vortex (init = 10) -- the reference convergence test case for
+  ! cell-centred Lagrangian hydrodynamics (Vilar, PhD 2012, Sec. 4.2.4). C0 has to
+  ! keep the pressure positive: min[cos+cos] = -2, so C0 > rho0*U0^2/2.
+  real(kind=DOUBLE), parameter :: tg_rho0 = 1.0_DOUBLE
+  real(kind=DOUBLE), parameter :: tg_u0   = 1.0_DOUBLE
+  real(kind=DOUBLE), parameter :: tg_c0   = 1.0_DOUBLE
 contains
   subroutine compute_rhs_lagrange(mesh, sol, vp, dt, rhs, n_bc, bc_type, bc_val, b2d, mass, &
       gamma_arr, vp_is_imposed, second_order, grad_v, grad_p, div_v, alpha_p_arr)
@@ -304,7 +311,8 @@ contains
     end do
   end subroutine compute_rhs_around_node
 
-  subroutine compute_gradients(mesh, sol, gamma_arr, dt, grad_v, grad_p, div_v, p_limited)
+  subroutine compute_gradients(mesh, sol, gamma_arr, dt, grad_v, grad_p, div_v, p_limited, weno, &
+      gg_corrected, eps_weno_in)
     use linear_solver_module, only: tensor_product_3, inverse_3_by_3
     ! Nodal WENO Green-Gauss gradients weighted by ||grad_p||.
     ! div_v = trace(grad_v).
@@ -318,13 +326,40 @@ contains
     real(kind=DOUBLE), dimension(3, mesh%n_elems), intent(out) :: grad_p
     real(kind=DOUBLE), dimension(mesh%n_elems), intent(out) :: div_v
     integer(kind=ENTIER), dimension(mesh%n_elems), intent(out), optional :: p_limited
+    ! .false. -> plain volume-weighted average of the nodal gradients (linear
+    ! scheme). Default .true. = the WENO-style weight below, which is nonlinear
+    ! even in smooth flow and is what the scheme has always used.
+    logical, intent(in), optional :: weno
+    ! .true. -> CORRECTED Green-Gauss, as aho_gg does: grad = mat^-1 . (sum A n dphi)
+    ! with mat = sum A n (x) dx, instead of dividing the raw flux sum by the nodal
+    ! volume Omega_p. The uncorrected form is only exact for a linear field when
+    ! mat = Omega_p * I, which holds on a Cartesian hex mesh by symmetry but not in
+    ! general. Default .false. = the historical behaviour.
+    logical, intent(in), optional :: gg_corrected
+    ! eps in the nonlinear nodal-gradient weight w_p = Omega_p/(eps + ||S_p||^4).
+    ! Default tiny() makes the weighting fully nonlinear even in smooth flow; a
+    ! larger eps (e.g. 1e-2) pushes it back towards the plain volume-weighted
+    ! (linear) combination wherever ||S_p||^4 is small compared to eps.
+    real(kind=DOUBLE), intent(in), optional :: eps_weno_in
 
     integer(kind=ENTIER) :: i, j, id_sub_face, id_sub_elem, id_face, id_elem, idl, idr
     real(kind=DOUBLE) :: omega_p, pl, pr, area, w_p, norm_Sp, p0
-    real(kind=DOUBLE), parameter :: eps_weno = tiny(1.0_DOUBLE)
+    real(kind=DOUBLE) :: eps_weno
     real(kind=DOUBLE), dimension(3) :: S_p, vl_vec, vr_vec, dv_vec, n, dx
     real(kind=DOUBLE), dimension(3, 3) :: S_p_gv, mat, mat_inv
     real(kind=DOUBLE), dimension(:), allocatable :: sum_omega_p, sum_omega_gv
+    logical :: use_weno, use_corr, mat_ok
+    real(kind=DOUBLE) :: det_mat
+    real(kind=DOUBLE), dimension(3, 3) :: mat_inv_t
+
+    use_weno = .true.
+    if (present(weno)) use_weno = weno
+    eps_weno = tiny(1.0_DOUBLE)
+    if (present(eps_weno_in)) then
+      if (eps_weno_in > 0.0_DOUBLE) eps_weno = eps_weno_in
+    end if
+    use_corr = .false.
+    if (present(gg_corrected)) use_corr = gg_corrected
 
     grad_v = 0.0_DOUBLE
     grad_p = 0.0_DOUBLE
@@ -368,11 +403,34 @@ contains
         S_p_gv = S_p_gv + area * tensor_product_3(dv_vec, n)
       end do
 
-      S_p    = S_p    / omega_p
-      S_p_gv = S_p_gv / omega_p
+      if (use_corr) then
+        ! S_p(i)      = mat(i,j) dp/dx_j            -> grad_p = mat^-1 S_p
+        ! S_p_gv(i,j) = J(i,k) mat(j,k)             -> J      = S_p_gv . (mat^-1)^T
+        ! Singular/ill-conditioned mat (degenerate vertex stencils) falls back to
+        ! the uncorrected form rather than producing garbage.
+        det_mat = mat(1,1)*(mat(2,2)*mat(3,3) - mat(2,3)*mat(3,2)) &
+                - mat(1,2)*(mat(2,1)*mat(3,3) - mat(2,3)*mat(3,1)) &
+                + mat(1,3)*(mat(2,1)*mat(3,2) - mat(2,2)*mat(3,1))
+        mat_ok = abs(det_mat) > 1.0e-12_DOUBLE*max(omega_p, tiny(1.0_DOUBLE))**3
+        if (mat_ok) then
+          call inverse_3_by_3(mat, mat_inv)
+          mat_inv_t = transpose(mat_inv)
+          S_p    = matmul(mat_inv, S_p)
+          S_p_gv = matmul(S_p_gv, mat_inv_t)
+        else
+          S_p    = S_p    / omega_p
+          S_p_gv = S_p_gv / omega_p
+        end if
+      else
+        S_p    = S_p    / omega_p
+        S_p_gv = S_p_gv / omega_p
+      end if
       norm_Sp = norm2(S_p)
-      w_p = omega_p / (eps_weno + norm_Sp**4)
-      !w_p = omega_p
+      if (use_weno) then
+        w_p = omega_p / (eps_weno + norm_Sp**4)
+      else
+        w_p = omega_p
+      end if
 
       do j = 1, mesh%vert(i)%n_sub_elems_neigh
         id_sub_elem = mesh%vert(i)%sub_elem_neigh(j)
@@ -978,6 +1036,15 @@ contains
         sol(5, i) = sol(5, i)/(sol(1, i)*(gamma_arr(i)-1.0_DOUBLE)) &
           + 0.5_DOUBLE*norm2(sol(2:4, i))**2
         sol(1, i) = 1.0_DOUBLE/sol(1, i)
+      end do
+    else if( init == 10) then
+      ! Taylor-Green. Initialised with the exact CELL AVERAGE of the conserved
+      ! variables (quadrature over the cell), not the centroid point value as
+      ! init=2 does: a centroid initialisation injects an O(h^2) error of its own,
+      ! which is the same order as what a second-order scheme is being measured
+      ! against. rho is uniform here, so the mass average is the volume average.
+      do i=1, mesh%n_elems
+        call taylor_green_cell_average(mesh, i, sol(:, i))
       end do
     else if( init == 42 ) then
       do i=1, mesh%n_elems
@@ -1629,4 +1696,358 @@ contains
     end do
     if (.not. (newEps >= 0.0_DOUBLE)) omega_pos = 0.0_DOUBLE
   end function omega_pos
+
+  ! L1/L2/Linf density error against the steady isentropic vortex (init=2).
+  ! Lagrangian specific: the mesh has MOVED, so the exact cell average is
+  ! re-quadratured on the deformed cell at the current vertex positions.
+  ! The vortex has zero background velocity, so it is an exact steady state
+  ! of the Euler equations and the exact field is the t=0 one at the moved
+  ! cell's own location (t is kept in the signature for symmetry).
+  subroutine compute_error_vortex(mesh, sol, t, h_extrude, h, l1err, l2err, linferr)
+    use quadrature_module, only: volume_quad_pts
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), intent(in) :: t, h_extrude
+    real(kind=DOUBLE), intent(out) :: h, l1err, l2err, linferr
+
+    integer(kind=ENTIER) :: i, k, q, n_v, n_inner, mpi_ierr
+    real(kind=DOUBLE) :: err1, err2, errinf, area_tot, area_i, rho_num, rho_ex, vol_q
+    real(kind=DOUBLE), dimension(5) :: wq
+    real(kind=DOUBLE), dimension(:, :), allocatable :: vcoords, pts
+    real(kind=DOUBLE), dimension(:), allocatable :: wts
+    real(kind=DOUBLE), dimension(4) :: buf
+
+    err1     = 0.0_DOUBLE
+    err2     = 0.0_DOUBLE
+    errinf   = 0.0_DOUBLE
+    area_tot = 0.0_DOUBLE
+    n_inner  = 0
+
+    do i = 1, mesh%n_elems
+      if (mesh%elem(i)%is_ghost) cycle
+
+      n_v = mesh%elem(i)%n_vert
+      rho_ex = 0.0_DOUBLE
+      if (n_v == 4 .or. n_v == 5 .or. n_v == 6 .or. n_v == 8) then
+        allocate(vcoords(3, n_v))
+        do k = 1, n_v
+          vcoords(:, k) = mesh%vert(mesh%elem(i)%vert(k))%coord
+        end do
+        call volume_quad_pts(n_v, vcoords, 3_ENTIER, pts, wts)
+        deallocate(vcoords)
+        vol_q = 0.0_DOUBLE
+        do q = 1, size(wts)
+          call sol_isentropic_vortex(pts(:, q), wq, t)
+          rho_ex = rho_ex + wts(q)*wq(1)
+          vol_q  = vol_q  + wts(q)
+        end do
+        deallocate(pts, wts)
+        if (vol_q > 0.0_DOUBLE) then
+          rho_ex = rho_ex/vol_q
+        else
+          call sol_isentropic_vortex(mesh%elem(i)%coord, wq, t)
+          rho_ex = wq(1)
+        end if
+      else
+        call sol_isentropic_vortex(mesh%elem(i)%coord, wq, t)
+        rho_ex = wq(1)
+      end if
+
+      rho_num = 1.0_DOUBLE/sol(1, i)
+      area_i  = mesh%elem(i)%volume/h_extrude
+
+      err1     = err1 + area_i*abs(rho_num - rho_ex)
+      err2     = err2 + area_i*(rho_num - rho_ex)**2
+      errinf   = max(errinf, abs(rho_num - rho_ex))
+      area_tot = area_tot + area_i
+      n_inner  = n_inner + 1
+    end do
+
+    buf = (/err1, err2, area_tot, real(n_inner, DOUBLE)/)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, buf, 3, MPI_DOUBLE_PRECISION, MPI_SUM, &
+      MPI_COMM_WORLD, mpi_ierr)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, buf(4), 1, MPI_DOUBLE_PRECISION, MPI_SUM, &
+      MPI_COMM_WORLD, mpi_ierr)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, errinf, 1, MPI_DOUBLE_PRECISION, MPI_MAX, &
+      MPI_COMM_WORLD, mpi_ierr)
+    err1     = buf(1)
+    err2     = buf(2)
+    area_tot = buf(3)
+
+    if (buf(4) > 0.0_DOUBLE .and. area_tot > 0.0_DOUBLE) then
+      h     = sqrt(area_tot/buf(4))
+      l1err = err1/area_tot
+      l2err = sqrt(err2/area_tot)
+    else
+      h = 0.0_DOUBLE; l1err = 0.0_DOUBLE; l2err = 0.0_DOUBLE
+    end if
+    linferr = errinf
+  end subroutine compute_error_vortex
+
+  ! 2D footprint area of a cell on an extruded "2D" mesh. Takes the area of the
+  ! z-normal face directly, the way euler_ho's compute_error_vortex does, instead
+  ! of volume/h_extrude: on a MOVING Lagrangian mesh the latter silently assumes
+  ! the z-extent is still the one auto-detected at t=0, and it hides a degenerate
+  ! cell (a NaN or zero volume shows up as a plausible area). Falls back to
+  ! volume/h_extrude when no z-face is found (a genuinely 3D mesh).
+  function cell_area_2d(mesh, i, h_extrude) result(area)
+    use quadrature_module, only: face_quad_pts
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: i
+    real(kind=DOUBLE), intent(in) :: h_extrude
+    real(kind=DOUBLE) :: area
+
+    integer(kind=ENTIER) :: kf, iface_loc, n_fv, k
+    real(kind=DOUBLE), dimension(:, :), allocatable :: fc, qpts_v
+    real(kind=DOUBLE), dimension(:), allocatable :: qwts_v
+
+    area = -1.0_DOUBLE
+    do kf = 1, mesh%elem(i)%n_faces
+      iface_loc = mesh%elem(i)%face(kf)
+      if (abs(abs(mesh%face(iface_loc)%norm(3)) - 1.0_DOUBLE) < 1.0e-6_DOUBLE) then
+        n_fv = mesh%face(iface_loc)%n_vert
+        if (n_fv >= 3 .and. allocated(mesh%face(iface_loc)%vert)) then
+          allocate(fc(3, n_fv))
+          do k = 1, n_fv
+            fc(:, k) = mesh%vert(mesh%face(iface_loc)%vert(k))%coord
+          end do
+          call face_quad_pts(n_fv, fc, 3_ENTIER, qpts_v, qwts_v)
+          deallocate(fc)
+          area = sum(qwts_v)
+          deallocate(qpts_v, qwts_v)
+          exit
+        end if
+      end if
+    end do
+    if (area <= 0.0_DOUBLE) area = mesh%elem(i)%volume/h_extrude
+  end function cell_area_2d
+
+  ! ---------------------------------------------------------------------------
+  ! Taylor-Green vortex, following Vilar (PhD 2012, Sec. 4.2.4), the standard
+  ! convergence test case for cell-centred Lagrangian hydrodynamics.
+  !
+  !   domain [0,1]^2,  rho = rho0  (uniform),
+  !   U = U0 ( sin(pi x) cos(pi y), -cos(pi x) sin(pi y) )   -- divergence free,
+  !   P = rho0 U0^2 / 4 * [cos(2 pi x) + cos(2 pi y)] + C0.
+  !
+  ! The velocity field being divergence free, the volume equation holds identically,
+  ! and that P is exactly what balances the inertia in the momentum equation. The
+  ! total energy equation does NOT close on its own: it needs the source term in
+  ! taylor_green_source (Vilar eq. 4.102-4.103). WITH that source the Eulerian
+  ! fields are steady, so the exact solution at any time is the initial one, which
+  ! is what compute_error_taylor_green relies on. WITHOUT it the computed solution
+  ! drifts and the error measurement is meaningless.
+  !
+  ! Note Vilar measures the rate on the PRESSURE, never the density -- here rho is
+  ! uniform and carries no signal at all.
+  ! ---------------------------------------------------------------------------
+  pure subroutine sol_taylor_green(coord, w)
+    use lagrange_global_data_module
+    implicit none
+
+    real(kind=DOUBLE), dimension(3), intent(in) :: coord
+    real(kind=DOUBLE), dimension(5), intent(inout) :: w
+
+    real(kind=DOUBLE) :: x, y
+
+    x = coord(1)
+    y = coord(2)
+    w(1) = tg_rho0
+    w(2) =  tg_u0*sin(PI*x)*cos(PI*y)
+    w(3) = -tg_u0*cos(PI*x)*sin(PI*y)
+    w(4) = 0.0_DOUBLE
+    w(5) = 0.25_DOUBLE*tg_rho0*tg_u0**2 &
+      *(cos(2.0_DOUBLE*PI*x) + cos(2.0_DOUBLE*PI*y)) + tg_c0
+  end subroutine sol_taylor_green
+
+  ! Energy source per unit VOLUME that closes the total energy equation, Vilar
+  ! eq. (4.103). Re-derived independently and it matches the printed formula.
+  pure function taylor_green_source(coord) result(src)
+    use lagrange_global_data_module
+    implicit none
+
+    real(kind=DOUBLE), dimension(3), intent(in) :: coord
+    real(kind=DOUBLE) :: src, x, y
+
+    x = coord(1)
+    y = coord(2)
+    src = PI*tg_rho0*tg_u0**3/(4.0_DOUBLE*(gamma - 1.0_DOUBLE)) &
+      *(cos(3.0_DOUBLE*PI*x)*cos(PI*y) - cos(3.0_DOUBLE*PI*y)*cos(PI*x))
+  end function taylor_green_source
+
+  ! Exact cell average of the Lagrangian conserved state (tau, u, E) over cell i.
+  subroutine taylor_green_cell_average(mesh, i, u_avg)
+    use quadrature_module, only: volume_quad_pts
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: i
+    real(kind=DOUBLE), dimension(5), intent(out) :: u_avg
+
+    integer(kind=ENTIER) :: k, q, n_v
+    real(kind=DOUBLE) :: vol_q, e_tot
+    real(kind=DOUBLE), dimension(5) :: w
+    real(kind=DOUBLE), dimension(:, :), allocatable :: vcoords, pts
+    real(kind=DOUBLE), dimension(:), allocatable :: wts
+
+    u_avg = 0.0_DOUBLE
+    n_v = mesh%elem(i)%n_vert
+    if (n_v == 4 .or. n_v == 5 .or. n_v == 6 .or. n_v == 8) then
+      allocate(vcoords(3, n_v))
+      do k = 1, n_v
+        vcoords(:, k) = mesh%vert(mesh%elem(i)%vert(k))%coord
+      end do
+      call volume_quad_pts(n_v, vcoords, 3_ENTIER, pts, wts)
+      deallocate(vcoords)
+      vol_q = 0.0_DOUBLE
+      do q = 1, size(wts)
+        call sol_taylor_green(pts(:, q), w)
+        e_tot = w(5)/(w(1)*(gamma - 1.0_DOUBLE)) + 0.5_DOUBLE*norm2(w(2:4))**2
+        u_avg(2:4) = u_avg(2:4) + wts(q)*w(2:4)
+        u_avg(5)   = u_avg(5)   + wts(q)*e_tot
+        vol_q = vol_q + wts(q)
+      end do
+      deallocate(pts, wts)
+      if (vol_q > 0.0_DOUBLE) then
+        u_avg(2:5) = u_avg(2:5)/vol_q
+      end if
+    else
+      call sol_taylor_green(mesh%elem(i)%coord, w)
+      u_avg(2:4) = w(2:4)
+      u_avg(5)   = w(5)/(w(1)*(gamma - 1.0_DOUBLE)) + 0.5_DOUBLE*norm2(w(2:4))**2
+    end if
+    u_avg(1) = 1.0_DOUBLE/tg_rho0     ! rho is uniform, so tau is exact
+  end subroutine taylor_green_cell_average
+
+  ! Adds the Taylor-Green energy source to the RHS. rhs(5,:) is dE/dt PER UNIT
+  ! MASS (new_sol = sol + dt*rhs with sol(5) the specific total energy), while the
+  ! source is per unit volume, hence the integral over the cell divided by its mass.
+  subroutine add_taylor_green_source(mesh, mass, rhs)
+    use quadrature_module, only: volume_quad_pts
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: mass
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(inout) :: rhs
+
+    integer(kind=ENTIER) :: i, k, q, n_v
+    real(kind=DOUBLE) :: src_int
+    real(kind=DOUBLE), dimension(:, :), allocatable :: vcoords, pts
+    real(kind=DOUBLE), dimension(:), allocatable :: wts
+
+    do i = 1, mesh%n_elems
+      if (mesh%elem(i)%is_ghost) cycle
+      if (mass(i) <= 0.0_DOUBLE) cycle
+      n_v = mesh%elem(i)%n_vert
+      src_int = 0.0_DOUBLE
+      if (n_v == 4 .or. n_v == 5 .or. n_v == 6 .or. n_v == 8) then
+        allocate(vcoords(3, n_v))
+        do k = 1, n_v
+          vcoords(:, k) = mesh%vert(mesh%elem(i)%vert(k))%coord
+        end do
+        call volume_quad_pts(n_v, vcoords, 3_ENTIER, pts, wts)
+        deallocate(vcoords)
+        do q = 1, size(wts)
+          src_int = src_int + wts(q)*taylor_green_source(pts(:, q))
+        end do
+        deallocate(pts, wts)
+      else
+        src_int = mesh%elem(i)%volume*taylor_green_source(mesh%elem(i)%coord)
+      end if
+      rhs(5, i) = rhs(5, i) + src_int/mass(i)
+    end do
+  end subroutine add_taylor_green_source
+
+  ! Error on the PRESSURE, as Vilar does. The exact reference is the pressure
+  ! re-quadratured on the DEFORMED cell at the final time: the Eulerian field is
+  ! steady, so the exact solution is the initial one evaluated at the cell's
+  ! current position.
+  subroutine compute_error_taylor_green(mesh, sol, gamma_arr, h_extrude, h, l1err, l2err, linferr)
+    use quadrature_module, only: volume_quad_pts
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
+    real(kind=DOUBLE), intent(in) :: h_extrude
+    real(kind=DOUBLE), intent(out) :: h, l1err, l2err, linferr
+
+    integer(kind=ENTIER) :: i, k, q, n_v, n_inner, mpi_ierr
+    real(kind=DOUBLE) :: err1, err2, errinf, area_tot, area_i, p_num, p_ex, vol_q
+    real(kind=DOUBLE), dimension(5) :: wq
+    real(kind=DOUBLE), dimension(:, :), allocatable :: vcoords, pts
+    real(kind=DOUBLE), dimension(:), allocatable :: wts
+    real(kind=DOUBLE), dimension(4) :: buf
+
+    err1 = 0.0_DOUBLE; err2 = 0.0_DOUBLE; errinf = 0.0_DOUBLE
+    area_tot = 0.0_DOUBLE; n_inner = 0
+
+    do i = 1, mesh%n_elems
+      if (mesh%elem(i)%is_ghost) cycle
+
+      n_v = mesh%elem(i)%n_vert
+      p_ex = 0.0_DOUBLE
+      if (n_v == 4 .or. n_v == 5 .or. n_v == 6 .or. n_v == 8) then
+        allocate(vcoords(3, n_v))
+        do k = 1, n_v
+          vcoords(:, k) = mesh%vert(mesh%elem(i)%vert(k))%coord
+        end do
+        call volume_quad_pts(n_v, vcoords, 3_ENTIER, pts, wts)
+        deallocate(vcoords)
+        vol_q = 0.0_DOUBLE
+        do q = 1, size(wts)
+          call sol_taylor_green(pts(:, q), wq)
+          p_ex  = p_ex + wts(q)*wq(5)
+          vol_q = vol_q + wts(q)
+        end do
+        deallocate(pts, wts)
+        if (vol_q > 0.0_DOUBLE) then
+          p_ex = p_ex/vol_q
+        else
+          call sol_taylor_green(mesh%elem(i)%coord, wq)
+          p_ex = wq(5)
+        end if
+      else
+        call sol_taylor_green(mesh%elem(i)%coord, wq)
+        p_ex = wq(5)
+      end if
+
+      p_num  = pressure(sol(:, i), gamma_arr(i))
+      area_i = cell_area_2d(mesh, i, h_extrude)
+
+      err1     = err1 + area_i*abs(p_num - p_ex)
+      err2     = err2 + area_i*(p_num - p_ex)**2
+      errinf   = max(errinf, abs(p_num - p_ex))
+      area_tot = area_tot + area_i
+      n_inner  = n_inner + 1
+    end do
+
+    buf = (/err1, err2, area_tot, real(n_inner, DOUBLE)/)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, buf, 4, MPI_DOUBLE_PRECISION, MPI_SUM, &
+      MPI_COMM_WORLD, mpi_ierr)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, errinf, 1, MPI_DOUBLE_PRECISION, MPI_MAX, &
+      MPI_COMM_WORLD, mpi_ierr)
+    err1 = buf(1); err2 = buf(2); area_tot = buf(3)
+
+    ! A diverged run makes area_tot NaN, and "NaN > 0" is false, so the plain
+    ! else branch below would report h=0, L1=0, L2=0 -- a blow-up disguised as a
+    ! zero error. Flag it explicitly instead.
+    if (.not. (area_tot == area_tot)) then
+      h = -1.0_DOUBLE; l1err = -1.0_DOUBLE; l2err = -1.0_DOUBLE; linferr = -1.0_DOUBLE
+      return
+    end if
+    if (buf(4) > 0.0_DOUBLE .and. area_tot > 0.0_DOUBLE) then
+      h     = sqrt(area_tot/buf(4))
+      l1err = err1/area_tot
+      l2err = sqrt(err2/area_tot)
+    else
+      h = 0.0_DOUBLE; l1err = 0.0_DOUBLE; l2err = 0.0_DOUBLE
+    end if
+    linferr = errinf
+  end subroutine compute_error_taylor_green
+
 end module lagrange_module

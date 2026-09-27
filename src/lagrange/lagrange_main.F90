@@ -52,6 +52,12 @@ program main
   integer(kind=ENTIER) :: n_sol_vtu=2
   integer(kind=ENTIER) :: i_sol_vtu
   integer(kind=ENTIER) :: iso_weight_mode = 2   ! w_pcf recipe for classic_iso_vol
+  ! Isentropic-vortex (init=2) convergence diagnostics
+  logical :: compute_error = .false.
+  logical :: grad_weno = .true.
+  logical :: grad_gg_corrected = .false.
+  real(kind=DOUBLE) :: grad_eps_weno = 0.0_DOUBLE   ! <=0 -> tiny(), the historical value
+  real(kind=DOUBLE) :: h_err, l1err, l2err, linferr
 
   namelist /INPUT_PARAM/ &
     meshfile_path, meshfile, &
@@ -60,7 +66,7 @@ program main
     scheme, method_length, b2d_h, &
     n_bc, bc_name, bc_type, bc_val, &
     sol_uniform, boundary_2d, &
-    n_sol_vtu, second_order, iso_weight_mode
+    n_sol_vtu, second_order, iso_weight_mode, compute_error, grad_weno, grad_gg_corrected, grad_eps_weno
 
   call MPI_INIT(mpi_ierr)
   call MPI_COMM_SIZE(MPI_COMM_WORLD, num_procs, mpi_ierr)
@@ -175,6 +181,9 @@ program main
   end do
 
   t = 0.0_DOUBLE
+  ! dt is read by compute_gradients / compute_rhs_* (GRP half-step) BEFORE
+  ! compute_dt assigns it on the first iteration -- it must start defined.
+  dt = 0.0_DOUBLE
   iter = 1
   do while ( t < t_max )
 
@@ -187,7 +196,8 @@ program main
 
     if (second_order) then
       call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)
-      call compute_gradients(mesh, sol, gamma_arr, dt, grad_v, grad_p, div_v, p_limited)
+      call compute_gradients(mesh, sol, gamma_arr, dt, grad_v, grad_p, div_v, p_limited, grad_weno, &
+        grad_gg_corrected, grad_eps_weno)
       ! Exchange ghost cell gradients so second-order RHS can reconstruct across MPI boundaries
       call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 3, grad_p)
       call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 9, grad_v)
@@ -219,6 +229,11 @@ program main
       print*, "No scheme !"
       error stop
     end if
+
+    ! Taylor-Green needs an energy source to close the total energy equation
+    ! (Vilar eq. 4.103). Added here, on the PRE-move mesh, because that is the
+    ! geometry rhs was just assembled on.
+    if (init == 10) call add_taylor_green_source(mesh, mass, rhs)
 
     call compute_dt(mesh, sol, dt, cfl, vp, me, num_procs, gamma_arr)
     if( t + dt > t_max ) dt = t_max - t
@@ -255,5 +270,17 @@ program main
   write(fln, *) "output_"//trim(adjustl(fln))
   call write_sol_lag(mesh, fln, new_sol, vp, pp, gamma_arr, grad_v, grad_p, div_v, alpha_p_arr, p_limited, h_p_arr)
   call write_sol_dat_lag(mesh, fln, new_sol, gamma_arr)
+
+  if (compute_error) then
+    if (init == 10) then
+      ! Taylor-Green: the rate is measured on the pressure, rho being uniform here.
+      call compute_error_taylor_green(mesh, new_sol, gamma_arr, h_extrude, h_err, &
+        l1err, l2err, linferr)
+    else
+      call compute_error_vortex(mesh, new_sol, t, h_extrude, h_err, l1err, l2err, linferr)
+    end if
+    if (me == 0) print *, "FINAL t=", t, "h=", h_err, "L1=", l1err, "L2=", l2err, "Linf=", linferr
+  end if
+
   call MPI_FINALIZE(mpi_ierr)
 end program main
