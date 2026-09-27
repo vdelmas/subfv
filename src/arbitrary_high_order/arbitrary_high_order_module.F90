@@ -1,4 +1,5 @@
 ! Arbitrary-order cell derivatives on unstructured meshes: recursive multi-D divided differences, one nodal LS/Green-Gauss fit + WENO scatter per recursion order (grad->hess->third), overlappable MPI exchange between orders.
+! Usage: set use_green_gauss = .true. (validated; aho_ls not recommended) and call compute_derivative_hierarchy(...) once per field; point evaluation of the reconstructed polynomial is separate, done by reconstruct() in euler_ho_module.F90.
 module arbitrary_high_order_module
   use precision_module
   use mesh_module
@@ -82,12 +83,8 @@ module arbitrary_high_order_module
   integer(kind=ENTIER), dimension(:), allocatable, save :: neigh_cache_start
   integer(kind=ENTIER), dimension(:), allocatable, save :: neigh_cache_list
 
-  ! Vertex-to-vertex adjacency (CSR), built once per mesh: v' is a neighbor of v if they share at
-  ! least one cell. Pure topology (no such array exists on vert_type/mesh_type itself -- every
-  ! _neigh field there points to elements/faces, never other vertices). Needed for aho_cls
-  ! (Haider, Croisille & Courbet 2011): raising a vertex's k-exact k-th derivative to (k+1)-exact
-  ! uses differences against NEIGHBORING VERTICES' own k-exact derivative, staying at the vertex
-  ! level between orders instead of compute_next_order_derivative's node->cell->node chain.
+  ! Vertex-to-vertex adjacency (CSR), built once per mesh: v' is a neighbor of v if they share a
+  ! cell. Used by aho_cls's vertex-level k-exact chain.
   integer(kind=ENTIER), save :: vv_neigh_cache_n_vert = -1
   integer(kind=ENTIER), dimension(:), allocatable, save :: vv_neigh_cache_start
   integer(kind=ENTIER), dimension(:), allocatable, save :: vv_neigh_cache_list
@@ -109,25 +106,8 @@ module arbitrary_high_order_module
   integer(kind=ENTIER), dimension(:), allocatable, save :: gg_flux_elem_cache
   real(kind=DOUBLE), dimension(:), allocatable, save :: gg_oi_hlocal_cache
 
-  ! Wall-tangent fit for boundary-vertex reconstruction (2026-09-20; supersedes an earlier
-  ! mirror-ghost-cell attempt that turned out numerically unstable -- reflecting sub-face geometry
-  ! across the wall could drive the LS/GG fit matrix arbitrarily close to singular, producing huge
-  ! finite gradients that only showed up as NaN several RK stages downstream, well after any
-  ! dt/t-based health check would catch it): the caller (euler_ho_module) computes, once per mesh,
-  ! a per-vertex outward wall normal from the vertex's touching WALL-type boundary faces and
-  ! registers it here via set_wall_mirror_data. mirror_wall_vec_start=0 disables the whole
-  ! mechanism (default); any nonzero value enables it (the specific value is no longer used to pick
-  ! which nc_in components are velocity -- this approach never touches phi's components at all).
-  ! Enabled, a wall vertex's fit is restricted to the plane tangent to its wall normal (1 tangent
-  ! direction for boundary_2d, 2 otherwise) instead of the global x[,y[,z]] directions: a small,
-  ! well-posed problem using only the well-resolved along-wall neighbor spread, leaving the
-  ! (poorly-resolved, one-sided) wall-normal gradient component at exactly 0 rather than
-  ! extrapolating it. See compute_nodal_derivative_at_vertex (LS) and
-  ! ensure_green_gauss_mat_cache/compute_nodal_derivative_at_vertex_green_gauss (GG). Only
-  ! consulted at deriv_order=1 (nc_in=5, primitives) -- compute_next_order_derivative's boundary
-  ! loop keeps the earlier phantom-zero-gradient hack for deriv_order=2/3 (hess/third) and for any
-  ! boundary vertex without a clean single-wall normal (mixed wall+inflow/outflow vertices, or
-  ! wall_mirror_valid=.false.).
+  ! Wall-tangent fit for boundary vertices (registered via set_wall_mirror_data): restricts the fit
+  ! to the tangent plane instead of extrapolating the wall-normal component. Disabled by default.
   integer(kind=ENTIER), save :: mirror_wall_vec_start = 0
   integer(kind=ENTIER), save :: wall_mirror_n_vert = -1
   real(kind=DOUBLE), dimension(:, :), allocatable, save :: wall_mirror_norm
@@ -137,9 +117,8 @@ module arbitrary_high_order_module
     real(kind=DOUBLE), dimension(:, :), allocatable :: val ! (d**order, n_elems)
   end type derivative_field_type
 
-  ! Per-cell moments about the cell's own centroid, M_c^{(m)} = (1/V_c) int_c (x-x_c)^{tensor m} dV,
-  ! full flat tensor of size 3**m (row-major, same convention as hess_flat/third_flat). Cached once
-  ! per mesh, m=2..max_order; feeds apply_local_taylor_correction.
+  ! Per-cell moments about the cell centroid, full flat tensor of size 3**m, cached once per mesh;
+  ! feeds apply_local_taylor_correction.
   type :: cell_moment_ptr_type
     real(kind=DOUBLE), dimension(:, :), allocatable :: m ! (3**order, n_elems)
   end type cell_moment_ptr_type
@@ -148,13 +127,8 @@ module arbitrary_high_order_module
   integer(kind=ENTIER), save :: cell_moment_cache_max_order = 0
   type(cell_moment_ptr_type), dimension(:), allocatable, save :: cell_moment_cache ! indexed 2:max_order
 
-  ! Persistent scratch buffers for compute_next_order_derivative's WENO-blend accumulation --
-  ! previously allocated and zeroed fresh on EVERY call (3x per RK stage: grad/hess/third, nc_out
-  ! up to 135), a real allocator + first-touch-page-fault cost on large meshes (profiled: memset
-  ! alone was ~9% of total runtime on a 6000-vertex tet mesh). Sized once to the largest nc_out
-  ! actually used (135, from third's nc_in=45, d=3) and reused via a (1:nc_out,:) slice --
-  ! assumed-shape dummies in accumulate_weno_contribution/scatter_weno_weighted/
-  ! rescue_zero_weight_cell accept that slice by descriptor, no copy.
+  ! Persistent scratch buffers for compute_next_order_derivative's WENO-blend accumulation, reused
+  ! across calls instead of allocated fresh every time (was a major allocator/page-fault cost).
   integer(kind=ENTIER), parameter :: WENO_BUF_MAX_NC_OUT = 135
   real(kind=DOUBLE), dimension(:, :), allocatable, save :: weno_num_buf
   real(kind=DOUBLE), dimension(:), allocatable, save :: weno_den_buf
@@ -164,29 +138,21 @@ module arbitrary_high_order_module
   integer(kind=ENTIER), save :: weno_buf_n_elems = -1
   integer(kind=ENTIER), save :: weno_buf_n_vert = -1
 
-  ! Discrete analogue of cell_moment_cache: mu_m^discrete(c) = average over the cell's own corner
-  ! vertices of (x_v-x_c)^{tensor m}, for averaging a per-vertex SAMPLE (not a continuous field)
-  ! over a cell's corners. See apply_discrete_vertex_moment_correction.
+  ! Discrete analogue of cell_moment_cache: average over a cell's own corner vertices of
+  ! (x_v-x_c)^m, for apply_discrete_vertex_moment_correction.
   integer(kind=ENTIER), save :: discrete_vmom_cache_n_elems = -1
   integer(kind=ENTIER), save :: discrete_vmom_cache_max_order = 0
   type(cell_moment_ptr_type), dimension(:), allocatable, save :: discrete_vmom_cache ! indexed 2:max_order
 
-  ! Per-vertex 1-exact-gradient of the geometric field (x_elem-x_vert)^{tensor m} (Pont et al. 2017,
-  ! JCP 350, eq. 56-61, generalized to arbitrary m): same GG flux-sum + gg_mat_inv_cache machinery
-  ! used for phi, fed the geometric field instead. Flat tensor (3*3**m, n_vert), component t*3+i
-  ! (t=geometric multi-index, i=gradient direction). Pure 1-ring geometry, cached once per mesh;
-  ! corrects the gradient from any higher true derivative m=2..max_order (apply_gradient_node_correction).
+  ! Per-vertex 1-exact-gradient of the geometric field (Pont et al. 2017), same GG machinery as
+  ! phi. Used to correct the gradient from a higher derivative (apply_gradient_node_correction).
   integer(kind=ENTIER), save :: gg_grad_h1_cache_n_vert = -1
   integer(kind=ENTIER), save :: gg_grad_h1_cache_max_order = 0
   logical, save :: gg_grad_h1_cache_boundary_2d = .false.
   type(cell_moment_ptr_type), dimension(:), allocatable, save :: gg_grad_h1_cache ! indexed 2:max_order
 
-  ! LS analogue of gg_mat_inv_cache: per-vertex weighted-LS fit matrix, reproducing
-  ! compute_nodal_derivative_at_vertex's own operator exactly (weight=1/|dx|^2, basis={1,x[,y[,z]]},
-  ! same dynamic active-dimension dropping) so ls_grad_h1_cache below applies the EXACT SAME
-  ! operator aho_ls itself uses -- required for Haider's eq. 13 correction to cancel the bias
-  ! exactly. Skips boundary/wall vertices (matches gg_mat_inv_cache; eq. 13 only ever corrects
-  ! interior-vertex-fed derivatives). Pure geometry, cached once per mesh.
+  ! LS analogue of gg_mat_inv_cache: per-vertex weighted-LS fit matrix reproducing aho_ls's own
+  ! operator exactly, needed for Haider's eq.13 correction to cancel the bias exactly.
   integer(kind=ENTIER), save :: ls_mat_cache_n_vert = -1
   logical, save :: ls_mat_cache_boundary_2d = .false.
   real(kind=DOUBLE), dimension(:, :, :), allocatable, save :: ls_mat_inv_cache ! (4,4,n_vert)
@@ -194,37 +160,28 @@ module arbitrary_high_order_module
   integer(kind=ENTIER), dimension(:), allocatable, save :: ls_n_active_cache
   logical, dimension(:), allocatable, save :: ls_mat_valid_cache
 
-  ! LS analogue of gg_grad_h1_cache: H_m^(1)(v), m=2..max_order, built by applying the SAME
-  ! ls_mat_inv_cache operator to the geometric field {z_vK^(m)}_K (shifted_cell_moment_full)
-  ! instead of phi. Pure geometry, cached once per mesh.
+  ! LS analogue of gg_grad_h1_cache: applies the SAME ls_mat_inv_cache operator to the geometric
+  ! moment field instead of phi.
   integer(kind=ENTIER), save :: ls_grad_h1_cache_n_vert = -1
   integer(kind=ENTIER), save :: ls_grad_h1_cache_max_order = 0
   logical, save :: ls_grad_h1_cache_boundary_2d = .false.
   type(cell_moment_ptr_type), dimension(:), allocatable, save :: ls_grad_h1_cache ! indexed 2:max_order
 
-  ! Cell-to-cell 1-exact gradient LS fit matrix (Haider, Croisille & Courbet 2011, Definition 1,
-  ! step 1): per cell alpha, unweighted normal-equations inverse over the cell's own
-  ! mesh%elem(alpha)%neigh_by_vert stencil. Pure geometry, cached once per mesh (boundary_2d baked
-  ! in as for gg_mat_inv_cache). This is the genuinely cell-centered CLS reference -- no vertex
-  ! fit, no cell blend anywhere -- distinct from aho_gg/aho_ls's vertex-fit+WENO-scatter chain.
+  ! Cell-to-cell 1-exact gradient fit matrix (Haider CLS Def. 1 step 1): per-cell LS inverse over
+  ! neigh_by_vert, no vertex fit involved -- distinct from aho_gg/aho_ls's vertex-fit chain.
   integer(kind=ENTIER), save :: cell_ls_mat_cache_n_elems = -1
   logical, save :: cell_ls_mat_cache_boundary_2d = .false.
   real(kind=DOUBLE), dimension(:, :, :), allocatable, save :: cell_ls_mat_inv_cache
 
-  ! Cell-to-cell analogue of gg_grad_h1_cache: H_m^(1)(alpha) = cell_ls_mat_inv_cache(alpha)
-  ! applied to the geometric field {z_{alpha,beta}^(m)-z_{alpha,alpha}^(m)}_beta
-  ! (shifted_cell_moment_full) instead of phi, over the SAME neigh_by_vert stencil as the grad
-  ! fit. Reproduces Haider's eq. 15-16 J-operator correction term faithfully (their w_beta^(k|k)
-  ! applied to z_beta^(k+1), for k=1). Pure geometry, cached once per mesh.
+  ! Cell-to-cell analogue of gg_grad_h1_cache: cell_ls_mat_inv_cache applied to the geometric
+  ! moment field, reproducing Haider's eq.15-16 J-operator term.
   integer(kind=ENTIER), save :: cell_ls_h1_cache_n_elems = -1
   integer(kind=ENTIER), save :: cell_ls_h1_cache_max_order = 0
   logical, save :: cell_ls_h1_cache_boundary_2d = .false.
   type(cell_moment_ptr_type), dimension(:), allocatable, save :: cell_ls_h1_cache ! indexed 2:max_order
 
-  ! Per-cell X's OWN hess operator applied to the geometric field z_X^(3) instead of phi
-  ! (Haider's w_beta^(2|2)[z_beta^(3)], eq. 15-16 m=2 case) -- see
-  ! ensure_cell_cls_hess_of_z3_cache's own header comment for the derivation. Reduced 6-component
-  ! hess basis x 27-component z basis (162), cached once per mesh.
+  ! Per-cell hess operator applied to the geometric field z^(3) instead of phi (Haider eq.15-16,
+  ! m=2 case).
   integer(kind=ENTIER), save :: cell_cls_hess_of_z3_n_elems = -1
   logical, save :: cell_cls_hess_of_z3_boundary_2d = .false.
   real(kind=DOUBLE), dimension(:, :), allocatable, save :: cell_cls_hess_of_z3_cache
@@ -238,20 +195,8 @@ module arbitrary_high_order_module
 
 contains
 
-  ! Drops every cached quantity that was computed from vertex COORDINATES, so
-  ! the next reconstruction call rebuilds them from the current geometry.
-  !
-  ! Each cache above is guarded only by a size check (cache_n_vert ==
-  ! mesh%n_vert, cache_n_elems == mesh%n_elems). That is sound for a fixed
-  ! mesh, but a solver that MOVES nodes changes neither count, so without this
-  ! call every cache silently survives the move and the reconstruction is then
-  ! built on the pre-move geometry -- wrong at order >= 2, and silent.
-  !
-  ! Call it after move_mesh/compute_geometry_mesh, before the next
-  ! reconstruction. Topology caches (neigh/vv_neigh) are reset too: they are
-  ! connectivity-only and a pure move leaves them valid, but resetting is cheap
-  ! next to a full rebuild and keeps this routine a single honest statement
-  ! ("geometry changed") rather than a list the caller must keep in sync.
+  ! Drops every geometry-derived cache so the next reconstruction rebuilds from current
+  ! coordinates -- needed after moving mesh nodes, since caches are only guarded by size checks.
   subroutine invalidate_geometry_caches()
     implicit none
 
@@ -275,12 +220,8 @@ contains
     cell_cls_hess_of_z3_n_elems = -1
   end subroutine invalidate_geometry_caches
 
-  ! Registers the per-vertex wall normal used by the mirror-ghost-cell fix (see the cache block's
-  ! header comment above). Call once per mesh, before the first compute_next_order_derivative/
-  ! ensure_green_gauss_mat_cache call that should see it (mesh%n_vert-sized re-registration is
-  ! cheap; the GG cache only rebuilds when mesh%n_vert or boundary_2d changes, so calling this
-  ! AFTER ensure_green_gauss_mat_cache has already run for this mesh size would not retroactively
-  ! rebuild it -- register before the first reconstruction call of a run).
+  ! Registers the per-vertex wall normal for the wall-tangent fit; call once per mesh before the
+  ! first reconstruction call.
   subroutine set_wall_mirror_data(mesh, norm_v, valid_v)
     implicit none
 
@@ -342,13 +283,8 @@ contains
     deriv_order_eff = 1
     if (present(deriv_order)) deriv_order_eff = deriv_order
 
-    ! nc_out cycles through a small fixed set of values (15/45/135 for grad/hess/third) every RK
-    ! stage; resized once to the largest ever requested (135 in production; a test-only caller in
-    ! arbitrary_high_order_main.F90 could ask for more, hence the max() rather than a hardcoded
-    ! bound) and reused via a (1:nc_out,:) ASSOCIATE alias -- unlike POINTER association this adds
-    ! no indirection (the compiler substitutes the slice expression at compile time), so it avoids
-    ! both the allocate/deallocate/first-touch cost this used to pay every single call AND any
-    ! aliasing-analysis penalty a real pointer would add.
+    ! nc_out cycles through a few fixed values (15/45/135) per RK stage; buffer sized once to the
+    ! largest ever needed and reused via ASSOCIATE (no pointer indirection, no per-call allocation).
     if (weno_buf_n_elems /= mesh%n_elems .or. weno_buf_n_vert /= mesh%n_vert &
         .or. (allocated(weno_num_buf) .and. size(weno_num_buf, 1) < nc_out)) then
       if (allocated(weno_num_buf)) then
@@ -369,16 +305,8 @@ contains
     weno_num = 0.0_DOUBLE
     weno_den = 0.0_DOUBLE
 
-    ! A boundary vertex is skipped (one-sided neighbor gather) unless .not. boundary_2d, where skipping it would starve every vertex.
-    ! 2026-09-20: at deriv_order=1 (the primitive gradient), a registered wall-mirror vertex
-    ! (is_wall_mirror_vertex) instead gets a symmetrized fit via a mirrored ghost-neighbor
-    ! contribution (LS: wall_norm passed into compute_nodal_derivative_at_vertex; GG: baked into
-    ! ensure_green_gauss_mat_cache's own per-vertex matrix) -- see the wall-mirror cache block's
-    ! header comment. Every other boundary vertex (deriv_order=2/3's hess/third, or any boundary
-    ! vertex without a clean single-wall normal) keeps the earlier phantom-zero-gradient hack:
-    ! scatter a phantom near-zero gradient (dphi_v~1e-16, oi_v=0) with the standard
-    ! weight=omega_p/(eps+OI^p) formula -- OI=0 makes this phantom sample dominate the blend for
-    ! any touching cell, pulling the reconstructed derivative toward flat/first-order near walls.
+    ! A boundary vertex is skipped unless boundary_2d; a wall-mirror vertex gets a tangent-plane
+    ! fit, others get a phantom near-zero-gradient scatter (pulls neighbors toward first order).
     do id_vert = 1, mesh%n_vert
       if (mesh%vert(id_vert)%is_bound) then
         if (deriv_order_eff == 1 .and. is_wall_mirror_vertex(id_vert, mesh%n_vert)) then
@@ -999,9 +927,8 @@ contains
     real(kind=DOUBLE), dimension(:), intent(inout) :: weno_den
     logical, dimension(:), intent(in), optional :: skip_cell
     integer(kind=ENTIER), intent(in), optional :: deriv_order
-    ! LS-only wall-mirror normal for this vertex (GG's mirror handling is entirely baked into
-    ! ensure_green_gauss_mat_cache/compute_nodal_derivative_at_vertex_green_gauss, keyed off the
-    ! module-level wall_mirror_norm/valid, so it needs no argument here).
+    ! LS-only wall-mirror normal (GG's own mirror handling needs no argument, it's baked into
+    ! ensure_green_gauss_mat_cache via the module-level wall_mirror_norm/valid).
     real(kind=DOUBLE), dimension(3), intent(in), optional :: wall_norm
 
     real(kind=DOUBLE), dimension(nc_in*d) :: dphi_v
@@ -1116,12 +1043,8 @@ contains
     logical, intent(out) :: valid
     ! WENO oscillation indicator: fit residual (dimensionless) combined via max with a gradient-norm term that catches an axis-aligned jump the residual is blind to.
     real(kind=DOUBLE), intent(out) :: oi_v
-    ! Wall-tangent fit (2026-09-20, replaces an earlier mirror-ghost-cell attempt that turned out
-    ! numerically unstable): when present (and mirror_wall_vec_start>0), the fit basis is restricted
-    ! to the plane tangent to this unit wall normal (1 tangent direction for boundary_2d, 2
-    ! otherwise) instead of the global x[,y[,z]] directions -- a small, well-posed problem using
-    ! only the well-resolved along-wall neighbor spread. The wall-normal gradient component is never
-    ! solved for and is left at exactly 0 rather than extrapolated from a one-sided stencil.
+    ! When present (mirror_wall_vec_start>0), restricts the fit basis to the plane tangent to this
+    ! unit wall normal; the wall-normal gradient component is left at exactly 0.
     real(kind=DOUBLE), dimension(3), intent(in), optional :: wall_norm
 
     integer(kind=ENTIER), parameter :: max_basis = 4
@@ -1151,9 +1074,7 @@ contains
     end if
 
     if (is_wall) then
-      ! Orthonormal tangent basis {t1[,t2]} spanning the plane perp to bp (Gram-Schmidt off a
-      ! reference axis not near-parallel to bp; boundary_2d keeps t1 in-plane, z=0, since bp itself
-      ! has bp(3)=0 for any side wall of a z-extruded 2D mesh).
+      ! Orthonormal tangent basis {t1[,t2]} spanning the plane perp to bp (Gram-Schmidt).
       n_tan = merge(1_ENTIER, 2_ENTIER, boundary_2d)
       if (abs(bp(1)) < 0.9_DOUBLE) then
         refv = (/1.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE/)
@@ -1264,10 +1185,8 @@ contains
     oi_v = max(oi_v, (max_spread * sum(rhs(2:n_basis, :)**2) / max(phi_scale2, 1.0e-300_DOUBLE)) &
       / grad_norm_derate)
 
-    ! rhs(1+a,i1)=d(phi_i1)/dx_active_dim(a); flattened component-fast/direction-slow, inactive
-    ! directions left at 0. is_wall: active_dim(a) instead indexes a SURVIVING TANGENT direction
-    ! (tvec(:,active_dim(a))), expanded back into global x[,y[,z]] components -- the wall-normal
-    ! component is never touched and stays 0 (dphi_v was zeroed above).
+    ! rhs(1+a,i1)=d(phi_i1)/dx_active_dim(a); is_wall expands the surviving tangent direction back
+    ! into global components, leaving the wall-normal component at 0.
     if (is_wall) then
       do a = 1, n_active
         do i1 = 1, nc_in
@@ -1317,9 +1236,7 @@ contains
     allocate(gg_oi_hlocal_cache(mesh%n_vert))
     allocate(gg_flux_offset_cache(mesh%n_vert + 1))
 
-    ! A registered wall vertex (see the wall-mirror cache block's header comment -- name kept for
-    ! the shared is_wall_mirror_vertex helper, though this GG path no longer mirrors anything) gets
-    ! a valid matrix too, built from real geometry only, same as any interior vertex.
+    ! A registered wall vertex gets a valid matrix too, built from real geometry only, same as any interior vertex.
     total_pairs = 0
     do v = 1, mesh%n_vert
       is_wm = is_wall_mirror_vertex(v, mesh%n_vert)
@@ -1382,13 +1299,7 @@ contains
       gg_oi_hlocal_cache(v) = maxval(dmaxn(1:n_cand) - dminn(1:n_cand))
 
       if (is_wm) then
-        ! Wall-tangent fit (see compute_nodal_derivative_at_vertex's own header comment for the
-        ! LS twin of this same idea): restrict the flux-matching unknown to grad=T@grad_t (T's
-        ! columns an orthonormal tangent basis), solved by least squares --
-        ! grad_t=(T'mat'mat T)^-1 T'mat' grad_raw -- then folded into one effective 3x3 operator
-        ! mat_inv_eff=T@(T'mat'mat T)^-1@T'mat' so compute_nodal_derivative_at_vertex_green_gauss's
-        ! plain grad_true=mat_inv_eff@grad_raw needs no changes. The wall-normal component is never
-        ! solved for, so it comes out exactly 0.
+        ! Wall-tangent fit (LS twin: compute_nodal_derivative_at_vertex): restricts grad to the tangent plane, folded into one effective 3x3 operator so the caller's plain matmul needs no changes.
         bp = wall_mirror_norm(:, v)
         n_tan = merge(1_ENTIER, 2_ENTIER, boundary_2d)
         if (abs(bp(1)) < 0.9_DOUBLE) then
@@ -1406,13 +1317,7 @@ contains
 
         mt(:, 1:n_tan) = matmul(mat, tvec(:, 1:n_tan))
         tam(1:n_tan, 1:n_tan) = matmul(transpose(mt(:, 1:n_tan)), mt(:, 1:n_tan))
-        ! Tikhonov ridge, relative to mat's own scale: a genuinely near-singular tam (t happens to
-        ! sit close to mat's null space too, seen on a handful of mesh-quality-degenerate wall
-        ! vertices) then damps smoothly toward a near-0 tangential gradient there instead of the
-        ! plain SVD pseudo-inverse's huge-but-finite blowup (1/tiny-sigma) -- confirmed by direct
-        ! measurement to reach ~1e6-1e7 on this mesh's worst vertices, enough to detonate the whole
-        ! solve within ~100 iterations despite looking like a merely "ill-conditioned", not exactly
-        ! singular, 1x1/2x2 system.
+        ! Tikhonov ridge (relative to mat's own scale): damps near-singular tam on degenerate wall vertices instead of the SVD pseudo-inverse's huge-but-finite blowup, which was measured to reach ~1e6-1e7 and detonate the solve.
         do a = 1, n_tan
           tam(a, a) = tam(a, a) + 1.0e-6_DOUBLE * sum(mat**2)
         end do
@@ -1434,9 +1339,8 @@ contains
     gg_mat_cache_boundary_2d = boundary_2d
   end subroutine ensure_green_gauss_mat_cache
 
-  ! Builds cell_moment_cache(m), m=2..max_order: each cell's own moment tensor M_c^{(m)} =
-  ! (1/V_c) int_c (x-x_c)^{tensor m} dV, full flat tensor of size 3**m (row-major, same
-  ! convention as hess_flat/third_flat). Pure geometry, cached once per mesh.
+  ! Builds cell_moment_cache(m): each cell's moment tensor M_c^{(m)} = (1/V_c) int_c (x-x_c)^{tensor m} dV,
+  ! flat tensor of size 3**m (same convention as hess_flat/third_flat). Pure geometry, cached once per mesh.
   subroutine ensure_cell_moment_cache(mesh, max_order)
     use quadrature_module, only: volume_quad_pts
     implicit none
@@ -1496,13 +1400,7 @@ contains
     cell_moment_cache_max_order = max_order
   end subroutine ensure_cell_moment_cache
 
-  ! z_vK^(m) = (1/|T_K|) int_{T_K} (x-x_v)^{tensor m} dV, for ONE neighbor cell id_elem and shift
-  ! s = x_elem - x_v, full flat tensor of size 3**m. Binomial/moment-shift expansion (Haider,
-  ! Croisille & Courbet 2011, eq. 1/13's z_{alpha,beta}): writing x-x_v = s + (x-x_K),
-  !   z^(m)[i_1..i_m] = sum over subsets S of {1..m} ( prod_{l not in S} s_{i_l} ) * M_K^{(|S|)}[i_l, l in S]
-  ! with M_K^(0)=1, M_K^(1)=0, M_K^(j)=cell_moment_cache(j) for j>=2 -- folds the node-stencil
-  ! geometry bias (S={} term) and K's own cell-average-vs-point-value gap (S!={} terms) into one
-  ! moment, reusing cell_moment_cache algebraically instead of a second GG pass per correction.
+  ! z_vK^(m) = (1/|T_K|) int_{T_K} (x-x_v)^{tensor m} dV via Haider/Croisille/Courbet 2011's binomial moment-shift expansion (eq. 1/13), reusing cell_moment_cache algebraically instead of a second GG pass per correction.
   subroutine shifted_cell_moment_full(id_elem, s, m, z)
     implicit none
 
@@ -1544,10 +1442,7 @@ contains
     end do
   end subroutine shifted_cell_moment_full
 
-  ! Builds gg_grad_h1_cache(m), m=2..max_order: for each vertex v, the SAME 1-exact GG gradient
-  ! operator (flux-sum + gg_mat_inv_cache) applied to the geometric field {z_vK^(m)}_K
-  ! (shifted_cell_moment_full) instead of phi. Pure geometry (v's own 1-ring plus each touching
-  ! cell's own cached moments), cached once per mesh.
+  ! Builds gg_grad_h1_cache(m): the SAME 1-exact GG gradient operator applied to the geometric field {z_vK^(m)}_K (shifted_cell_moment_full) instead of phi, cached once per mesh.
   subroutine ensure_gg_gradient_h1_cache(mesh, boundary_2d, max_order)
     implicit none
 
@@ -1597,12 +1492,8 @@ contains
     gg_grad_h1_cache_boundary_2d = boundary_2d
   end subroutine ensure_gg_gradient_h1_cache
 
-  ! Builds ls_mat_inv_cache/ls_active_dim_cache/ls_n_active_cache/ls_mat_valid_cache: per-vertex
-  ! weighted-LS fit matrix reproducing compute_nodal_derivative_at_vertex's own operator exactly
-  ! (weight=1/|dx|^2, basis={1,x[,y[,z]]}, same dynamic active-dimension dropping by spread), minus
-  ! the wall-tangent special case (wall/boundary vertices are simply left invalid, matching
-  ! gg_mat_valid_cache's own convention -- eq. 13's correction only ever applies at interior
-  ! vertices).
+  ! Builds the per-vertex weighted-LS fit matrix reproducing compute_nodal_derivative_at_vertex's operator
+  ! (weight=1/|dx|^2, basis={1,x[,y[,z]]}, dynamic active-dimension dropping by spread); wall/boundary vertices are left invalid, matching gg_mat_valid_cache's convention.
   subroutine ensure_ls_mat_cache(mesh, boundary_2d)
     use linear_solver_module, only: pseudo_inverse_inplace_lapack
     implicit none
@@ -1702,10 +1593,7 @@ contains
     ls_mat_cache_boundary_2d = boundary_2d
   end subroutine ensure_ls_mat_cache
 
-  ! LS analogue of ensure_gg_gradient_h1_cache: H_m^(1)(v), m=2..max_order, built by applying the
-  ! SAME ls_mat_inv_cache weighted-LS operator to the geometric field {z_vK^(m)}_K
-  ! (shifted_cell_moment_full) instead of phi -- only the gradient rows of the fit (dropping the
-  ! constant/intercept row) are kept, matching compute_nodal_derivative_at_vertex's own dphi_v.
+  ! LS analogue of ensure_gg_gradient_h1_cache: applies the same ls_mat_inv_cache weighted-LS operator to the geometric field {z_vK^(m)}_K instead of phi, keeping only the gradient rows.
   ! Pure geometry, cached once per mesh.
   subroutine ensure_ls_grad_h1_cache(mesh, boundary_2d, max_order)
     implicit none
@@ -1800,12 +1688,8 @@ contains
     valid = gg_mat_valid_cache(id_vert)
     if (.not. valid) return
 
-    ! Geometry is precomputed in ensure_green_gauss_mat_cache (gg_mat_inv_cache is the plain
-    ! pseudo-inverse for an interior vertex, or the wall-tangent-projected effective operator for a
-    ! wall vertex -- see that cache's own header comment); only this phi gather is redone every call.
-    ! i1 outer / a inner (a=1:3 is grad_raw's and gg_flux_w_cache's own contiguous leading
-    ! dimension): each inner step is a length-3 axpy on contiguous memory instead of a
-    ! stride-3 write, same total sum either way.
+    ! Geometry (gg_mat_inv_cache) is precomputed in ensure_green_gauss_mat_cache; only this phi gather is redone every call.
+    ! Loop order (i1 outer, a inner) keeps grad_raw/gg_flux_w_cache access contiguous instead of a stride-3 write.
     grad_raw = 0.0_DOUBLE
     k0 = gg_flux_offset_cache(id_vert)
     k1 = gg_flux_offset_cache(id_vert + 1) - 1
@@ -1870,9 +1754,7 @@ contains
     neigh_cache_n_vert = mesh%n_vert
   end subroutine ensure_neighbor_cache
 
-  ! Builds vv_neigh_cache: for each vertex v, the set of OTHER vertices sharing at least one cell
-  ! with v (deduplicated), via a two-pass CSR build using a reusable "last touched by v" mark
-  ! array (avoids an O(n_vert) reset per vertex). Pure topology, cached once per mesh.
+  ! Builds vv_neigh_cache: for each vertex, the deduplicated set of other vertices sharing a cell with it, via a two-pass CSR build with a reusable mark array (avoids an O(n_vert) reset per vertex).
   subroutine ensure_vv_neighbor_cache(mesh)
     implicit none
 
@@ -2002,17 +1884,8 @@ contains
     call add_sort_unique_int(neigh, n_neigh, mesh%vert(id_vert)%elem_neigh)
   end subroutine gather_ls_neighbors
 
-  ! Corrects the grad step's own O(h^2) bias against a cubic field in place, using each
-  ! vertex's nodal Hessian/third tensor and per-cell second moment. Handles both
-  ! boundary_2d=.true. (2 active directions x,y) and genuinely-3D meshes (3 active
-  ! directions x,y,z) through one unified formula: the basis size (3 or 4) is the only
-  ! branch, everything else is the full 3D tensor contraction, which degenerates exactly
-  ! to the 2D case when z-related H/T components are zero (as they are for boundary_2d).
-  ! hess_v/third_v flat layout: index (0-based, in units of nc_in) for a component whose
-  ! derivative directions are taken in order (dir1,dir2[,dir3]) is
-  ! (dir3-1)*9+(dir2-1)*3+(dir1-1) (third_v) or (dir2-1)*3+(dir1-1) (hess_v), 1=x,2=y,3=z;
-  ! symmetric components are averaged over every valid ordering (verified numerically
-  ! against manufactured cubic fields with fully distinct coefficients).
+  ! Corrects the grad step's O(h^2) bias against a cubic field in place, using each vertex's nodal Hessian/third tensor and per-cell second moment; one unified 3D formula degenerates exactly to the 2D case when z-components are zero (boundary_2d).
+  ! hess_v/third_v flat layout (0-based, units of nc_in): (dir3-1)*9+(dir2-1)*3+(dir1-1) for third_v, (dir2-1)*3+(dir1-1) for hess_v (1=x,2=y,3=z); symmetric components are averaged over every valid ordering.
   subroutine apply_grad_bias_correction(mesh, d, nc_in, boundary_2d, grad_cell, &
       hess_v, third_v, valid_hess_v, valid_third_v, grad_oi_v)
     use linear_solver_module, only: lu_factor_lapack, lu_solve_mat_lapack
@@ -2079,14 +1952,8 @@ contains
     t_num_xxy = 0.0_DOUBLE; t_num_xxz = 0.0_DOUBLE; t_num_xyy = 0.0_DOUBLE
     t_num_yyz = 0.0_DOUBLE; t_num_xzz = 0.0_DOUBLE; t_num_yzz = 0.0_DOUBLE; t_num_xyz = 0.0_DOUBLE
 
-    ! Single merged pass over vertices: the original code ran two separate do iv=1,mesh%n_vert
-    ! loops back to back -- one for the bias correction (needs hess AND third valid), one for the
-    ! cell-blend curvature correction (needs only third valid) -- each independently re-extracting
-    ! the SAME 10-component Txxx..Txyz reduction from third_v and recomputing the SAME vweight.
-    ! Merged into one pass (extract once, guard the hess-dependent part on valid_hess_v(iv) exactly
-    ! as the original outer cycle did, then feed both accumulations from a single sub_elem_neigh
-    ! loop since sub_elem_volume is identical in both) -- purely eliminates duplicate work, no
-    ! change to any formula or to which vertices contribute to which correction.
+    ! Single merged pass over vertices: computes the bias correction (needs hess+third valid) and the cell-blend
+    ! curvature correction (needs only third valid) together, since both reduce the same third_v Txxx..Txyz components and sub_elem_volume.
     do iv = 1, mesh%n_vert
       if (mesh%vert(iv)%is_bound) cycle
       if (.not. valid_third_v(iv)) cycle
@@ -2122,9 +1989,8 @@ contains
           Hyz(ic) = 0.5_DOUBLE*(hess_v(5*nc_in+ic, iv) + hess_v(7*nc_in+ic, iv))
         end do
 
-        ! Index neigh_cache_list directly instead of copying this vertex's neighbor slice into a
-        ! freshly allocate()'d local array every single vertex (n_vert allocate/deallocate cycles
-        ! per call, a real cost on a tet mesh where a vertex's neigh_by_vert stencil is large).
+        ! Index neigh_cache_list directly instead of copying each vertex's neighbor slice into a fresh
+        ! local array (avoids n_vert allocate/deallocate cycles per call).
         n_neigh = neigh_cache_start(iv+1) - neigh_cache_start(iv)
         mat(1:n_basis, 1:n_basis) = 0.0_DOUBLE
         rhs(1:n_basis, :) = 0.0_DOUBLE
@@ -2235,13 +2101,8 @@ contains
     deallocate(t_num_xyy, t_num_yyz, t_num_xzz, t_num_yzz, t_num_xyz)
   end subroutine apply_grad_bias_correction
 
-  ! Contracts the LAST m=(k-q) indices of the rank-k tensor D_k (flat, row-major, size d**k*nc_in
-  ! per cell) against the rank-m geometric tensor M_m (flat, row-major, size d**m per cell),
-  ! leaving a rank-q tensor (flat, size d**q*nc_in per cell). Since both operands are stored in the
-  ! FULL (redundant) flat convention already used for hess_flat/third_flat, this plain index-matched
-  ! sum reproduces the correct symmetric-contraction multinomial weights automatically -- no
-  ! separate combinatorial bookkeeping needed, unlike an independent-component (Hxx/Hxy/...)
-  ! representation.
+  ! Contracts the last m=(k-q) indices of the rank-k tensor D_k against the rank-m geometric tensor M_m, leaving a rank-q tensor.
+  ! Both operands use the full (redundant) flat convention already used for hess_flat/third_flat, so this plain index-matched sum reproduces the correct symmetric-contraction multinomial weights automatically -- no separate combinatorial bookkeeping needed.
   subroutine contract_last_indices(d, nc_in, n_elems, k, m, D_k, M_m, corr_q)
     implicit none
 
@@ -2266,12 +2127,8 @@ contains
     end do
   end subroutine contract_last_indices
 
-  ! Corrects, in place, the cell-level Taylor coefficients D^(0)=phi,...,D^(k_max) held in
-  ! dfield(0:k_max)%val: each is a RAW cell-AVERAGE estimate, not the point value at x_c.
-  ! Taylor-expanding about x_c and averaging over the cell (M_c^(1)=0 identically):
-  !   D^(q)(x_c) = avg(D^(q))_c - sum_{m=2}^{k_max-q} (1/m!) D^(q+m)(x_c) : M_c^(m)
-  ! applied incrementally k=2,...,k_max using the RAW dfield(k)%val (Pont et al. 2017, JCP 350,
-  ! sec. 3.4's successive-correction idea, but entirely local to the cell: only cell_moment_cache).
+  ! Corrects, in place, the cell-level Taylor coefficients dfield(0:k_max)%val from raw cell-average estimates to point values at x_c:
+  !   D^(q)(x_c) = avg(D^(q))_c - sum_{m=2}^{k_max-q} (1/m!) D^(q+m)(x_c) : M_c^(m), applied incrementally (Pont et al. 2017, JCP 350, sec. 3.4, but local to the cell).
   subroutine apply_local_taylor_correction(mesh, d, nc_in, k_max, dfield)
     implicit none
 
@@ -2298,16 +2155,8 @@ contains
     end do
   end subroutine apply_local_taylor_correction
 
-  ! Contracts the m geometric indices of H_m^(1)(v) (flat, layout t*3+i, t=0..3**m-1, i=1..3)
-  ! against the rank-m derivative tensor D_m_v (flat, layout t*nc_in+ic, same row-major
-  ! convention as hess_v/third_v), leaving the rank-1 (gradient-direction i, component ic) bias
-  ! bias_v(i,ic,vertex). Same "full flat tensor, plain index-matched sum" trick as
-  ! contract_last_indices: the symmetric-contraction multinomial weights fall out automatically.
-  ! Loop nest is vertex-outermost so each inner pass over t/i/ic stays within one contiguous
-  ! column of D_m_v/H_m1_v/bias_v (arrays are (component, vertex), vertex trailing/column-major) --
-  ! the previous component-outermost order made every access a full-n_vert stride, one useful
-  ! element per cache line, which dominated compute_node_derivative_bias's cost (~0.23s/call at
-  ! N=160, vs a ~10ms flop-count estimate) and was the main driver of order 4's slowdown.
+  ! Contracts the m geometric indices of H_m^(1)(v) against the rank-m derivative tensor D_m_v, leaving the rank-1 bias bias_v(i,ic,vertex); same flat-tensor index-matched-sum trick as contract_last_indices.
+  ! Loop nest is vertex-outermost to keep each inner pass contiguous in memory -- component-outermost order caused a full-n_vert stride per access, dominating compute_node_derivative_bias's cost and driving order 4's slowdown.
   subroutine contract_grad_node_bias(nc_in, m, n_vert, D_m_v, H_m1_v, bias_v)
     implicit none
 
@@ -2332,15 +2181,8 @@ contains
     end do
   end subroutine contract_grad_node_bias
 
-  ! Corrects a RAW order-k vertex derivative (built by one application of the GG operator L_v to
-  ! the order-(k-1) cell field) using every available higher vertex derivative
-  ! dfield_v(k+1)%val,...,dfield_v(k_max)%val:
-  !   (D^k phi)_v^corrected = (D^k phi)_v^raw - sum_{m=2}^{k_max-k+1} (1/m!) D^(k-1+m)(x_v) : H_m^(1)(v)
-  ! (Pont et al. 2017, JCP 350, sec. 3.4 generalized to arbitrary order, folded into one moment
-  ! per Haider, Croisille & Courbet 2011 eq. 13). H_m^(1)(v)=gg_grad_h1_cache(m) is the SAME
-  ! operator L_v applied to every level of the aho_gg recursion, so this ONE cache corrects any
-  ! order k by treating D^(k-1)'s d**(k-1) components as independent scalar fields (nc_in
-  ! replaced by nc_in*d**(k-1) in eq:grad-bias-gg). k=1 is the gradient case.
+  ! Corrects a raw order-k vertex derivative using every available higher vertex derivative dfield_v(k+1)%val,...,dfield_v(k_max)%val:
+  !   (D^k phi)_v^corrected = (D^k phi)_v^raw - sum_{m=2}^{k_max-k+1} (1/m!) D^(k-1+m)(x_v) : H_m^(1)(v) (Pont et al. 2017, JCP 350 sec. 3.4, folded per Haider, Croisille & Courbet 2011 eq. 13). k=1 is the gradient case.
   subroutine compute_node_derivative_bias(mesh, d, nc_in, boundary_2d, k, k_max, dfield_v, bias_v_total)
     implicit none
 
@@ -2356,9 +2198,7 @@ contains
     bias_v_total = 0.0_DOUBLE
     if (k_max < k+1) return
 
-    ! Dispatches on the SAME module-level flag aho_reconstruction uses to pick aho_gg vs aho_ls:
-    ! the h1-cache must be built from whichever operator actually produced dfield_v's own m-exact
-    ! derivatives, or eq. 13's correction does not cancel the right bias.
+    ! Dispatches on the same module-level flag aho_reconstruction uses to pick aho_gg vs aho_ls: the h1-cache must match whichever operator produced dfield_v's derivatives, or eq. 13's correction cancels the wrong bias.
     if (use_green_gauss) then
       call ensure_gg_gradient_h1_cache(mesh, boundary_2d, k_max-k+1)
     else
@@ -2399,11 +2239,8 @@ contains
     call compute_node_derivative_bias(mesh, d, nc_in, boundary_2d, 1_ENTIER, k_max, dfield_v, bias_v_total)
   end subroutine compute_gradient_node_bias
 
-  ! Recombines a per-vertex quantity into cells via a weighted least-squares affine regression
-  ! (val_v(x) ~= val_cell + G.(x-x_c), inverse-square-distance weight) over each cell's own
-  ! touching vertices, instead of a naive average (only exact when the sampled quantity is
-  ! constant across the cell). Falls back to a plain average when a cell has too few valid
-  ! vertices for the fit (e.g. near a boundary).
+  ! Recombines a per-vertex quantity into cells via weighted LS affine regression (val_v(x) ~= val_cell + G.(x-x_c), inverse-square-distance weight), exact even when the quantity varies linearly across the cell.
+  ! Falls back to a plain average when a cell has too few valid vertices for the fit (e.g. near a boundary).
   subroutine recombine_derivative_regression(mesh, boundary_2d, n_comp, val_v, valid_v, val_cell_out)
     use linear_solver_module, only: lu_factor_lapack, lu_solve_mat_lapack
     implicit none
@@ -2484,14 +2321,8 @@ contains
       grad_cell, dfield_v, valid_v)
   end subroutine apply_gradient_node_correction
 
-  ! Generalizes apply_gradient_node_correction to any order k (k=1 is the gradient case): corrects
-  ! dfield_cell (a k-exact k-th derivative in cell-average form) in place using every available
-  ! higher vertex derivative dfield_v(k+1)%val,...,dfield_v(k_max)%val, per Haider, Croisille &
-  ! Courbet 2011 eq. 13 (compute_node_derivative_bias, which itself dispatches on use_green_gauss
-  ! to reproduce whichever operator -- aho_gg or aho_ls -- actually built dfield_v), then blends
-  ! the correction into cells via a plain sub_elem_volume average (unweighted, matching the
-  ! original grad-only routine -- the correction is a geometry+derivative bias, not a re-blend of
-  ! samples, so it does not need grad_cell's own WENO weight).
+  ! Generalizes apply_gradient_node_correction to any order k (k=1 is the gradient case): corrects dfield_cell in place using every available higher vertex derivative, per Haider, Croisille & Courbet 2011 eq. 13 (compute_node_derivative_bias).
+  ! Blends the correction into cells via a plain unweighted sub_elem_volume average -- it's a geometry+derivative bias, not a re-blend of samples, so it doesn't need grad_cell's own WENO weight.
   subroutine apply_derivative_node_correction(mesh, d, nc_in, boundary_2d, k, k_max, dfield_cell, &
       dfield_v, valid_v)
     implicit none
@@ -2537,11 +2368,7 @@ contains
     deallocate(bias_v_total, bias_num, bias_den)
   end subroutine apply_derivative_node_correction
 
-  ! Same cell-blend as apply_derivative_node_correction's second half, but takes an already-computed
-  ! per-vertex bias instead of calling compute_node_derivative_bias itself -- for a caller (the
-  ! eq.13 cascade) that also needs the per-vertex bias on its own (to correct a lower derivative's
-  ! own vertex values before using them to correct the next one down), so the bias is computed once
-  ! and reused rather than recomputed from scratch for the cell-level pass.
+  ! Same cell-blend as apply_derivative_node_correction's second half, but takes an already-computed per-vertex bias instead of recomputing it -- for a caller (the eq.13 cascade) that also needs the per-vertex bias on its own to correct a lower derivative's vertex values.
   subroutine scatter_bias_to_cells(mesh, boundary_2d, n_comp, bias_v_total, valid_v, dfield_cell)
     implicit none
 
@@ -2580,10 +2407,8 @@ contains
     deallocate(bias_num, bias_den)
   end subroutine scatter_bias_to_cells
 
-  ! aho_cls (Haider, Croisille & Courbet 2011, "Efficient Implementation of High Order
-  ! Reconstruction in Finite Volume Methods"): contracts H_2^(1) (gg_grad_h1_cache(2), full flat,
-  ! layout t*3+i) with a rank-2 tensor E9 (full flat, layout (i-1)*3+j), leaving the rank-1
-  ! (direction i) result -- used to build the functional-identity matrix below.
+  ! aho_cls (Haider, Croisille & Courbet 2011): contracts H_2^(1) (gg_grad_h1_cache(2), flat layout t*3+i) with a rank-2 tensor E9 (flat layout (i-1)*3+j),
+  ! leaving the rank-1 result used to build the functional-identity matrix below.
   pure function contract_geom_h2(Hcol, E9) result(vec3)
     implicit none
 
@@ -2601,15 +2426,8 @@ contains
     end do
   end function contract_geom_h2
 
-  ! aho_cls, step k=1->2: builds a GENUINELY 2-exact Hessian at every vertex directly from
-  ! ONE-RING vertex data, following Haider, Croisille & Courbet (2011) eq. 15-18 ("functional
-  ! identity"), adapted from their cell-based setting to our vertex-based dual stencil. For a
-  ! genuinely quadratic field u with true Hessian H, eq:grad-bias-gg with k_max=2 gives at any
-  ! vertex w: w_w^(1|1)[u] = grad(u)(x_w) + (1/2) H:H_2^(1)(w) exactly. Subtracting this relation
-  ! at a neighbor v' from the one at v, and using grad(u)(x_v')-grad(u)(x_v)=H.(x_v'-x_v) exactly:
-  !   w_v'^(1|1)[u] - w_v^(1|1)[u] = H.(x_v'-x_v) + (1/2) H : [H_2^(1)(v') - H_2^(1)(v)]
-  ! a known linear map J_v(b) in a candidate tensor b -- solving J_v(b)={...}_v' by least squares
-  ! recovers b=H exactly when u is quadratic. Needs only vv_neigh_cache and gg_grad_h1_cache(2).
+  ! aho_cls, step k=1->2: builds a genuinely 2-exact Hessian at every vertex from one-ring vertex data, following Haider, Croisille & Courbet (2011) eq. 15-18 ("functional identity"), adapted to our vertex-based dual stencil.
+  ! Solves w_v'^(1|1)[u] - w_v^(1|1)[u] = H.(x_v'-x_v) + (1/2) H : [H_2^(1)(v') - H_2^(1)(v)] for H by least squares over neighbors v'; recovers H exactly for quadratic u. Needs only vv_neigh_cache and gg_grad_h1_cache(2).
   subroutine compute_2exact_hessian_aho_cls(mesh, boundary_2d, grad_v, valid_grad_v, hess_v_out, valid_out)
     use linear_solver_module, only: lu_factor_lapack, lu_solve_mat_lapack
     implicit none
@@ -2679,10 +2497,8 @@ contains
     end do
   end subroutine compute_2exact_hessian_aho_cls
 
-  ! Builds discrete_vmom_cache(m), m=2..max_order: for each cell, mu_m^discrete(c) = the average
-  ! over its OWN corner vertices v of (x_v-x_c)^{tensor m}, as a full flat tensor of size 3**m
-  ! (same row-major convention as cell_moment_cache). Pure topology+geometry, cached once per
-  ! mesh -- unlike cell_moment_cache's quadrature, this is a plain average over mesh%elem(:)%vert.
+  ! Builds discrete_vmom_cache(m): each cell's mu_m^discrete(c) = average over its own corner vertices of (x_v-x_c)^{tensor m}, flat tensor of size 3**m (same convention as cell_moment_cache).
+  ! Unlike cell_moment_cache's quadrature, this is a plain average over mesh%elem(:)%vert; cached once per mesh.
   subroutine ensure_discrete_vertex_moment_cache(mesh, max_order)
     implicit none
 
@@ -2727,12 +2543,8 @@ contains
     discrete_vmom_cache_max_order = max_order
   end subroutine ensure_discrete_vertex_moment_cache
 
-  ! Corrects, in place, a cell-level quantity D^(q)_cell (built by recombine_derivative_regression,
-  ! which already removes the m=1 term via its affine fit) using every available higher blended
-  ! derivative D^(q+2)_cell,...,D^(k_max)_cell -- same Taylor argument and loop structure as
-  ! apply_local_taylor_correction, but for the DISCRETE corner-vertex average discrete_vmom_cache
-  ! instead of a continuous volume integral, and starting at m=2 since the regression already
-  ! handles m=1. Verified to close the vertex-to-cell recombination gap to ~1e-10.
+  ! Corrects, in place, a cell-level quantity D^(q)_cell (already m=1-corrected by recombine_derivative_regression's affine fit) using every available higher blended derivative, same Taylor argument as apply_local_taylor_correction but using the discrete corner-vertex average discrete_vmom_cache instead of a continuous volume integral.
+  ! Verified to close the vertex-to-cell recombination gap to ~1e-10.
   subroutine apply_discrete_vertex_moment_correction(mesh, d, nc_in, q, k_max, q_val, dfield_cell)
     implicit none
 
@@ -2756,29 +2568,8 @@ contains
     end do
   end subroutine apply_discrete_vertex_moment_correction
 
-  ! aho_cls, fully standalone (no dependence on aho_gg/aho_ls's own fit),
-  ! recursive to arbitrary order. Builds p(1),p(2),...,p(k_max) -- each
-  ! GENUINELY exact to its own order -- alternating a node step and a
-  ! cell-blend step:
-  !   p(0)_cell = phi (given)
-  !     -> [order-1 node step, below]      -> p(1)_node   (grad_v)
-  !     -> [linear/WENO blend]             -> p(1)_cell   (grad_out)
-  !     -> [functional-identity node step] -> p(2)_node   (hess_v)
-  !     -> [linear/WENO blend]             -> p(2)_cell   (hess_out)
-  !     -> [functional-identity node step] -> p(3)_node   (third_v)
-  !     -> [linear/WENO blend]             -> p(3)_cell   (third_out)
-  ! compute_order1_node_aho_cls (k=1) and compute_next_order_node_aho_cls
-  ! (k>=2, SAME routine for k=2,3,...,40) both rest on the identical idea --
-  ! a quantity built by a SIMPLE, EXPLICIT interpolation/blend of known data
-  ! has an EXACTLY COMPUTABLE bias against the true field, a plain discrete
-  ! geometric moment (no quadrature, no gg_grad_h1_cache) -- but they differ
-  ! because the interpolation runs in OPPOSITE directions at k=1 (node built
-  ! FROM cells, order 0) vs k>=2 (cell built FROM nodes, order k-1, from the
-  ! previous blend step), so the discrete moment (nu_v vs mu_C(v)) and the
-  ! delta each corrects are not the same formula -- seeded from an ordinary
-  ! GG/LS fit instead, grad_v carries an UNCOMPUTABLE-here bias (it needs
-  ! gg_grad_h1_cache to characterize), which is why that was tried and
-  ! abandoned in favor of this fully self-contained construction.
+  ! aho_cls, fully standalone (no dependence on aho_gg/aho_ls), recursive to arbitrary order: builds p(1)...p(k_max), alternating a node step and a cell-blend step, each genuinely exact to its own order via an explicitly computable bias against a plain discrete geometric moment (no quadrature, no gg_grad_h1_cache).
+  ! compute_order1_node_aho_cls (k=1) and compute_next_order_node_aho_cls (k>=2) share this idea but differ in interpolation direction (node-from-cells at k=1 vs cell-from-nodes at k>=2), so their discrete-moment/delta formulas differ.
   subroutine compute_derivatives_aho_cls(mesh, nc_in, phi, grad_out, hess_out, third_out)
     implicit none
 
@@ -2808,16 +2599,8 @@ contains
     deallocate(grad_v, hess_v, third_v, grad_oi_v, hess_oi_v, third_oi_v_unused)
   end subroutine compute_derivatives_aho_cls
 
-  ! Special k=1 node step (no p(0)_node exists to difference against, unlike
-  ! k>=2): phi_v(v), a SIMPLE inverse-square-distance-weighted interpolation
-  ! of phi over v's own neighbor cells, has an exactly computable bias
-  ! against phi(x_v) for a genuinely affine field: phi_v(v) = phi(x_v) +
-  ! grad(x_v).nu_v, nu_v the SAME-weighted average of (x_C-x_v). So for each
-  ! neighbor cell C, phi(C) - phi_v(v) = grad(x_v).[(x_C-x_v) - nu_v] exactly
-  ! -- solved by weighted LS over v's 1-ring for grad_v, without ever
-  ! forming phi_v as a separate output (it cancels out of the fit). Verified
-  ! to reproduce grad_v exactly for a synthetic affine field even though
-  ! phi_v itself is measurably biased.
+  ! Special k=1 node step (no p(0)_node to difference against): for each neighbor cell C, phi(C) - phi_v(v) = grad(x_v).[(x_C-x_v) - nu_v] exactly for an affine field (nu_v the inverse-square-distance-weighted average of (x_C-x_v)).
+  ! Solved by weighted LS over v's 1-ring for grad_v; phi_v itself is never formed since it cancels out of the fit.
   subroutine compute_order1_node_aho_cls(mesh, nc_in, phi, grad_v, oi_v)
     use linear_solver_module, only: lu_factor_lapack, lu_solve_mat_lapack
     implicit none
@@ -2912,10 +2695,7 @@ contains
     end do
   end subroutine compute_order1_node_aho_cls
 
-  ! Blends a per-vertex tensor (ncomp components, any order -- k=1..40 alike)
-  ! into cells via the SAME sub_elem_volume/WENO weight used everywhere else
-  ! in this module: weight = sub_elem_volume (use_weno_blend=.false.) or
-  ! sub_elem_volume/(eps_weight_num+oi_node) (use_weno_blend=.true.).
+  ! Blends a per-vertex tensor (any order) into cells via the same sub_elem_volume/WENO weight used everywhere else in this module: weight = sub_elem_volume, or sub_elem_volume/(eps_weight_num+oi_node) when use_weno_blend.
   subroutine blend_node_to_cell_aho_cls(mesh, ncomp, p_node, oi_node, p_cell)
     implicit none
 
@@ -2960,25 +2740,8 @@ contains
     deallocate(num, den)
   end subroutine blend_node_to_cell_aho_cls
 
-  ! GENERAL k-exact node step, identical for every k>=2 (k=2,3,...,40): builds
-  ! p_next_node = D^k(x_v), genuinely k-exact, at every non-boundary vertex,
-  ! from p_prev_node = D^(k-1)(x_v) (already known, built at the previous
-  ! step) and p_prev_cell = D^(k-1) blended into cells (blend_node_to_cell_
-  ! aho_cls's own output, using oi_prev_node's weights). For a genuine
-  ! degree-k field, D^(k-1) is exactly affine, so each neighbor cell C's own
-  ! blend gap delta_C := p_prev_cell(C) - p_prev_node(v) equals exactly
-  ! D^k(x_v) contracted with mu_C(v), the SAME sub_elem_volume/WENO-weighted
-  ! average of (x_v'-x_v) over C's own corner vertices v' used to build that
-  ! blend (a DISCRETE moment, no continuous quadrature cache needed here --
-  ! this is Haider's functional identity, eq. 15-18, generalized from
-  ! vertex-vertex differences (compute_2exact_hessian_aho_cls) to
-  ! vertex-cell differences, so it composes without a growing stencil or a
-  ! growing per-step linear system). Stacking over v's own 1-ring of cells
-  ! (n_neigh equations) and contracting only the LAST tensor index of D^k
-  ! against mu_C(v) decouples into nc_in*3**(k-1) INDEPENDENT 3-unknown
-  ! weighted least-squares fits sharing one (n_neigh x 3) geometry matrix --
-  ! exactly the size of an ordinary gradient fit, at any k. oi_next_node is
-  ! this fit's own normalized residual, used as the NEXT blend's WENO weight.
+  ! General k-exact node step (same for every k>=2): builds D^k(x_v) from D^(k-1)(x_v) and its cell-blend, using Haider's functional identity (eq. 15-18, generalized from vertex-vertex to vertex-cell differences) so it composes without a growing stencil.
+  ! Contracting only the last tensor index of D^k against the discrete moment mu_C(v) decouples into nc_in*3**(k-1) independent 3-unknown weighted LS fits sharing one (n_neigh x 3) geometry matrix -- same size as an ordinary gradient fit at any k.
   subroutine compute_next_order_node_aho_cls(mesh, nc_in, k, p_prev_node, p_prev_cell, oi_prev_node, &
       p_next_node, oi_next_node)
     use linear_solver_module, only: lu_factor_lapack, lu_solve_mat_lapack
@@ -3076,10 +2839,8 @@ contains
     end do
   end subroutine compute_next_order_node_aho_cls
 
-  ! Builds cell_ls_mat_inv_cache (Haider, Croisille & Courbet 2011, Definition 1, step 1: a
-  ! 1-exact 1st derivative computed directly from cell averages on a small stencil). Unweighted LS
-  ! normal-equations inverse over mesh%elem(alpha)%neigh_by_vert (the cell's own vertex-stencil
-  ! neighbor cells) -- purely cell-centered, no vertex fit or blend involved anywhere.
+  ! Builds cell_ls_mat_inv_cache (Haider, Croisille & Courbet 2011, Definition 1 step 1: a 1-exact 1st derivative from cell averages on a small stencil).
+  ! Unweighted LS normal-equations inverse over mesh%elem(alpha)%neigh_by_vert -- purely cell-centered, no vertex fit or blend involved.
   subroutine ensure_cell_ls_grad_mat_cache(mesh, boundary_2d)
     use linear_solver_module, only: pseudo_inverse_inplace_lapack
     implicit none
@@ -3117,9 +2878,8 @@ contains
     cell_ls_mat_cache_boundary_2d = boundary_2d
   end subroutine ensure_cell_ls_grad_mat_cache
 
-  ! Cell-to-cell 1-exact gradient (Definition 1, step 1): grad_cell(:,alpha) =
-  ! cell_ls_mat_inv_cache(alpha) @ sum_beta h_{alpha,beta}*(phi(beta)-phi(alpha)), beta ranging
-  ! over neigh_by_vert(alpha). Caller must have called ensure_cell_ls_grad_mat_cache first.
+  ! Cell-to-cell 1-exact gradient (Definition 1, step 1): grad_cell(:,alpha) = cell_ls_mat_inv_cache(alpha) @ sum_beta h_{alpha,beta}*(phi(beta)-phi(alpha)) over neigh_by_vert(alpha).
+  ! Caller must have called ensure_cell_ls_grad_mat_cache first.
   subroutine compute_cell_ls_grad(mesh, nc_in, phi, grad_cell)
     implicit none
 
@@ -3150,11 +2910,8 @@ contains
     end do
   end subroutine compute_cell_ls_grad
 
-  ! Cell-to-cell analogue of ensure_gg_gradient_h1_cache: H_m^(1)(alpha), m=2..max_order, built by
-  ! applying the SAME cell_ls_mat_inv_cache grad operator to the geometric field
-  ! {z_{alpha,beta}^(m)-z_{alpha,alpha}^(m)}_beta (shifted_cell_moment_full) instead of phi, over
-  ! alpha's own neigh_by_vert stencil. This is Haider's w_beta^(k|k) applied to z_beta^(k+1) (eq.
-  ! 15-16) for the k=1 case. Pure geometry, cached once per mesh.
+  ! Cell-to-cell analogue of ensure_gg_gradient_h1_cache: applies the same cell_ls_mat_inv_cache grad operator to the geometric field {z_{alpha,beta}^(m)-z_{alpha,alpha}^(m)}_beta instead of phi, over alpha's neigh_by_vert stencil.
+  ! This is Haider's w_beta^(k|k) applied to z_beta^(k+1) (eq. 15-16) for the k=1 case. Pure geometry, cached once per mesh.
   subroutine ensure_cell_ls_h1_cache(mesh, boundary_2d, max_order)
     implicit none
 
@@ -3207,13 +2964,8 @@ contains
     cell_ls_h1_cache_boundary_2d = boundary_2d
   end subroutine ensure_cell_ls_h1_cache
 
-  ! Cell-to-cell CLS Hessian (Haider, Croisille & Courbet 2011, Definition 1, step 2, k=1->2):
-  ! builds a genuinely 2-exact Hessian directly at cell centers from a 1-exact gradient
-  ! (grad_cell, compute_cell_ls_grad) and the SAME operator's own bias on the geometric moment
-  ! field (cell_ls_h1_cache(2)), following the functional identity (eq. 15-18) with i indexing
-  ! neigh_by_vert(alpha) instead of vv_neigh_cache. Direct cell-to-cell port of the already-proven
-  ! vertex-vertex compute_2exact_hessian_aho_cls -- this is Haider's OWN algorithm (which never
-  ! involves vertices/nodes at all), as opposed to Setzwein's vertex-centered adaptation of it.
+  ! Cell-to-cell CLS Hessian (Haider, Croisille & Courbet 2011, Definition 1 step 2, k=1->2): builds a genuinely 2-exact Hessian at cell centers from a 1-exact gradient and the operator's own bias on the geometric moment field, following the functional identity (eq. 15-18) with i indexing neigh_by_vert(alpha) instead of vv_neigh_cache.
+  ! This is Haider's own cell-only algorithm, as opposed to Setzwein's vertex-centered adaptation (compute_2exact_hessian_aho_cls).
   subroutine compute_cell_cls_2exact_hessian(mesh, boundary_2d, grad_cell, hess_cell)
     use linear_solver_module, only: lu_factor_lapack, lu_solve_mat_lapack
     implicit none
@@ -3268,10 +3020,8 @@ contains
     end do
   end subroutine compute_cell_cls_2exact_hessian
 
-  ! Driver: Haider, Croisille & Courbet (2011) Definition 1 CLS algorithm, faithfully cell-to-cell
-  ! (reference implementation; k=1->2 only for now, eq. 13's final k-exactness correction and the
-  ! k=2->3 step are not yet implemented). nc_in=1 only for now. grad_out/hess_out use the full flat
-  ! (redundant) tensor convention, (dir2-1)*3*nc_in+(dir1-1)*nc_in+ic, matching hess_flat elsewhere.
+  ! Driver: Haider, Croisille & Courbet (2011) Definition 1 CLS algorithm, faithfully cell-to-cell (reference implementation; k=1->2 only for now, nc_in=1 only for now).
+  ! grad_out/hess_out use the full flat (redundant) tensor convention (dir2-1)*3*nc_in+(dir1-1)*nc_in+ic, matching hess_flat elsewhere.
   subroutine compute_derivatives_cls_classic(mesh, boundary_2d, phi, grad_out, hess_out)
     implicit none
 
@@ -3302,15 +3052,8 @@ contains
     end do
   end subroutine compute_derivatives_cls_classic
 
-  ! GENERAL reusable "apply the SAME grad-to-hess functional-identity OPERATOR (Haider eq. 16,
-  ! m=1 case) to an ARBITRARY nc_in-component grad-like field", instead of the real 1-exact
-  ! gradient -- since the operator's own geometry (Jmat/normal_mat, built from
-  ! cell_ls_h1_cache(2) and cell centroid displacements alone) does NOT depend on which field is
-  ! being processed, this is the SAME construction as compute_cell_cls_2exact_hessian, just
-  ! batched over nc_in independent "grad-like" fields at once. This is the key building block
-  ! that makes the k=2->3 step (needing beta's OWN hess operator applied to a geometric moment
-  ! field, not phi) tractable: call this with grad_like_cell = grad-of-the-geometric-field.
-  ! Output is the reduced 6-component (Hxx,Hxy,Hxz,Hyy,Hyz,Hzz) basis, times nc_in.
+  ! General reusable form of compute_cell_cls_2exact_hessian: applies the same grad-to-hess functional-identity operator (Haider eq. 16, m=1) to an arbitrary nc_in-component grad-like field, since the operator's geometry (Jmat/normal_mat) doesn't depend on which field is processed.
+  ! Key building block for the k=2->3 step (call with grad_like_cell = grad of the geometric field). Output is the reduced 6-component (Hxx,Hxy,Hxz,Hyy,Hyz,Hzz) basis, times nc_in.
   subroutine apply_cell_cls_hess_operator(mesh, boundary_2d, nc_in, grad_like_cell, hess_like_out)
     use linear_solver_module, only: lu_factor_lapack, lu_solve_mat_lapack
     implicit none
@@ -3373,16 +3116,8 @@ contains
     end do
   end subroutine apply_cell_cls_hess_operator
 
-  ! Builds cell_cls_hess_of_z3_cache(X) := X's OWN hess operator (apply_cell_cls_hess_operator)
-  ! applied to the geometric field {z_{X,gamma}^(3)}_gamma (shifted_cell_moment_full) instead of
-  ! phi -- Haider's w_beta^(2|2) applied to z_beta^(3) (eq. 15-16, m=2 case), the piece needed to
-  ! build a genuinely 3-exact third derivative from a 2-exact Hessian (Definition 1, step 2,
-  ! k=2->3) that a simple reapplication of grad's OWN operator (as used for k=1->2) cannot give.
-  ! For each X, first fits the geometric field's OWN "grad" at X and each of X's neigh_by_vert
-  ! neighbors (a local, bounded 2-ring computation via cell_ls_mat_inv_cache), then applies X's
-  ! hess operator to those local grad values. Pure geometry, expensive (O(n_elems * n_neigh^2)),
-  ! cached once per mesh. Output: reduced 6-component hess basis x 27-component z basis (162
-  ! total), layout (ell_hess-1)*27+ell_z.
+  ! Builds cell_cls_hess_of_z3_cache(X) := X's own hess operator applied to the geometric field {z_{X,gamma}^(3)}_gamma instead of phi (Haider's w_beta^(2|2) applied to z_beta^(3), eq. 15-16 m=2 case) -- needed for the genuinely 3-exact third derivative (k=2->3), which a simple reapplication of grad's operator cannot give.
+  ! For each X, fits the geometric field's own grad at X and its neigh_by_vert neighbors, then applies X's hess operator; expensive (O(n_elems*n_neigh^2)), cached once. Output layout: (ell_hess-1)*27+ell_z, 6x27=162 components.
   subroutine ensure_cell_cls_hess_of_z3_cache(mesh, boundary_2d)
     use linear_solver_module, only: lu_factor_lapack, lu_solve_mat_lapack
     implicit none
@@ -3489,25 +3224,8 @@ contains
     cell_cls_hess_of_z3_boundary_2d = boundary_2d
   end subroutine ensure_cell_cls_hess_of_z3_cache
 
-  ! Cell-to-cell CLS third derivative (Haider, Croisille & Courbet 2011, Definition 1, step 2,
-  ! k=2->3): builds a genuinely 3-exact third derivative directly at cell centers from a 2-exact
-  ! Hessian (hess_red, reduced 6-component Hxx,Hxy,Hxz,Hyy,Hyz,Hzz, from
-  ! compute_cell_cls_2exact_hessian) and cell_cls_hess_of_z3_cache (beta's OWN hess operator
-  ! applied to z_beta^(3), NOT grad's operator -- the genuinely faithful eq. 16 construction,
-  ! unlike compute_node_derivative_bias's approximation of always reusing the order-1 operator).
-  ! third_out is the full flat (redundant) 27-component tensor; NOT explicitly symmetrized (each
-  ! of the 27 unknowns is fit independently against whichever equations reference it, so
-  ! permutation-equivalent entries may differ by a small residual amount rather than being
-  ! forced exactly equal).
-  ! third_red is the GENUINELY REDUCED 10-component basis of S^3(R^3) (independent components of a
-  ! symmetric rank-3 3D tensor: xxx,xxy,xxz,xyy,xyz,xzz,yyy,yyz,yzz,zzz), NOT the full-flat
-  ! 27-component redundant array used elsewhere in this module. Using the redundant basis for an
-  ! UNKNOWN being solved for (as opposed to a KNOWN geometric field, where redundancy is harmless)
-  ! leaves the normal-equations system rank-deficient: its null space lets the Moore-Penrose
-  ! pseudo-inverse return the MINIMUM-NORM solution among many consistent ones, not the unique
-  ! true (symmetric) value -- a real, load-bearing bug, not a cosmetic asymmetry, found by
-  ! rereading Haider, Croisille & Courbet 2011 in full: their own S^m(R^d) notation IS the reduced
-  ! symmetric tensor space, never a redundant flat array.
+  ! Cell-to-cell CLS third derivative (Haider, Croisille & Courbet 2011, Definition 1 step 2, k=2->3): builds a genuinely 3-exact third derivative at cell centers from a 2-exact Hessian and cell_cls_hess_of_z3_cache (beta's own hess operator applied to z_beta^(3), the faithful eq. 16 construction).
+  ! third_red MUST use the reduced 10-component S^3(R^3) basis, not the full-flat 27-component redundant array: solving for a redundant unknown leaves the normal-equations system rank-deficient, so the pseudo-inverse returns an arbitrary minimum-norm solution instead of the true symmetric value (a real bug, not cosmetic).
   subroutine compute_cell_cls_3exact_third(mesh, boundary_2d, hess_red, third_red)
     use linear_solver_module, only: pseudo_inverse_inplace_lapack
     implicit none
@@ -3524,10 +3242,8 @@ contains
     real(kind=DOUBLE), dimension(10, 10) :: normal_mat
     integer(kind=ENTIER), parameter :: basis_i(6) = (/1,1,1,2,2,3/)
     integer(kind=ENTIER), parameter :: basis_j(6) = (/1,2,3,2,3,3/)
-    ! Sorted (a,b,c) triple for each of the 10 canonical third-derivative components, and their
-    ! full-flat 27-index (c-1)*9+(b-1)*3+a (matching cell_cls_hess_of_z3_cache's own z-input
-    ! layout) -- z is a KNOWN geometric field there, so picking one canonical representative per
-    ! permutation-equivalent group is exact, no averaging needed.
+    ! Sorted (a,b,c) triple for each of the 10 canonical third-derivative components, and their full-flat 27-index (c-1)*9+(b-1)*3+a (matching cell_cls_hess_of_z3_cache's z-input layout);
+    ! z is a known field there, so picking one representative per permutation group is exact.
     integer(kind=ENTIER), parameter :: red10_a(10) = (/1,1,1,1,1,1,2,2,2,3/)
     integer(kind=ENTIER), parameter :: red10_b(10) = (/1,1,1,2,2,3,2,2,3,3/)
     integer(kind=ENTIER), parameter :: red10_c(10) = (/1,2,3,2,3,3,2,3,3,3/)
@@ -3575,9 +3291,8 @@ contains
     end do
   end subroutine compute_cell_cls_3exact_third
 
-  ! Sorts (a,b,c) and returns the matching index (1..10) into the canonical S^3(R^3) basis
-  ! (xxx,xxy,xxz,xyy,xyz,xzz,yyy,yyz,yzz,zzz). Module-level so every routine building or applying
-  ! a third-derivative operator uses the SAME canonical convention.
+  ! Sorts (a,b,c) and returns the matching index (1..10) into the canonical S^3(R^3) basis (xxx,xxy,xxz,xyy,xyz,xzz,yyy,yyz,yzz,zzz).
+  ! Module-level so every routine building or applying a third-derivative operator uses the same canonical convention.
   pure function canon10_index(a_in, b_in, c_in) result(ell)
     implicit none
     integer(kind=ENTIER), intent(in) :: a_in, b_in, c_in
@@ -3622,11 +3337,8 @@ contains
     ell = -1
   end function canon15_index
 
-  ! Expands a reduced 10-component (S^3(R^3): xxx,xxy,xxz,xyy,xyz,xzz,yyy,yyz,yzz,zzz) tensor
-  ! into the full flat 27-component convention, for feeding routines (contract_grad_node_bias)
-  ! that expect the general full-flat layout used elsewhere in this module. Since third_red's 10
-  ! components are already the UNIQUE, exactly-symmetric solution (no redundant unknowns solved
-  ! for), this expansion is exact by construction -- no averaging needed.
+  ! Expands a reduced 10-component S^3(R^3) tensor into the full flat 27-component convention, for routines (contract_grad_node_bias) expecting the general full-flat layout.
+  ! Exact by construction since third_red's 10 components are already the unique, exactly-symmetric solution -- no averaging needed.
   pure function third_red_to_full27(third_red, n_elems) result(third_full)
     implicit none
     integer(kind=ENTIER), intent(in) :: n_elems
@@ -3658,9 +3370,7 @@ contains
     end do
   end function third_red_to_full27
 
-  ! Averages every permutation-equivalent group of components of a full-flat (27, n_elems)
-  ! rank-3 tensor (flat index (c-1)*9+(b-1)*3+a for (a,b,c) in 1..3) so the result is EXACTLY
-  ! symmetric under any permutation of its 3 indices, instead of merely approximately so.
+  ! Averages every permutation-equivalent group of components of a full-flat (27, n_elems) rank-3 tensor (flat index (c-1)*9+(b-1)*3+a) so the result is exactly symmetric, instead of merely approximately so.
   subroutine symmetrize_third_flat(third_out, n_elems)
     implicit none
 
@@ -3714,11 +3424,8 @@ contains
     end do
   end subroutine symmetrize_third_flat
 
-  ! Driver: full Haider, Croisille & Courbet (2011) Definition 1 CLS algorithm, faithfully
-  ! cell-to-cell, up to the third derivative (grad 1-exact, hess 2-exact via eq. 16's functional
-  ! identity, third 3-exact via the SAME identity reusing hess's OWN operator, not grad's).
-  ! nc_in=1 only. grad_out/hess_out use the full flat (redundant) tensor convention; third_out is
-  ! full flat too and not explicitly symmetrized (see compute_cell_cls_3exact_third).
+  ! Driver: full Haider, Croisille & Courbet (2011) Definition 1 CLS algorithm, cell-to-cell up to the third derivative (grad 1-exact, hess 2-exact, third 3-exact via eq. 16 reusing hess's own operator, not grad's). nc_in=1 only.
+  ! grad_out/hess_out/third_out use the full flat (redundant) tensor convention; third_out is not explicitly symmetrized (see compute_cell_cls_3exact_third).
   subroutine compute_derivatives_cls_classic_order3(mesh, boundary_2d, phi, grad_out, hess_out, third_out)
     implicit none
 
@@ -3753,10 +3460,7 @@ contains
     call compute_cell_cls_3exact_third(mesh, boundary_2d, hess_red, third_red)
     third_out = third_red_to_full27(third_red, mesh%n_elems)
 
-    ! Definition 1, step 3 (eq. 13): correct grad (k=1) and hess (k=2) using third (k+1=3), now
-    ! that it is available, so grad/hess ALSO reach 3-exactness instead of stopping at their own
-    ! 1-/2-exact construction. For a genuinely cubic field this should drive grad and hess to
-    ! (near) machine precision.
+    ! Definition 1, step 3 (eq. 13): corrects grad (k=1) and hess (k=2) using the now-available third derivative, so they also reach 3-exactness instead of stopping at their own 1-/2-exact construction (near machine precision for a genuinely cubic field).
     call apply_cell_cls_eq13_correction(mesh, boundary_2d, grad_out, hess_red, third_out)
 
     hess_out = 0.0_DOUBLE
@@ -3771,12 +3475,8 @@ contains
     end do
   end subroutine compute_derivatives_cls_classic_order3
 
-  ! Haider, Croisille & Courbet (2011) Definition 1, step 3 (eq. 13): corrects grad (k=1, in
-  ! place) and hess_red (k=2, reduced 6-component, in place) using the now-available third
-  ! derivative, reusing the SAME geometric operators already built for the k->k+1 recursion
-  ! (cell_ls_h1_cache for grad's own correction, cell_cls_hess_of_z3_cache for hess's own
-  ! correction -- NOT always grad's operator, unlike compute_node_derivative_bias's
-  ! approximation for the vertex-based aho_gg/aho_ls chain).
+  ! Haider, Croisille & Courbet (2011) Definition 1, step 3 (eq. 13): corrects grad (k=1) and hess_red (k=2) in place using the now-available third derivative, reusing the geometric operators already built for the k->k+1 recursion (cell_ls_h1_cache for grad, cell_cls_hess_of_z3_cache for hess).
+  ! Unlike compute_node_derivative_bias's vertex-based approximation, this does NOT always reuse grad's operator.
   subroutine apply_cell_cls_eq13_correction(mesh, boundary_2d, grad_out, hess_red, third_out)
     implicit none
 
@@ -3814,9 +3514,7 @@ contains
     grad_out = grad_out - bias_grad_m2/2.0_DOUBLE - bias_grad_m3/6.0_DOUBLE
   end subroutine apply_cell_cls_eq13_correction
 
-  ! Expands a reduced 6-component (Hxx,Hxy,Hxz,Hyy,Hyz,Hzz) hess field into the full flat
-  ! 9-component convention, for feeding contract_grad_node_bias (which expects the general
-  ! full-flat layout used everywhere else in the module).
+  ! Expands a reduced 6-component (Hxx,Hxy,Hxz,Hyy,Hyz,Hzz) hess field into the full flat 9-component convention, for feeding contract_grad_node_bias.
   pure function hess_red_to_full9(hess_red, n_elems) result(hess_full)
     implicit none
     integer(kind=ENTIER), intent(in) :: n_elems
@@ -3836,22 +3534,10 @@ contains
     end do
   end function hess_red_to_full9
 
-  ! ============================================================================================
-  ! Order-5 extension (Haider, Croisille & Courbet 2011, Definition 1, k=3->4 step): builds a
-  ! genuinely 4-exact 4th derivative from the 3-exact third derivative, needing "third's OWN
-  ! operator applied to z^(4)" (eq. 16, m=3 case) -- ONE MORE nesting level than the k=2->3 step
-  ! (which needed "hess's own operator applied to z^(3)"). Implemented ON DEMAND (no persistent
-  ! module-level cache): every quantity is recomputed fresh from mesh geometry + cell_ls_mat_inv_
-  ! cache + cell_ls_h1_cache(2) + cell_cls_hess_of_z3_cache each call, mirroring exactly how a
-  ! human would hand-evaluate eq. 15-18 recursively. This is expensive (each call to
-  ! third_of_geom_field_at costs O(n_neigh^3): a grad-fit at every point of a 2-ring, a hess-fit
-  ! at every point of a 1-ring, then one more solve) -- acceptable for validating correctness on
-  ! a small mesh, not yet a production-ready order-5 implementation.
-  ! ============================================================================================
+  ! Order-5 extension (Haider, Croisille & Courbet 2011, Definition 1, k=3->4 step): builds a genuinely 4-exact 4th derivative from the 3-exact third derivative, one nesting level deeper than k=2->3 (third's own operator applied to z^(4), eq. 16 m=3).
+  ! Implemented on demand (no persistent cache), recomputing everything each call from mesh geometry: expensive (O(n_neigh^3) per third_of_geom_field_at call), acceptable for correctness validation on a small mesh, not yet production-ready.
 
-  ! id_eval's own 1-exact grad operator (Definition 1, step 1) applied to the KNOWN geometric
-  ! field {z_{id_home,gamma}^(m_order)}_gamma (shifted_cell_moment_full) instead of phi, using
-  ! id_eval's own neigh_by_vert stencil. Full-flat output (3, 3**m_order).
+  ! id_eval's own 1-exact grad operator (Definition 1, step 1) applied to the known geometric field {z_{id_home,gamma}^(m_order)}_gamma instead of phi, using id_eval's own neigh_by_vert stencil. Full-flat output (3, 3**m_order).
   subroutine grad_of_geom_field_at(mesh, id_home, m_order, id_eval, g)
     implicit none
 
@@ -3879,9 +3565,7 @@ contains
     g = matmul(cell_ls_mat_inv_cache(:, :, id_eval), rhs)
   end subroutine grad_of_geom_field_at
 
-  ! id_eval's own 2-exact hess operator (eq. 16, m=1 case) applied to the SAME geometric field,
-  ! via grad_of_geom_field_at evaluated over id_eval's own neigh_by_vert stencil. Reduced
-  ! 6-component output (6, 3**m_order).
+  ! id_eval's own 2-exact hess operator (eq. 16, m=1 case) applied to the same geometric field, via grad_of_geom_field_at over id_eval's neigh_by_vert stencil. Reduced 6-component output (6, 3**m_order).
   subroutine hess_of_geom_field_at(mesh, boundary_2d, id_home, m_order, id_eval, h6)
     use linear_solver_module, only: pseudo_inverse_inplace_lapack
     implicit none
@@ -3932,10 +3616,8 @@ contains
     deallocate(Jmat, rhsvec, normal_rhs, g_eval, g_beta)
   end subroutine hess_of_geom_field_at
 
-  ! id_eval's own 3-exact third operator (eq. 16, m=2 case, reduced-10 basis) applied to the SAME
-  ! geometric field, via hess_of_geom_field_at evaluated over id_eval's own neigh_by_vert
-  ! stencil, using cell_cls_hess_of_z3_cache for the SAME geometric correction term used to build
-  ! the real third derivative. Reduced 10-component output (10, 3**m_order).
+  ! id_eval's own 3-exact third operator (eq. 16, m=2 case, reduced-10 basis) applied to the same geometric field, via hess_of_geom_field_at over id_eval's neigh_by_vert stencil, reusing cell_cls_hess_of_z3_cache's geometric correction term.
+  ! Reduced 10-component output (10, 3**m_order).
   subroutine third_of_geom_field_at(mesh, boundary_2d, id_home, m_order, id_eval, t10)
     use linear_solver_module, only: pseudo_inverse_inplace_lapack
     implicit none
@@ -3987,13 +3669,8 @@ contains
     deallocate(Jmat, rhsvec, normal_rhs, hess_eval, hess_beta)
   end subroutine third_of_geom_field_at
 
-  ! Cell-to-cell CLS fourth derivative (Definition 1, step 2, k=3->4): builds a genuinely
-  ! 4-exact fourth derivative directly at cell centers from a 3-exact third derivative
-  ! (third_red, reduced 10-component) and third_of_geom_field_at(alpha,4,alpha) (the SAME
-  ! geometric correction mechanism, one nesting level deeper). fourth_red is the reduced
-  ! 15-component S^4(R^3) basis (xxxx,xxxy,xxxz,xxyy,xxyz,xxzz,xyyy,xyyz,xyzz,xzzz,yyyy,yyyz,
-  ! yyzz,yzzz,zzzz). No caching: third_of_geom_field_at is recomputed from scratch for every
-  ! (alpha,beta) pair -- expensive, see this section's header comment.
+  ! Cell-to-cell CLS fourth derivative (Definition 1 step 2, k=3->4): builds a genuinely 4-exact fourth derivative at cell centers from a 3-exact third derivative and third_of_geom_field_at (same geometric correction mechanism, one nesting level deeper). fourth_red is the reduced 15-component S^4(R^3) basis.
+  ! No caching: third_of_geom_field_at is recomputed from scratch for every (alpha,beta) pair -- expensive (see this section's header).
   subroutine compute_cell_cls_4exact_fourth(mesh, boundary_2d, third_red, fourth_red)
     use linear_solver_module, only: pseudo_inverse_inplace_lapack
     implicit none
