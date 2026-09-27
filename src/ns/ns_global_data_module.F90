@@ -76,8 +76,23 @@ module ns_global_data_module
   integer, parameter :: SCHEME_MULTI_POINT_VILAR       = 10 ! "multi_point_vilar"
   integer, parameter :: SCHEME_WIP2                    = 11 ! "WIP2"
   integer, parameter :: SCHEME_WIP2_NOLM               = 12 ! "WIP2_NOLM" (theta=1, reference)
-  integer, parameter :: SCHEME_THREE_WAVE_ENTHALPY     = 15 ! "three_wave_enthalpy" (enthalpy-preserving three_wave)
-  integer, parameter :: SCHEME_MULTI_POINT_ENTHALPY    = 16 ! "multi_point_enthalpy" (enthalpy-preserving multi_point)
+  integer, parameter :: SCHEME_WIP2_AADV               = 13 ! "WIP2_AADV" (theta=1, AMISO advection)
+  integer, parameter :: SCHEME_WIP2_HYB                = 14 ! "WIP2_HYB" (theta=1, shock-sensor blended advection)
+  ! eps_p sensor variants of WIP2_NOLM (see tex/wip.tex's four candidates)
+  integer, parameter :: SCHEME_WIP2_EJUMP              = 15 ! "WIP2_EJUMP" (d) normalised pressure jump
+  integer, parameter :: SCHEME_WIP2_EDIV               = 16 ! "WIP2_EDIV"  (a) -div(v) only
+  integer, parameter :: SCHEME_WIP2_EMAX               = 17 ! "WIP2_EMAX"  (b) max(p jump, -div v), Ma^2 gate
+  integer, parameter :: SCHEME_WIP2_ENTH                = 18 ! "WIP2_ENTH" Haenel/MGallice enthalpy fix
+  integer, parameter :: SCHEME_WIP2_ENTH_EJUMP          = 19 ! "WIP2_ENTH_EJUMP" enthalpy fix + (d) sensor
+  integer, parameter :: SCHEME_WIP2_TP                  = 20 ! "WIP2_TP" Tallois multi-D low-Mach correction
+  integer, parameter :: SCHEME_WIP2_TP_ENTH             = 21 ! "WIP2_TP_ENTH" + Haenel enthalpy fix
+  ! 60-62: kept clear of the 1-21 block, which the WIP2 family keeps growing into. These three
+  ! were 15/16/17 and silently collided with SCHEME_WIP2_EJUMP/EDIV/EMAX: the WIP2 if-chain in
+  ! ns_euler_module fires before the flux select case, so the enthalpy schemes ran a WIP2
+  ! solver instead, with no error message. Renumber here, not there, if more are added.
+  integer, parameter :: SCHEME_THREE_WAVE_ENTHALPY     = 60 ! "three_wave_enthalpy" (enthalpy-preserving three_wave)
+  integer, parameter :: SCHEME_MULTI_POINT_ENTHALPY    = 61 ! "multi_point_enthalpy" (enthalpy-preserving multi_point)
+  integer, parameter :: SCHEME_THREE_WAVE_ENTHALPY2    = 62 ! "three_wave_enthalpy2" (HLL-consistent realisation; see solver header)
   integer, parameter :: SCHEME_ZB                   = 42 ! "ZB_*_*"
   ! ZB advection sub-scheme IDs
   integer, parameter :: SCHEME_ADV_AR1D     = 1  ! "AR1D"
@@ -295,6 +310,8 @@ contains
       scheme_id = SCHEME_THREE_WAVE_ENTHALPY
     else if (t == "multi_point_enthalpy") then
       scheme_id = SCHEME_MULTI_POINT_ENTHALPY
+    else if (t == "three_wave_enthalpy2") then
+      scheme_id = SCHEME_THREE_WAVE_ENTHALPY2
     else if (t == "multi_point_pressure") then
       scheme_id = SCHEME_MULTI_POINT_PRESSURE
     else if (t == "multi_point_pressure_ph") then
@@ -307,6 +324,24 @@ contains
       scheme_id = SCHEME_WIP2
     else if (t == "WIP2_NOLM") then
       scheme_id = SCHEME_WIP2_NOLM
+    else if (t == "WIP2_AADV") then
+      scheme_id = SCHEME_WIP2_AADV
+    else if (t == "WIP2_HYB") then
+      scheme_id = SCHEME_WIP2_HYB
+    else if (t == "WIP2_EJUMP") then
+      scheme_id = SCHEME_WIP2_EJUMP
+    else if (t == "WIP2_EDIV") then
+      scheme_id = SCHEME_WIP2_EDIV
+    else if (t == "WIP2_EMAX") then
+      scheme_id = SCHEME_WIP2_EMAX
+    else if (t == "WIP2_ENTH") then
+      scheme_id = SCHEME_WIP2_ENTH
+    else if (t == "WIP2_ENTH_EJUMP") then
+      scheme_id = SCHEME_WIP2_ENTH_EJUMP
+    else if (t == "WIP2_TP") then
+      scheme_id = SCHEME_WIP2_TP
+    else if (t == "WIP2_TP_ENTH") then
+      scheme_id = SCHEME_WIP2_TP_ENTH
     else if (t == "USI3D") then
       scheme_id = SCHEME_USI3D
     else if (t(1:2) == "ZB") then

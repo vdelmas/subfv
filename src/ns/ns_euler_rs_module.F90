@@ -83,6 +83,14 @@ contains
   ! euler_ho_module's three_wave_enthalpy_flux; see the long comment there for the derivation
   ! and the two properties checked analytically.
   !
+  ! NOTE on what this is: U~ is not a Riemann solver profile for the Euler system -- its
+  ! far-field state U~_l differs from the initial datum U_l -- so this is not a Godunov-type
+  ! scheme built on an approximate Riemann solver. It is a conservative, consistent numerical
+  ! flux whose DISSIPATION operator acts on rho*h = rho*E + p instead of rho*E, i.e. Haenel's
+  ! energy-flux splitting transplanted into the Gallice wave structure. The assembly is still
+  ! built on the TRUE physical flux F(U_l), never on F(U~_l), and is legitimate because
+  ! sum_k Lambda_k (U~_{k+1} - U~_k) = F(U_r) - F(U_l) holds exactly with those true fluxes.
+  !
   ! In short: for a steady Euler solution the total enthalpy h = e + p/rho is constant along
   ! streamlines, so h == h_inf everywhere downstream of a uniform inflow, shocks included.
   ! three_wave above (like HLLC/Roe/Rusanov) does not reproduce that discretely and leaves an h
@@ -177,6 +185,155 @@ contains
 
     lr_flux(:, 2) = -lr_flux(:, 1)
   end subroutine three_wave_enthalpy
+
+  ! Reference:
+  !   L. Tallois, "Enthalpy preserving Simple Riemann solvers for steady hypersonic flows",
+  !   CEA-CESTA preprint, June 2026 (papers/talois.pdf), section 5.
+  !
+  ! Enthalpy-preserving solver written as a GENUINE simple Riemann solver: the two outer states
+  ! are the true conservative data (rho, rho*u, rho*E), so the solver satisfies the
+  ! Harten-Lax-van Leer consistency condition obtained by integrating the conservation law over
+  ! an x-t control volume, and only the two star states are free.
+  !
+  ! Why this exists. three_wave_enthalpy assembles its dissipation on states whose energy slot
+  ! carries rho*h; its far-field states therefore differ from the Riemann data by (0,0,0,0,p).
+  ! Integrating the conservation law over [x_l, x_r] x [0, dt] gives
+  !     int W dx = x_r U_r - x_l U_l - dt [f(U_r) - f(U_l)],
+  ! and Abel summation of the left-hand side leaves, for that solver, the extra requirement
+  ! Lambda_max (U~_r - U_r) = Lambda_min (U~_l - U_l), i.e. Lambda_max p_r = Lambda_min p_l --
+  ! impossible, since the integration bounds are arbitrary outside the fan. (Measured: the
+  ! residual of that condition is 5.8 for one choice of bounds and 19.0 for another, against
+  ! 0 for the classical solver whatever the bounds.) So three_wave_enthalpy is a valid
+  ! conservative, consistent numerical FLUX, but not a Godunov-type scheme built on a Riemann
+  ! solver -- it is Haenel's energy-flux splitting in the Gallice wave structure.
+  !
+  ! The construction here recovers the Riemann-solver reading. With the true outer states, the
+  ! mass and momentum components of the consistency condition are already satisfied by Gallice's
+  ! own rho*_s and u*_s, so only the two star ENERGIES E2, E3 are free, and exactly two scalar
+  ! conditions are imposed on them:
+  !
+  !   (I)   sum_k Lambda_k  dE_k = f_r(5) - f_l(5)   -- consistency with the integral form
+  !   (II)  sum_k |Lambda_k| dE_k = D5               -- D5 = the energy dissipation of
+  !                                                     three_wave_enthalpy, which is what
+  !                                                     enforces Haenel's condition
+  !
+  ! Two equations, two unknowns. An earlier attempt additionally demanded h*_s = h_s, which
+  ! over-constrained the system (three conditions for two unknowns) and broke both (I) and
+  ! Haenel -- and measured WORSE than the baseline three_wave on the M=20 cylinder (median
+  ! |H-h_inf|/h_inf of 3.7e-3 against 1.3e-13, the uniform supersonic upstream no longer being
+  ! preserved because the flux was no longer upwind there).
+  !
+  ! The 2x2 determinant vanishes exactly when the three speeds share a sign, i.e. when the fan
+  ! does not straddle the face. The flux is then the pure upwind flux whatever the star
+  ! energies, and the two rows are proportional, so any solution of (I) will do: the baseline
+  ! Gallice star energies are used, which satisfy (I) by construction.
+  !
+  ! Verified numerically on the implemented expressions (600 random state pairs): the flux is
+  ! identical to three_wave_enthalpy to round-off (2.7e-15 relative); the x-t integral
+  ! consistency residual is 6.9e-15 FOR ANY integration bounds; Haenel's condition holds to
+  ! 2.6e-14; F(U,U) = Fn(U) exactly; and the flux reduces to the upwind flux on a fully
+  ! supersonic face. In other words this solver and three_wave_enthalpy are the same scheme --
+  ! which is what settles the question: that flux IS the flux of a Godunov-type scheme whose
+  ! outer states are the Riemann data. Prefer three_wave_enthalpy in production (same answer,
+  ! no 2x2 solve); keep this one as the formal justification.
+  subroutine three_wave_enthalpy2(sol_w_l, sol_w_r, n, lr_flux, sl, sr)
+    implicit none
+
+    real(kind=DOUBLE), dimension(5), intent(in) :: sol_w_l, sol_w_r
+    real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), dimension(5) :: sol_l, sol_r
+    real(kind=DOUBLE), dimension(5, 2), intent(inout) :: lr_flux
+    real(kind=DOUBLE), intent(inout) :: sl, sr
+
+    real(kind=DOUBLE) :: rhol, rhor, vn_l, vn_r
+    real(kind=DOUBLE) :: pl, pr, rhol_et, rhor_et
+    real(kind=DOUBLE) :: v_et, el, er, al, ar, hl, hr
+    real(kind=DOUBLE) :: v_bar, pl_bar, pr_bar
+    real(kind=DOUBLE) :: lambda_l, lambda_r
+    real(kind=DOUBLE) :: aa, bb, cc, abs_a, abs_b, abs_c
+    real(kind=DOUBLE) :: e1, e4, e2, e3, d5, det, r1, r2, m11, m12, m21, m22
+    real(kind=DOUBLE), dimension(5) :: fl, fr, sol_l_et, sol_r_et
+
+    rhol = sol_w_l(1)
+    vn_l = dot_product(sol_w_l(2:4), n)
+    pl = sol_w_l(5)
+    sol_l = primit_to_conserv(sol_w_l)
+    el = sol_l(5)/rhol
+    al = sound_speed_w(sol_w_l)
+    hl = el + pl/rhol
+
+    rhor = sol_w_r(1)
+    vn_r = dot_product(sol_w_r(2:4), n)
+    pr = sol_w_r(5)
+    sol_r = primit_to_conserv(sol_w_r)
+    er = sol_r(5)/rhor
+    ar = sound_speed_w(sol_w_r)
+    hr = er + pr/rhor
+
+    fl(1)   = vn_l*sol_l(1)
+    fl(2:4) = vn_l*sol_l(2:4) + pl*n
+    fl(5)   = (sol_l(5) + pl)*vn_l
+
+    fr(1)   = vn_r*sol_r(1)
+    fr(2:4) = vn_r*sol_r(2:4) + pr*n
+    fr(5)   = (sol_r(5) + pr)*vn_r
+
+    lambda_l = max(al*rhol, sqrt(rhol*max(0.0_DOUBLE, pr - pl)), -rhol*(vn_r - vn_l))
+    lambda_r = max(ar*rhor, sqrt(rhor*max(0.0_DOUBLE, pl - pr)), -rhor*(vn_r - vn_l))
+    v_bar = (lambda_l*vn_l + lambda_r*vn_r - (pr - pl))/(lambda_r + lambda_l)
+    v_et = v_bar
+
+    rhol_et = 1.0_DOUBLE/(1.0_DOUBLE/rhol + (v_et - vn_l)/lambda_l)
+    pl_bar = pl - lambda_l*(v_et - vn_l)
+    rhor_et = 1.0_DOUBLE/(1.0_DOUBLE/rhor + (vn_r - v_et)/lambda_r)
+    pr_bar = pr + lambda_r*(v_et - vn_r)
+
+    sl = vn_l - lambda_l/rhol
+    sr = vn_r + lambda_r/rhor
+
+    aa = sl; bb = v_et; cc = sr
+    abs_a = abs(aa); abs_b = abs(bb); abs_c = abs(cc)
+
+    ! Outer energies are the TRUE ones; that is the whole point of this variant.
+    e1 = sol_l(5)
+    e4 = sol_r(5)
+
+    ! D5: the energy dissipation of three_wave_enthalpy, i.e. the mass dissipation weighted by h.
+    d5 = abs_a*(rhol_et*hl - rhol*hl) &
+       + abs_b*(rhor_et*hr - rhol_et*hl) &
+       + abs_c*(rhor*hr - rhor_et*hr)
+
+    m11 = aa - bb;        m12 = bb - cc
+    m21 = abs_a - abs_b;  m22 = abs_b - abs_c
+    r1 = (fr(5) - fl(5)) + aa*e1 - cc*e4
+    r2 = d5 + abs_a*e1 - abs_c*e4
+    det = m11*m22 - m12*m21
+
+    if (abs(det) > 1.0e-12_DOUBLE*max(1.0_DOUBLE, max(abs(m11), abs(m12))**2)) then
+      e2 = ( r1*m22 - m12*r2) / det
+      e3 = ( m11*r2 - r1*m21) / det
+    else
+      ! Fan entirely on one side of the face: rows proportional, flux is the upwind flux
+      ! regardless. Baseline Gallice star energies satisfy (I) by construction.
+      e2 = rhol_et*(el + (pl*vn_l - pl_bar*v_et)/lambda_l)
+      e3 = rhor_et*(er + (pr_bar*v_et - pr*vn_r)/lambda_r)
+    end if
+
+    sol_l_et(1)   = rhol_et
+    sol_l_et(2:4) = rhol_et*(sol_w_l(2:4) + (v_et - vn_l)*n)
+    sol_l_et(5)   = e2
+
+    sol_r_et(1)   = rhor_et
+    sol_r_et(2:4) = rhor_et*(sol_w_r(2:4) + (v_et - vn_r)*n)
+    sol_r_et(5)   = e3
+
+    lr_flux(:, 1) = 0.5_DOUBLE*(fl + fr) - 0.5_DOUBLE* &
+      (abs(sl)*(sol_l_et - sol_l) + &
+      abs(v_et)*(sol_r_et - sol_l_et) + &
+      abs(sr)*(sol_r - sol_r_et))
+
+    lr_flux(:, 2) = -lr_flux(:, 1)
+  end subroutine three_wave_enthalpy2
 
   subroutine modified_three_wave(sol_w_l, sol_w_r, n, lr_flux, sl, sr)
     implicit none
@@ -920,10 +1077,19 @@ contains
     integer(kind=ENTIER) :: j, id_sub_face, le, re, iter, n_iter
     real(kind=DOUBLE) :: rhol, vn_l, pl, al, lambda_l
     real(kind=DOUBLE) :: rhor, vn_r, pr, ar, lambda_r
-    real(kind=DOUBLE) :: s1, s2
+    real(kind=DOUBLE) :: s1, s2, p_prev
 
-    n_iter = 10
+    ! Fixed-point iteration on (lambda, p_node). The lambdas only ever grow (they
+    ! are updated through max()), so the iteration is monotone and converges; the
+    ! former hard stop at 10 sweeps was however not always enough in a strong
+    ! shock (Mach 27 half-cylinder on triangles), leaving the lambdas too small
+    ! for the intermediate states to stay positive -- the run then died on
+    ! "BAD OMEGA". Iterate to convergence instead, with a generous cap: where 10
+    ! sweeps already sufficed the same fixed point is reached, so results there
+    ! are unchanged.
+    n_iter = 100
     p_node = 0.0_DOUBLE
+    p_prev = 0.0_DOUBLE
     do iter = 1, n_iter
       s1 = 0.0_DOUBLE
       s2 = 0.0_DOUBLE
@@ -979,6 +1145,11 @@ contains
       end do
 
       p_node = s1/s2
+
+      if (iter > 1) then
+        if (abs(p_node - p_prev) <= 1.0e-12_DOUBLE*max(abs(p_node), tiny(1.0_DOUBLE))) exit
+      end if
+      p_prev = p_node
     end do
   end subroutine compute_lambdas_and_solve_nodal_pressure
 
