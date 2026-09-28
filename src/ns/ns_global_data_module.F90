@@ -74,6 +74,25 @@ module ns_global_data_module
   integer, parameter :: SCHEME_WIP                     = 7  ! "WIP"
   integer, parameter :: SCHEME_USI3D                   = 9  ! "USI3D"
   integer, parameter :: SCHEME_MULTI_POINT_VILAR       = 10 ! "multi_point_vilar"
+  integer, parameter :: SCHEME_WIP2                    = 11 ! "WIP2"
+  integer, parameter :: SCHEME_WIP2_NOLM               = 12 ! "WIP2_NOLM" (theta=1, reference)
+  integer, parameter :: SCHEME_WIP2_AADV               = 13 ! "WIP2_AADV" (theta=1, AMISO advection)
+  integer, parameter :: SCHEME_WIP2_HYB                = 14 ! "WIP2_HYB" (theta=1, shock-sensor blended advection)
+  ! eps_p sensor variants of WIP2_NOLM (see tex/wip.tex's four candidates)
+  integer, parameter :: SCHEME_WIP2_EJUMP              = 15 ! "WIP2_EJUMP" (d) normalised pressure jump
+  integer, parameter :: SCHEME_WIP2_EDIV               = 16 ! "WIP2_EDIV"  (a) -div(v) only
+  integer, parameter :: SCHEME_WIP2_EMAX               = 17 ! "WIP2_EMAX"  (b) max(p jump, -div v), Ma^2 gate
+  integer, parameter :: SCHEME_WIP2_ENTH                = 18 ! "WIP2_ENTH" Haenel/MGallice enthalpy fix
+  integer, parameter :: SCHEME_WIP2_ENTH_EJUMP          = 19 ! "WIP2_ENTH_EJUMP" enthalpy fix + (d) sensor
+  integer, parameter :: SCHEME_WIP2_TP                  = 20 ! "WIP2_TP" Tallois multi-D low-Mach correction
+  integer, parameter :: SCHEME_WIP2_TP_ENTH             = 21 ! "WIP2_TP_ENTH" + Haenel enthalpy fix
+  ! 60-62: kept clear of the 1-21 block, which the WIP2 family keeps growing into. These three
+  ! were 15/16/17 and silently collided with SCHEME_WIP2_EJUMP/EDIV/EMAX: the WIP2 if-chain in
+  ! ns_euler_module fires before the flux select case, so the enthalpy schemes ran a WIP2
+  ! solver instead, with no error message. Renumber here, not there, if more are added.
+  integer, parameter :: SCHEME_THREE_WAVE_ENTHALPY     = 60 ! "three_wave_enthalpy" (enthalpy-preserving three_wave)
+  integer, parameter :: SCHEME_MULTI_POINT_ENTHALPY    = 61 ! "multi_point_enthalpy" (enthalpy-preserving multi_point)
+  integer, parameter :: SCHEME_THREE_WAVE_ENTHALPY2    = 62 ! "three_wave_enthalpy2" (HLL-consistent realisation; see solver header)
   integer, parameter :: SCHEME_ZB                   = 42 ! "ZB_*_*"
   ! ZB advection sub-scheme IDs
   integer, parameter :: SCHEME_ADV_AR1D     = 1  ! "AR1D"
@@ -81,15 +100,17 @@ module ns_global_data_module
   integer, parameter :: SCHEME_ADV_AMISO    = 3  ! "AMISO"
   integer, parameter :: SCHEME_ADV_ARMD     = 4  ! "ARMD"
   integer, parameter :: SCHEME_ADV_ARMDU    = 5  ! "ARMDU"
-  integer, parameter :: SCHEME_ADV_ARMDM    = 6  ! "ARMDM"
   integer, parameter :: SCHEME_ADV_ARMDMAT  = 7  ! "ARMDMAT"
   integer, parameter :: SCHEME_ADV_ARMDUMAT = 8  ! "ARMDUMAT"
-  integer, parameter :: SCHEME_ADV_ARMDMMAT = 9  ! "ARMDMMAT"
+  ! SCHEME_ADV_ARMDM (6), SCHEME_ADV_ARMDMMAT (9) removed 2026-09-15: only
+  ! active users of compute_ellip's mat_h_p output, and unreachable via any
+  ! schemes.txt entry (advection sub-schemes there are AMISO/AR1D only)
   integer, parameter :: SCHEME_ADV_ARMDWIP     = 10  ! "ARMDWIP"
   ! ZB Lagrange sub-scheme IDs
   integer, parameter :: SCHEME_LAG_LS  = 1  ! "LS"
   integer, parameter :: SCHEME_LAG_LSU = 2  ! "LSU"
-  integer, parameter :: SCHEME_LAG_LSM = 3  ! "LSM"
+  ! SCHEME_LAG_LSM (3) removed 2026-09-15: same reason, unreachable via
+  ! schemes.txt (lag sub-schemes there are LVPPP/LPP/LS1D/LPF only)
   integer, parameter :: SCHEME_LAG_LSWIP = 4  ! "LSWIP"
   integer, parameter :: SCHEME_LAG_LPP = 5  ! "LPP"
   integer, parameter :: SCHEME_LAG_LVPPP = 6  ! "LVPPP"
@@ -285,6 +306,12 @@ contains
       scheme_id = SCHEME_TWO_WAVE
     else if (t == "modified_three_wave") then
       scheme_id = SCHEME_MODIFIED_THREE_WAVE
+    else if (t == "three_wave_enthalpy") then
+      scheme_id = SCHEME_THREE_WAVE_ENTHALPY
+    else if (t == "multi_point_enthalpy") then
+      scheme_id = SCHEME_MULTI_POINT_ENTHALPY
+    else if (t == "three_wave_enthalpy2") then
+      scheme_id = SCHEME_THREE_WAVE_ENTHALPY2
     else if (t == "multi_point_pressure") then
       scheme_id = SCHEME_MULTI_POINT_PRESSURE
     else if (t == "multi_point_pressure_ph") then
@@ -293,6 +320,28 @@ contains
       scheme_id = SCHEME_MULTI_POINT_VILAR
     else if (t == "WIP") then
       scheme_id = SCHEME_WIP
+    else if (t == "WIP2") then
+      scheme_id = SCHEME_WIP2
+    else if (t == "WIP2_NOLM") then
+      scheme_id = SCHEME_WIP2_NOLM
+    else if (t == "WIP2_AADV") then
+      scheme_id = SCHEME_WIP2_AADV
+    else if (t == "WIP2_HYB") then
+      scheme_id = SCHEME_WIP2_HYB
+    else if (t == "WIP2_EJUMP") then
+      scheme_id = SCHEME_WIP2_EJUMP
+    else if (t == "WIP2_EDIV") then
+      scheme_id = SCHEME_WIP2_EDIV
+    else if (t == "WIP2_EMAX") then
+      scheme_id = SCHEME_WIP2_EMAX
+    else if (t == "WIP2_ENTH") then
+      scheme_id = SCHEME_WIP2_ENTH
+    else if (t == "WIP2_ENTH_EJUMP") then
+      scheme_id = SCHEME_WIP2_ENTH_EJUMP
+    else if (t == "WIP2_TP") then
+      scheme_id = SCHEME_WIP2_TP
+    else if (t == "WIP2_TP_ENTH") then
+      scheme_id = SCHEME_WIP2_TP_ENTH
     else if (t == "USI3D") then
       scheme_id = SCHEME_USI3D
     else if (t(1:2) == "ZB") then
@@ -309,10 +358,8 @@ contains
       if (t_adv == "ARMD")     then; scheme_adv_id = SCHEME_ADV_ARMD;     recognized = .true.; end if
       if (t_adv == "ARMDWIP")  then; scheme_adv_id = SCHEME_ADV_ARMDWIP;  recognized = .true.; end if
       if (t_adv == "ARMDU")    then; scheme_adv_id = SCHEME_ADV_ARMDU;    recognized = .true.; end if
-      if (t_adv == "ARMDM")    then; scheme_adv_id = SCHEME_ADV_ARMDM;    recognized = .true.; end if
       if (t_adv == "ARMDMAT")  then; scheme_adv_id = SCHEME_ADV_ARMDMAT;  recognized = .true.; end if
       if (t_adv == "ARMDUMAT") then; scheme_adv_id = SCHEME_ADV_ARMDUMAT; recognized = .true.; end if
-      if (t_adv == "ARMDMMAT") then; scheme_adv_id = SCHEME_ADV_ARMDMMAT; recognized = .true.; end if
       if (.not. recognized) then
         print *, "ERROR: ZB advection unrecognized: '", trim(t_adv), "'"
         error stop
@@ -323,7 +370,6 @@ contains
       if (t_lag == "LPP")  then; scheme_lag_id = SCHEME_LAG_LPP; recognized = .true.; end if
       if (t_lag == "LVPPP")  then; scheme_lag_id = SCHEME_LAG_LVPPP; recognized = .true.; end if
       if (t_lag == "LSU") then; scheme_lag_id = SCHEME_LAG_LSU;   recognized = .true.; end if
-      if (t_lag == "LSM") then; scheme_lag_id = SCHEME_LAG_LSM;   recognized = .true.; end if
       if (t_lag == "LS1D") then; scheme_lag_id = SCHEME_LAG_LS1D; recognized = .true.; end if
       if (t_lag == "LPF")  then; scheme_lag_id = SCHEME_LAG_LPF;  recognized = .true.; end if
       if (.not. recognized) then

@@ -10,6 +10,13 @@ module lagrange_module
   implicit none
 
   real(kind=DOUBLE), parameter :: gamma = 7.0_DOUBLE/5.0_DOUBLE
+
+  ! Taylor-Green vortex (init = 10) -- the reference convergence test case for
+  ! cell-centred Lagrangian hydrodynamics (Vilar, PhD 2012, Sec. 4.2.4). C0 has to
+  ! keep the pressure positive: min[cos+cos] = -2, so C0 > rho0*U0^2/2.
+  real(kind=DOUBLE), parameter :: tg_rho0 = 1.0_DOUBLE
+  real(kind=DOUBLE), parameter :: tg_u0   = 1.0_DOUBLE
+  real(kind=DOUBLE), parameter :: tg_c0   = 1.0_DOUBLE
 contains
   subroutine compute_rhs_lagrange(mesh, sol, vp, dt, rhs, n_bc, bc_type, bc_val, b2d, mass, &
       gamma_arr, vp_is_imposed, second_order, grad_v, grad_p, div_v, alpha_p_arr)
@@ -294,15 +301,18 @@ contains
         flux(2:4) = pr_et * mesh%face(id_face)%norm
         flux(5)   = pr_et * v_et
         rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == i_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == i_vert) then
           rse_loc = mesh%sub_elem(rse)%id_loc_around_node
           rhs(:, rse_loc) = rhs(:, rse_loc) + mesh%sub_face(id_sub_face)%area/mass(idr) * flux
+        end if
         end if
       end if
     end do
   end subroutine compute_rhs_around_node
 
-  subroutine compute_gradients(mesh, sol, gamma_arr, dt, grad_v, grad_p, div_v, p_limited)
+  subroutine compute_gradients(mesh, sol, gamma_arr, dt, grad_v, grad_p, div_v, p_limited, weno, &
+      gg_corrected, eps_weno_in)
     use linear_solver_module, only: tensor_product_3, inverse_3_by_3
     ! Nodal WENO Green-Gauss gradients weighted by ||grad_p||.
     ! div_v = trace(grad_v).
@@ -316,13 +326,40 @@ contains
     real(kind=DOUBLE), dimension(3, mesh%n_elems), intent(out) :: grad_p
     real(kind=DOUBLE), dimension(mesh%n_elems), intent(out) :: div_v
     integer(kind=ENTIER), dimension(mesh%n_elems), intent(out), optional :: p_limited
+    ! .false. -> plain volume-weighted average of the nodal gradients (linear
+    ! scheme). Default .true. = the WENO-style weight below, which is nonlinear
+    ! even in smooth flow and is what the scheme has always used.
+    logical, intent(in), optional :: weno
+    ! .true. -> CORRECTED Green-Gauss, as aho_gg does: grad = mat^-1 . (sum A n dphi)
+    ! with mat = sum A n (x) dx, instead of dividing the raw flux sum by the nodal
+    ! volume Omega_p. The uncorrected form is only exact for a linear field when
+    ! mat = Omega_p * I, which holds on a Cartesian hex mesh by symmetry but not in
+    ! general. Default .false. = the historical behaviour.
+    logical, intent(in), optional :: gg_corrected
+    ! eps in the nonlinear nodal-gradient weight w_p = Omega_p/(eps + ||S_p||^4).
+    ! Default tiny() makes the weighting fully nonlinear even in smooth flow; a
+    ! larger eps (e.g. 1e-2) pushes it back towards the plain volume-weighted
+    ! (linear) combination wherever ||S_p||^4 is small compared to eps.
+    real(kind=DOUBLE), intent(in), optional :: eps_weno_in
 
     integer(kind=ENTIER) :: i, j, id_sub_face, id_sub_elem, id_face, id_elem, idl, idr
     real(kind=DOUBLE) :: omega_p, pl, pr, area, w_p, norm_Sp, p0
-    real(kind=DOUBLE), parameter :: eps_weno = tiny(1.0_DOUBLE)
+    real(kind=DOUBLE) :: eps_weno
     real(kind=DOUBLE), dimension(3) :: S_p, vl_vec, vr_vec, dv_vec, n, dx
     real(kind=DOUBLE), dimension(3, 3) :: S_p_gv, mat, mat_inv
     real(kind=DOUBLE), dimension(:), allocatable :: sum_omega_p, sum_omega_gv
+    logical :: use_weno, use_corr, mat_ok
+    real(kind=DOUBLE) :: det_mat
+    real(kind=DOUBLE), dimension(3, 3) :: mat_inv_t
+
+    use_weno = .true.
+    if (present(weno)) use_weno = weno
+    eps_weno = tiny(1.0_DOUBLE)
+    if (present(eps_weno_in)) then
+      if (eps_weno_in > 0.0_DOUBLE) eps_weno = eps_weno_in
+    end if
+    use_corr = .false.
+    if (present(gg_corrected)) use_corr = gg_corrected
 
     grad_v = 0.0_DOUBLE
     grad_p = 0.0_DOUBLE
@@ -366,11 +403,34 @@ contains
         S_p_gv = S_p_gv + area * tensor_product_3(dv_vec, n)
       end do
 
-      S_p    = S_p    / omega_p
-      S_p_gv = S_p_gv / omega_p
+      if (use_corr) then
+        ! S_p(i)      = mat(i,j) dp/dx_j            -> grad_p = mat^-1 S_p
+        ! S_p_gv(i,j) = J(i,k) mat(j,k)             -> J      = S_p_gv . (mat^-1)^T
+        ! Singular/ill-conditioned mat (degenerate vertex stencils) falls back to
+        ! the uncorrected form rather than producing garbage.
+        det_mat = mat(1,1)*(mat(2,2)*mat(3,3) - mat(2,3)*mat(3,2)) &
+                - mat(1,2)*(mat(2,1)*mat(3,3) - mat(2,3)*mat(3,1)) &
+                + mat(1,3)*(mat(2,1)*mat(3,2) - mat(2,2)*mat(3,1))
+        mat_ok = abs(det_mat) > 1.0e-12_DOUBLE*max(omega_p, tiny(1.0_DOUBLE))**3
+        if (mat_ok) then
+          call inverse_3_by_3(mat, mat_inv)
+          mat_inv_t = transpose(mat_inv)
+          S_p    = matmul(mat_inv, S_p)
+          S_p_gv = matmul(S_p_gv, mat_inv_t)
+        else
+          S_p    = S_p    / omega_p
+          S_p_gv = S_p_gv / omega_p
+        end if
+      else
+        S_p    = S_p    / omega_p
+        S_p_gv = S_p_gv / omega_p
+      end if
       norm_Sp = norm2(S_p)
-      w_p = omega_p / (eps_weno + norm_Sp**4)
-      !w_p = omega_p
+      if (use_weno) then
+        w_p = omega_p / (eps_weno + norm_Sp**4)
+      else
+        w_p = omega_p
+      end if
 
       do j = 1, mesh%vert(i)%n_sub_elems_neigh
         id_sub_elem = mesh%vert(i)%sub_elem_neigh(j)
@@ -707,7 +767,7 @@ contains
   end subroutine compute_rhs_lagrange_classic_iso
 
   subroutine compute_rhs_lagrange_sidil(mesh, sol, vp, dt, rhs, &
-      n_bc, bc_type, bc_val, b2d, mass, method, b2d_h, gamma_arr, vp_is_imposed)
+      n_bc, bc_type, bc_val, b2d, mass, method, b2d_h, gamma_arr, vp_is_imposed, h_p_arr)
     use linear_solver_module, only: lu_solve, print_mat, inverse_3_by_3
     implicit none
 
@@ -724,6 +784,7 @@ contains
     real(kind=DOUBLE), dimension(5, n_bc) :: bc_val
     logical, intent(in) :: b2d
     real(kind=DOUBLE), intent(in) :: b2d_h
+    real(kind=DOUBLE), dimension(mesh%n_vert), intent(out), optional :: h_p_arr
 
     integer(kind=ENTIER) :: i, j, id_elem, id_face, id_sub_face
     integer(kind=ENTIER) :: id_sub_elem
@@ -744,9 +805,12 @@ contains
     do i=1, mesh%n_vert
 
       if (.not. vp_is_imposed(i)) then
-        call compute_nodal_velocity_sidil(mesh, i, sol, vp(:, i), method, b2d, b2d_h, gamma_arr)
+        call compute_nodal_velocity_sidil(mesh, i, sol, vp(:, i), method, b2d, b2d_h, gamma_arr, &
+          n_bc, bc_type, bc_val)
       end if
-      call compute_nodal_pressure_sidil(mesh, i, sol, pp, method, b2d, b2d_h, gamma_arr)
+      call compute_nodal_pressure_sidil(mesh, i, sol, pp, method, b2d, b2d_h, gamma_arr, &
+        n_bc, bc_type, bc_val)
+      if (present(h_p_arr)) h_p_arr(i) = compute_length(mesh, i, method, b2d, b2d_h)
 
       a_p = 0.0_DOUBLE
       do j=1, mesh%vert(i)%n_sub_elems_neigh
@@ -973,6 +1037,15 @@ contains
           + 0.5_DOUBLE*norm2(sol(2:4, i))**2
         sol(1, i) = 1.0_DOUBLE/sol(1, i)
       end do
+    else if( init == 10) then
+      ! Taylor-Green. Initialised with the exact CELL AVERAGE of the conserved
+      ! variables (quadrature over the cell), not the centroid point value as
+      ! init=2 does: a centroid initialisation injects an O(h^2) error of its own,
+      ! which is the same order as what a second-order scheme is being measured
+      ! against. rho is uniform here, so the mass average is the volume average.
+      do i=1, mesh%n_elems
+        call taylor_green_cell_average(mesh, i, sol(:, i))
+      end do
     else if( init == 42 ) then
       do i=1, mesh%n_elems
         sol(1, i) = 1.0_DOUBLE
@@ -1074,6 +1147,49 @@ contains
         sol(5, i) = (1.0_DOUBLE + mesh%elem(i)%coord(1) + mesh%elem(i)%coord(2)) &
                     / (gamma_arr(i) - 1.0_DOUBLE)
       end do
+    else if( init == 9 ) then
+      ! Shock-bubble interaction (Haas & Sturtevant 1987, He+28% air bubble),
+      ! Ms=1.22 planar shock in air. Geometry/gas data from Razmi et al.
+      ! (2019, JAFM 12(2), Fig. 2 / Table 1) and Quirk & Karni (1996, JFM
+      ! 318, Fig. 6). Full domain (no symmetry reduction), full circular
+      ! bubble centered at mid-height (xc_bub, yc_bub), radius r_bub.
+      ! The whole domain starts quiescent (rho=p=1, gamma=1.4) except the
+      ! bubble, which is in mechanical/thermal equilibrium with the ambient
+      ! air (same p, T), giving density R_air/R_bubble and gamma=1.648
+      ! (Table 1 of the reference: He contaminated 28% by mass with air).
+      ! The Ms=1.22 shock is generated by a 'piston' BC at the right wall
+      ! (x=Lx) imposing the post-shock velocity u2 there (see input_data.f);
+      ! this reproduces the reference's inflow BC on side CD ("exact flow
+      ! conditions behind the incident shock wave") and matches the normal-
+      ! shock relations for gamma=1.4: rho2/rho1=1.376417, p2/p1=1.569800,
+      ! u2=-(2/(gamma+1))*(Ms-1/Ms)*sqrt(gamma*p1/rho1)=-0.394664.
+      block
+        real(kind=DOUBLE), parameter :: xc_bub = 0.350_DOUBLE
+        real(kind=DOUBLE), parameter :: yc_bub = 0.0445_DOUBLE
+        real(kind=DOUBLE), parameter :: r_bub = 0.025_DOUBLE
+        real(kind=DOUBLE), parameter :: gamma_air = 1.4_DOUBLE
+        real(kind=DOUBLE), parameter :: gamma_bub = 1.648_DOUBLE
+        real(kind=DOUBLE), parameter :: rho_bub = 0.287_DOUBLE / 1.578_DOUBLE
+        real(kind=DOUBLE) :: rb
+        do i = 1, mesh%n_elems
+          rb = sqrt((mesh%elem(i)%coord(1) - xc_bub)**2 + (mesh%elem(i)%coord(2) - yc_bub)**2)
+          if (rb <= r_bub) then
+            gamma_arr(i) = gamma_bub
+            sol(1, i) = rho_bub
+            sol(2, i) = 0.0_DOUBLE
+            sol(5, i) = 1.0_DOUBLE
+          else
+            gamma_arr(i) = gamma_air
+            sol(1, i) = 1.0_DOUBLE
+            sol(2, i) = 0.0_DOUBLE
+            sol(5, i) = 1.0_DOUBLE
+          end if
+          sol(3:4, i) = 0.0_DOUBLE
+          sol(1, i) = 1.0_DOUBLE / sol(1, i)
+          sol(5, i) = sol(5, i) / ((gamma_arr(i) - 1.0_DOUBLE) / sol(1, i)) &
+            + 0.5_DOUBLE * norm2(sol(2:4, i))**2
+        end do
+      end block
     end if
 
   end subroutine init_sol
@@ -1188,7 +1304,8 @@ contains
     w(5) = w(1)**gamma
   end subroutine sol_isentropic_vortex
 
-  subroutine compute_nodal_velocity_sidil(mesh, id_vert, sol, vp, method, b2d, b2d_h, gamma_arr)
+  subroutine compute_nodal_velocity_sidil(mesh, id_vert, sol, vp, method, b2d, b2d_h, gamma_arr, &
+      n_bc, bc_type, bc_val)
     use lagrange_global_data_module, only : boundary_2d
     use linear_solver_module
     implicit none
@@ -1200,12 +1317,15 @@ contains
     real(kind=DOUBLE), intent(in) :: b2d_h
     logical, intent(in) :: b2d
     real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
+    integer(kind=ENTIER), intent(in), optional :: n_bc
+    character(len=255), dimension(:), intent(in), optional :: bc_type
+    real(kind=DOUBLE), dimension(:, :), intent(in), optional :: bc_val
 
     integer(kind=ENTIER) :: j, k, le, re
     integer(kind=ENTIER) :: id_sub_elem, id_elem
     integer(kind=ENTIER) :: id_sub_face, id_face
     real(kind=DOUBLE) :: rho_p, a_p, h_p
-    real(kind=DOUBLE), dimension(3) :: grad_p, Bp
+    real(kind=DOUBLE), dimension(3) :: grad_p, Bp, v_target
     real(kind=DOUBLE), dimension(5) :: sol_w, sol_l, sol_r
     real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r
     real(kind=DOUBLE), dimension(3,3) :: mat
@@ -1237,15 +1357,41 @@ contains
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
       id_face = mesh%sub_face(id_sub_face)%mesh_face
+      ! In boundary_2d, z-normal "cap" faces (top/bottom of the single
+      ! prism/hex layer) carry no physical wall, exactly like in
+      ! boundary_normal/corner_normal above -- but unlike those, this loop
+      ! never excluded them. If the fluid ever picks up even a tiny
+      ! out-of-plane z-velocity (numerical noise, since nothing in this
+      ! scheme forces it to stay exactly 0 the way vp_z is forced to for
+      ! the grid velocity), the cap-face mirror flips its sign, and the
+      ! resulting jump gets weighted by the cap's *full 2D footprint area*
+      ! (large, ~1e-4) instead of a lateral face's thin sliver (~1e-7) --
+      ! turning a negligible z-velocity into a wildly amplified spurious
+      ! grad_p/div_v contribution. Confirmed empirically: an interior
+      ! vertex with genuinely uniform, at-rest neighboring cells still blew
+      ! up to div_v~500 purely from this effect.
+      if (b2d .and. abs(mesh%face(id_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE) cycle
       le = mesh%face(id_face)%left_neigh
       re = mesh%face(id_face)%right_neigh
       sol_l = sol(:, le)
       if( re > 0 ) then
         sol_r = sol(:, re)
       else
+        ! Generic boundary mirror targets zero normal velocity (a static
+        ! wall). A piston BC moves with an imposed velocity instead: its
+        ! mirror must target that velocity's normal component, not zero,
+        ! or the reconstructed boundary state (and hence grad_p, which
+        ! depends on it through the kinetic-energy term in pressure())
+        ! silently assumes the piston isn't moving at all.
+        v_target = 0.0_DOUBLE
+        if (present(n_bc) .and. re < 0) then
+          if (-re <= n_bc) then
+            if (trim(bc_type(-re)) == 'piston') v_target = bc_val(2:4, -re)
+          end if
+        end if
         sol_r = sol(:, le)
-        sol_r(2:4) = sol_r(2:4) - 2.0_DOUBLE*dot_product(sol_r(2:4), &
-          mesh%face(id_face)%norm)*mesh%face(id_face)%norm
+        sol_r(2:4) = sol_l(2:4) + 2.0_DOUBLE*(dot_product(v_target, mesh%face(id_face)%norm) &
+          - dot_product(sol_l(2:4), mesh%face(id_face)%norm))*mesh%face(id_face)%norm
       end if
       sol_w_l = lag_to_primit(sol_l, gamma_arr(le))
       sol_w_r = lag_to_primit(sol_r, gamma_arr(le))
@@ -1256,16 +1402,28 @@ contains
     grad_p = grad_p / mesh%vert(id_vert)%volume
 
     if( mesh%vert(id_vert)%is_bound ) then
-      Bp = boundary_normal(mesh, id_vert)
+      Bp = boundary_normal(mesh, id_vert, b2d)
       Bp = Bp/norm2(Bp)
       grad_p = grad_p - dot_product(grad_p, Bp)*Bp
     end if
 
     h_p = compute_length(mesh, id_vert, method, b2d, b2d_h)
     vp = vp - 0.5_DOUBLE*h_p/(rho_p*a_p)*grad_p
+
+    ! The correction above only ever adds a tangential contribution (grad_p
+    ! was already projected against Bp), but vp's base value -- the
+    ! volume-weighted average of the neighboring cells' velocities, before
+    ! any correction -- was never projected: a general flow field has no
+    ! reason for that average to be tangential to the wall already, so the
+    ! final vp used to move the boundary node could still carry a spurious
+    ! wall-normal (penetrating) component.
+    if( mesh%vert(id_vert)%is_bound ) then
+      vp = vp - dot_product(vp, Bp)*Bp
+    end if
   end subroutine compute_nodal_velocity_sidil
 
-  subroutine compute_nodal_pressure_sidil(mesh, id_vert, sol, pp, method, b2d, b2d_h, gamma_arr)
+  subroutine compute_nodal_pressure_sidil(mesh, id_vert, sol, pp, method, b2d, b2d_h, gamma_arr, &
+      n_bc, bc_type, bc_val)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -1275,11 +1433,15 @@ contains
     real(kind=DOUBLE), intent(in) :: b2d_h
     logical :: b2d
     real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
+    integer(kind=ENTIER), intent(in), optional :: n_bc
+    character(len=255), dimension(:), intent(in), optional :: bc_type
+    real(kind=DOUBLE), dimension(:, :), intent(in), optional :: bc_val
 
     integer(kind=ENTIER) :: j, id_elem, id_sub_elem, le, re
     integer(kind=ENTIER) :: id_face, id_sub_face
     real(kind=DOUBLE), dimension(5) :: sol_w
     real(kind=DOUBLE) :: rho_p, a_p, h_p, div_v
+    real(kind=DOUBLE), dimension(3) :: v_target
     real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, sol_l, sol_r
 
     pp = 0.0_DOUBLE
@@ -1305,15 +1467,24 @@ contains
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
       id_face = mesh%sub_face(id_sub_face)%mesh_face
+      ! See the identical exclusion + comment in compute_nodal_velocity_sidil.
+      if (b2d .and. abs(mesh%face(id_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE) cycle
       le = mesh%face(id_face)%left_neigh
       re = mesh%face(id_face)%right_neigh
       sol_l = sol(:, le)
       if( re > 0 ) then
         sol_r = sol(:, re)
       else
+        ! Same piston-vs-static-wall mirror fix as compute_nodal_velocity_sidil.
+        v_target = 0.0_DOUBLE
+        if (present(n_bc) .and. re < 0) then
+          if (-re <= n_bc) then
+            if (trim(bc_type(-re)) == 'piston') v_target = bc_val(2:4, -re)
+          end if
+        end if
         sol_r = sol(:, le)
-        sol_r(2:4) = sol_r(2:4) - 2.0_DOUBLE*dot_product(sol_r(2:4), &
-          mesh%face(id_face)%norm)*mesh%face(id_face)%norm
+        sol_r(2:4) = sol_l(2:4) + 2.0_DOUBLE*(dot_product(v_target, mesh%face(id_face)%norm) &
+          - dot_product(sol_l(2:4), mesh%face(id_face)%norm))*mesh%face(id_face)%norm
       end if
       sol_w_l = lag_to_primit(sol_l, gamma_arr(le))
       sol_w_r = lag_to_primit(sol_r, gamma_arr(le))
@@ -1343,33 +1514,77 @@ contains
     integer(kind=ENTIER) :: j, k
     integer(kind=ENTIER) :: id_sub_elem, id_sub_face
     integer(kind=ENTIER) :: id_elem, id_face
-    real(kind=DOUBLE) :: area_sum
+    real(kind=DOUBLE) :: area_sum, vol_2d, length_scale, coeff
 
     area_sum = 0.0_DOUBLE
     do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
       id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
       id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
-      area_sum = area_sum + norm2(corner_normal(mesh, id_sub_elem))
+      if( b2d ) then
+        ! The lateral faces' area scales with the (purely numerical, not
+        ! physical) extrusion thickness -- only the z-normal "cap" faces
+        ! (top/bottom of the single layer) carry a genuine 2D footprint
+        ! area, independent of that thickness. Sum it as a plain scalar
+        ! area (not corner_normal's vector-summed normal, which mixes
+        ! several differently-oriented faces): each sub_elem contributes
+        ! its footprint area once (top and bottom caps have equal area, so
+        ! either one alone already represents it -- summing both would
+        ! just double-count the same physical quantity).
+        do k=1, mesh%sub_elem(id_sub_elem)%n_sub_faces
+          id_sub_face = mesh%sub_elem(id_sub_elem)%sub_face(k)
+          id_face = mesh%sub_face(id_sub_face)%mesh_face
+          if( abs(mesh%face(id_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE ) then
+            area_sum = area_sum + mesh%sub_face(id_sub_face)%area
+            exit
+          end if
+        end do
+      else
+        area_sum = area_sum + norm2(corner_normal(mesh, id_sub_elem, b2d))
+      end if
     end do
 
-    if( method == 0 ) then
-      h_p = 0.0_DOUBLE*mesh%vert(id_vert)%volume/area_sum
-    else if( method == 1) then
-      h_p = 1.0_DOUBLE*mesh%vert(id_vert)%volume/area_sum
-    else if( method == 2) then
-      h_p = 2.0_DOUBLE*mesh%vert(id_vert)%volume/area_sum
-    else if( method == 3) then
-      h_p = 4.0_DOUBLE*mesh%vert(id_vert)%volume/area_sum
-    else if( method == 4) then
-      h_p = 8.0_DOUBLE*mesh%vert(id_vert)%volume/area_sum
+    if( b2d ) then
+      ! mesh%vert(...)%volume is a genuine 3D volume (physical 2D area
+      ! times the artificial extrusion thickness): dividing by b2d_h (the
+      ! same thickness, set by the user to match the mesh's actual
+      ! extrusion) recovers the physical 2D area. area_sum is now itself a
+      ! physical area (see above), so sqrt(area_sum) is the length scale to
+      ! divide by, keeping h_p homogeneous to a length either way.
+      vol_2d = mesh%vert(id_vert)%volume / b2d_h
+      length_scale = sqrt(area_sum)
+    else
+      vol_2d = mesh%vert(id_vert)%volume
+      length_scale = area_sum
     end if
+
+    if( method == 0 ) then
+      coeff = 0.0_DOUBLE
+    else if( method == 1) then
+      coeff = 1.0_DOUBLE
+    else if( method == 2) then
+      coeff = 2.0_DOUBLE
+    else if( method == 3) then
+      coeff = 4.0_DOUBLE
+    else if( method == 4) then
+      coeff = 8.0_DOUBLE
+    end if
+    h_p = coeff*vol_2d/length_scale
   end function compute_length
 
-  function boundary_normal(mesh, id_vert) result(Bp)
+  function boundary_normal(mesh, id_vert, boundary_2d) result(Bp)
+    ! boundary_2d is passed in explicitly (matching every other routine in
+    ! this file, e.g. compute_nodal_velocity_sidil's b2d argument) rather
+    ! than pulled from lagrange_global_data_module: lagrange_main.F90
+    ! declares its OWN local boundary_2d (read from the namelist, default
+    ! .true.), which shadows the module's own (unrelated, always-.FALSE.
+    ! default, never assigned) variable of the same name -- using the
+    ! module one here silently always saw .FALSE., regardless of the actual
+    ! run's boundary_2d setting.
     implicit none
 
     type(mesh_type), intent(in) :: mesh
     integer(kind=ENTIER), intent(in) :: id_vert
+    logical, intent(in) :: boundary_2d
 
     real(kind=DOUBLE), dimension(3) :: Bp
     integer(kind=ENTIER) :: j
@@ -1380,18 +1595,37 @@ contains
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
       id_face = mesh%sub_face(id_sub_face)%mesh_face
       if( mesh%face(id_face)%right_neigh <= 0 ) then
-        Bp = Bp &
-          + mesh%sub_face(id_sub_face)%area*mesh%face(id_face)%norm
+        ! In boundary_2d, the mesh is a single prism/hex layer: the z-normal
+        ! "cap" faces (top/bottom of that one layer) are also boundary
+        ! faces (right_neigh<=0) but carry no physical wall -- including
+        ! them here mixes a spurious z-component into Bp, corrupting the
+        ! wall-tangential projection for every genuinely 2D lateral wall.
+        if (.not. (boundary_2d .and. abs(mesh%face(id_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE)) then
+          Bp = Bp &
+            + mesh%sub_face(id_sub_face)%area*mesh%face(id_face)%norm
+        end if
       end if
     end do
   end function boundary_normal
 
-  function corner_normal(mesh, id_sub_elem) result(norm)
-    use lagrange_global_data_module, only: boundary_2d
+  function corner_normal(mesh, id_sub_elem, boundary_2d) result(norm)
+    ! boundary_2d passed in explicitly -- same reasoning as boundary_normal
+    ! above: lagrange_global_data_module's own boundary_2d is a dead,
+    ! always-.FALSE. variable, shadowed everywhere else by lagrange_main's
+    ! local one (the one actually read from the namelist and threaded as
+    ! the b2d argument). Pulling it from the module here silently disabled
+    ! the entire z-cap-face exclusion below (.not. .FALSE. .or. ... is
+    ! always true), so area_sum in compute_length mixed in the z-normal cap
+    ! faces' area alongside the genuine lateral faces -- those scale with
+    ! the artificial extrusion thickness (h_extrude, e.g. 1e-4) completely
+    ! differently than the physical 2D geometry, corrupting the nodal
+    ! characteristic length h_p for every method that goes through
+    ! compute_length (the "classic" and "sidil" schemes).
     implicit none
 
     type(mesh_type), intent(in) :: mesh
     integer(kind=ENTIER), intent(in) :: id_sub_elem
+    logical, intent(in) :: boundary_2d
     real(kind=DOUBLE), dimension(3) :: norm
 
     integer(kind=ENTIER) :: j, id_sub_face, id_face
@@ -1462,4 +1696,358 @@ contains
     end do
     if (.not. (newEps >= 0.0_DOUBLE)) omega_pos = 0.0_DOUBLE
   end function omega_pos
+
+  ! L1/L2/Linf density error against the steady isentropic vortex (init=2).
+  ! Lagrangian specific: the mesh has MOVED, so the exact cell average is
+  ! re-quadratured on the deformed cell at the current vertex positions.
+  ! The vortex has zero background velocity, so it is an exact steady state
+  ! of the Euler equations and the exact field is the t=0 one at the moved
+  ! cell's own location (t is kept in the signature for symmetry).
+  subroutine compute_error_vortex(mesh, sol, t, h_extrude, h, l1err, l2err, linferr)
+    use quadrature_module, only: volume_quad_pts
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), intent(in) :: t, h_extrude
+    real(kind=DOUBLE), intent(out) :: h, l1err, l2err, linferr
+
+    integer(kind=ENTIER) :: i, k, q, n_v, n_inner, mpi_ierr
+    real(kind=DOUBLE) :: err1, err2, errinf, area_tot, area_i, rho_num, rho_ex, vol_q
+    real(kind=DOUBLE), dimension(5) :: wq
+    real(kind=DOUBLE), dimension(:, :), allocatable :: vcoords, pts
+    real(kind=DOUBLE), dimension(:), allocatable :: wts
+    real(kind=DOUBLE), dimension(4) :: buf
+
+    err1     = 0.0_DOUBLE
+    err2     = 0.0_DOUBLE
+    errinf   = 0.0_DOUBLE
+    area_tot = 0.0_DOUBLE
+    n_inner  = 0
+
+    do i = 1, mesh%n_elems
+      if (mesh%elem(i)%is_ghost) cycle
+
+      n_v = mesh%elem(i)%n_vert
+      rho_ex = 0.0_DOUBLE
+      if (n_v == 4 .or. n_v == 5 .or. n_v == 6 .or. n_v == 8) then
+        allocate(vcoords(3, n_v))
+        do k = 1, n_v
+          vcoords(:, k) = mesh%vert(mesh%elem(i)%vert(k))%coord
+        end do
+        call volume_quad_pts(n_v, vcoords, 3_ENTIER, pts, wts)
+        deallocate(vcoords)
+        vol_q = 0.0_DOUBLE
+        do q = 1, size(wts)
+          call sol_isentropic_vortex(pts(:, q), wq, t)
+          rho_ex = rho_ex + wts(q)*wq(1)
+          vol_q  = vol_q  + wts(q)
+        end do
+        deallocate(pts, wts)
+        if (vol_q > 0.0_DOUBLE) then
+          rho_ex = rho_ex/vol_q
+        else
+          call sol_isentropic_vortex(mesh%elem(i)%coord, wq, t)
+          rho_ex = wq(1)
+        end if
+      else
+        call sol_isentropic_vortex(mesh%elem(i)%coord, wq, t)
+        rho_ex = wq(1)
+      end if
+
+      rho_num = 1.0_DOUBLE/sol(1, i)
+      area_i  = mesh%elem(i)%volume/h_extrude
+
+      err1     = err1 + area_i*abs(rho_num - rho_ex)
+      err2     = err2 + area_i*(rho_num - rho_ex)**2
+      errinf   = max(errinf, abs(rho_num - rho_ex))
+      area_tot = area_tot + area_i
+      n_inner  = n_inner + 1
+    end do
+
+    buf = (/err1, err2, area_tot, real(n_inner, DOUBLE)/)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, buf, 3, MPI_DOUBLE_PRECISION, MPI_SUM, &
+      MPI_COMM_WORLD, mpi_ierr)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, buf(4), 1, MPI_DOUBLE_PRECISION, MPI_SUM, &
+      MPI_COMM_WORLD, mpi_ierr)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, errinf, 1, MPI_DOUBLE_PRECISION, MPI_MAX, &
+      MPI_COMM_WORLD, mpi_ierr)
+    err1     = buf(1)
+    err2     = buf(2)
+    area_tot = buf(3)
+
+    if (buf(4) > 0.0_DOUBLE .and. area_tot > 0.0_DOUBLE) then
+      h     = sqrt(area_tot/buf(4))
+      l1err = err1/area_tot
+      l2err = sqrt(err2/area_tot)
+    else
+      h = 0.0_DOUBLE; l1err = 0.0_DOUBLE; l2err = 0.0_DOUBLE
+    end if
+    linferr = errinf
+  end subroutine compute_error_vortex
+
+  ! 2D footprint area of a cell on an extruded "2D" mesh. Takes the area of the
+  ! z-normal face directly, the way euler_ho's compute_error_vortex does, instead
+  ! of volume/h_extrude: on a MOVING Lagrangian mesh the latter silently assumes
+  ! the z-extent is still the one auto-detected at t=0, and it hides a degenerate
+  ! cell (a NaN or zero volume shows up as a plausible area). Falls back to
+  ! volume/h_extrude when no z-face is found (a genuinely 3D mesh).
+  function cell_area_2d(mesh, i, h_extrude) result(area)
+    use quadrature_module, only: face_quad_pts
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: i
+    real(kind=DOUBLE), intent(in) :: h_extrude
+    real(kind=DOUBLE) :: area
+
+    integer(kind=ENTIER) :: kf, iface_loc, n_fv, k
+    real(kind=DOUBLE), dimension(:, :), allocatable :: fc, qpts_v
+    real(kind=DOUBLE), dimension(:), allocatable :: qwts_v
+
+    area = -1.0_DOUBLE
+    do kf = 1, mesh%elem(i)%n_faces
+      iface_loc = mesh%elem(i)%face(kf)
+      if (abs(abs(mesh%face(iface_loc)%norm(3)) - 1.0_DOUBLE) < 1.0e-6_DOUBLE) then
+        n_fv = mesh%face(iface_loc)%n_vert
+        if (n_fv >= 3 .and. allocated(mesh%face(iface_loc)%vert)) then
+          allocate(fc(3, n_fv))
+          do k = 1, n_fv
+            fc(:, k) = mesh%vert(mesh%face(iface_loc)%vert(k))%coord
+          end do
+          call face_quad_pts(n_fv, fc, 3_ENTIER, qpts_v, qwts_v)
+          deallocate(fc)
+          area = sum(qwts_v)
+          deallocate(qpts_v, qwts_v)
+          exit
+        end if
+      end if
+    end do
+    if (area <= 0.0_DOUBLE) area = mesh%elem(i)%volume/h_extrude
+  end function cell_area_2d
+
+  ! ---------------------------------------------------------------------------
+  ! Taylor-Green vortex, following Vilar (PhD 2012, Sec. 4.2.4), the standard
+  ! convergence test case for cell-centred Lagrangian hydrodynamics.
+  !
+  !   domain [0,1]^2,  rho = rho0  (uniform),
+  !   U = U0 ( sin(pi x) cos(pi y), -cos(pi x) sin(pi y) )   -- divergence free,
+  !   P = rho0 U0^2 / 4 * [cos(2 pi x) + cos(2 pi y)] + C0.
+  !
+  ! The velocity field being divergence free, the volume equation holds identically,
+  ! and that P is exactly what balances the inertia in the momentum equation. The
+  ! total energy equation does NOT close on its own: it needs the source term in
+  ! taylor_green_source (Vilar eq. 4.102-4.103). WITH that source the Eulerian
+  ! fields are steady, so the exact solution at any time is the initial one, which
+  ! is what compute_error_taylor_green relies on. WITHOUT it the computed solution
+  ! drifts and the error measurement is meaningless.
+  !
+  ! Note Vilar measures the rate on the PRESSURE, never the density -- here rho is
+  ! uniform and carries no signal at all.
+  ! ---------------------------------------------------------------------------
+  pure subroutine sol_taylor_green(coord, w)
+    use lagrange_global_data_module
+    implicit none
+
+    real(kind=DOUBLE), dimension(3), intent(in) :: coord
+    real(kind=DOUBLE), dimension(5), intent(inout) :: w
+
+    real(kind=DOUBLE) :: x, y
+
+    x = coord(1)
+    y = coord(2)
+    w(1) = tg_rho0
+    w(2) =  tg_u0*sin(PI*x)*cos(PI*y)
+    w(3) = -tg_u0*cos(PI*x)*sin(PI*y)
+    w(4) = 0.0_DOUBLE
+    w(5) = 0.25_DOUBLE*tg_rho0*tg_u0**2 &
+      *(cos(2.0_DOUBLE*PI*x) + cos(2.0_DOUBLE*PI*y)) + tg_c0
+  end subroutine sol_taylor_green
+
+  ! Energy source per unit VOLUME that closes the total energy equation, Vilar
+  ! eq. (4.103). Re-derived independently and it matches the printed formula.
+  pure function taylor_green_source(coord) result(src)
+    use lagrange_global_data_module
+    implicit none
+
+    real(kind=DOUBLE), dimension(3), intent(in) :: coord
+    real(kind=DOUBLE) :: src, x, y
+
+    x = coord(1)
+    y = coord(2)
+    src = PI*tg_rho0*tg_u0**3/(4.0_DOUBLE*(gamma - 1.0_DOUBLE)) &
+      *(cos(3.0_DOUBLE*PI*x)*cos(PI*y) - cos(3.0_DOUBLE*PI*y)*cos(PI*x))
+  end function taylor_green_source
+
+  ! Exact cell average of the Lagrangian conserved state (tau, u, E) over cell i.
+  subroutine taylor_green_cell_average(mesh, i, u_avg)
+    use quadrature_module, only: volume_quad_pts
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: i
+    real(kind=DOUBLE), dimension(5), intent(out) :: u_avg
+
+    integer(kind=ENTIER) :: k, q, n_v
+    real(kind=DOUBLE) :: vol_q, e_tot
+    real(kind=DOUBLE), dimension(5) :: w
+    real(kind=DOUBLE), dimension(:, :), allocatable :: vcoords, pts
+    real(kind=DOUBLE), dimension(:), allocatable :: wts
+
+    u_avg = 0.0_DOUBLE
+    n_v = mesh%elem(i)%n_vert
+    if (n_v == 4 .or. n_v == 5 .or. n_v == 6 .or. n_v == 8) then
+      allocate(vcoords(3, n_v))
+      do k = 1, n_v
+        vcoords(:, k) = mesh%vert(mesh%elem(i)%vert(k))%coord
+      end do
+      call volume_quad_pts(n_v, vcoords, 3_ENTIER, pts, wts)
+      deallocate(vcoords)
+      vol_q = 0.0_DOUBLE
+      do q = 1, size(wts)
+        call sol_taylor_green(pts(:, q), w)
+        e_tot = w(5)/(w(1)*(gamma - 1.0_DOUBLE)) + 0.5_DOUBLE*norm2(w(2:4))**2
+        u_avg(2:4) = u_avg(2:4) + wts(q)*w(2:4)
+        u_avg(5)   = u_avg(5)   + wts(q)*e_tot
+        vol_q = vol_q + wts(q)
+      end do
+      deallocate(pts, wts)
+      if (vol_q > 0.0_DOUBLE) then
+        u_avg(2:5) = u_avg(2:5)/vol_q
+      end if
+    else
+      call sol_taylor_green(mesh%elem(i)%coord, w)
+      u_avg(2:4) = w(2:4)
+      u_avg(5)   = w(5)/(w(1)*(gamma - 1.0_DOUBLE)) + 0.5_DOUBLE*norm2(w(2:4))**2
+    end if
+    u_avg(1) = 1.0_DOUBLE/tg_rho0     ! rho is uniform, so tau is exact
+  end subroutine taylor_green_cell_average
+
+  ! Adds the Taylor-Green energy source to the RHS. rhs(5,:) is dE/dt PER UNIT
+  ! MASS (new_sol = sol + dt*rhs with sol(5) the specific total energy), while the
+  ! source is per unit volume, hence the integral over the cell divided by its mass.
+  subroutine add_taylor_green_source(mesh, mass, rhs)
+    use quadrature_module, only: volume_quad_pts
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: mass
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(inout) :: rhs
+
+    integer(kind=ENTIER) :: i, k, q, n_v
+    real(kind=DOUBLE) :: src_int
+    real(kind=DOUBLE), dimension(:, :), allocatable :: vcoords, pts
+    real(kind=DOUBLE), dimension(:), allocatable :: wts
+
+    do i = 1, mesh%n_elems
+      if (mesh%elem(i)%is_ghost) cycle
+      if (mass(i) <= 0.0_DOUBLE) cycle
+      n_v = mesh%elem(i)%n_vert
+      src_int = 0.0_DOUBLE
+      if (n_v == 4 .or. n_v == 5 .or. n_v == 6 .or. n_v == 8) then
+        allocate(vcoords(3, n_v))
+        do k = 1, n_v
+          vcoords(:, k) = mesh%vert(mesh%elem(i)%vert(k))%coord
+        end do
+        call volume_quad_pts(n_v, vcoords, 3_ENTIER, pts, wts)
+        deallocate(vcoords)
+        do q = 1, size(wts)
+          src_int = src_int + wts(q)*taylor_green_source(pts(:, q))
+        end do
+        deallocate(pts, wts)
+      else
+        src_int = mesh%elem(i)%volume*taylor_green_source(mesh%elem(i)%coord)
+      end if
+      rhs(5, i) = rhs(5, i) + src_int/mass(i)
+    end do
+  end subroutine add_taylor_green_source
+
+  ! Error on the PRESSURE, as Vilar does. The exact reference is the pressure
+  ! re-quadratured on the DEFORMED cell at the final time: the Eulerian field is
+  ! steady, so the exact solution is the initial one evaluated at the cell's
+  ! current position.
+  subroutine compute_error_taylor_green(mesh, sol, gamma_arr, h_extrude, h, l1err, l2err, linferr)
+    use quadrature_module, only: volume_quad_pts
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
+    real(kind=DOUBLE), intent(in) :: h_extrude
+    real(kind=DOUBLE), intent(out) :: h, l1err, l2err, linferr
+
+    integer(kind=ENTIER) :: i, k, q, n_v, n_inner, mpi_ierr
+    real(kind=DOUBLE) :: err1, err2, errinf, area_tot, area_i, p_num, p_ex, vol_q
+    real(kind=DOUBLE), dimension(5) :: wq
+    real(kind=DOUBLE), dimension(:, :), allocatable :: vcoords, pts
+    real(kind=DOUBLE), dimension(:), allocatable :: wts
+    real(kind=DOUBLE), dimension(4) :: buf
+
+    err1 = 0.0_DOUBLE; err2 = 0.0_DOUBLE; errinf = 0.0_DOUBLE
+    area_tot = 0.0_DOUBLE; n_inner = 0
+
+    do i = 1, mesh%n_elems
+      if (mesh%elem(i)%is_ghost) cycle
+
+      n_v = mesh%elem(i)%n_vert
+      p_ex = 0.0_DOUBLE
+      if (n_v == 4 .or. n_v == 5 .or. n_v == 6 .or. n_v == 8) then
+        allocate(vcoords(3, n_v))
+        do k = 1, n_v
+          vcoords(:, k) = mesh%vert(mesh%elem(i)%vert(k))%coord
+        end do
+        call volume_quad_pts(n_v, vcoords, 3_ENTIER, pts, wts)
+        deallocate(vcoords)
+        vol_q = 0.0_DOUBLE
+        do q = 1, size(wts)
+          call sol_taylor_green(pts(:, q), wq)
+          p_ex  = p_ex + wts(q)*wq(5)
+          vol_q = vol_q + wts(q)
+        end do
+        deallocate(pts, wts)
+        if (vol_q > 0.0_DOUBLE) then
+          p_ex = p_ex/vol_q
+        else
+          call sol_taylor_green(mesh%elem(i)%coord, wq)
+          p_ex = wq(5)
+        end if
+      else
+        call sol_taylor_green(mesh%elem(i)%coord, wq)
+        p_ex = wq(5)
+      end if
+
+      p_num  = pressure(sol(:, i), gamma_arr(i))
+      area_i = cell_area_2d(mesh, i, h_extrude)
+
+      err1     = err1 + area_i*abs(p_num - p_ex)
+      err2     = err2 + area_i*(p_num - p_ex)**2
+      errinf   = max(errinf, abs(p_num - p_ex))
+      area_tot = area_tot + area_i
+      n_inner  = n_inner + 1
+    end do
+
+    buf = (/err1, err2, area_tot, real(n_inner, DOUBLE)/)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, buf, 4, MPI_DOUBLE_PRECISION, MPI_SUM, &
+      MPI_COMM_WORLD, mpi_ierr)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, errinf, 1, MPI_DOUBLE_PRECISION, MPI_MAX, &
+      MPI_COMM_WORLD, mpi_ierr)
+    err1 = buf(1); err2 = buf(2); area_tot = buf(3)
+
+    ! A diverged run makes area_tot NaN, and "NaN > 0" is false, so the plain
+    ! else branch below would report h=0, L1=0, L2=0 -- a blow-up disguised as a
+    ! zero error. Flag it explicitly instead.
+    if (.not. (area_tot == area_tot)) then
+      h = -1.0_DOUBLE; l1err = -1.0_DOUBLE; l2err = -1.0_DOUBLE; linferr = -1.0_DOUBLE
+      return
+    end if
+    if (buf(4) > 0.0_DOUBLE .and. area_tot > 0.0_DOUBLE) then
+      h     = sqrt(area_tot/buf(4))
+      l1err = err1/area_tot
+      l2err = sqrt(err2/area_tot)
+    else
+      h = 0.0_DOUBLE; l1err = 0.0_DOUBLE; l2err = 0.0_DOUBLE
+    end if
+    linferr = errinf
+  end subroutine compute_error_taylor_green
+
 end module lagrange_module

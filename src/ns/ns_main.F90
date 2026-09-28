@@ -62,7 +62,7 @@ program main
   allocate(mat_h_p(3, 3, mesh%n_vert))     ; mat_h_p   = 0.0_DOUBLE
   do i = 1, mesh%n_vert
     h_p(i) = compute_length(mesh, i)
-    mat_h_p(:, :, i) = compute_ellip(mesh, i)
+    ! compute_ellip call removed 2026-09-15 (dead code, see ns_euler_zb_module.F90); mat_h_p stays 0
   end do
 
   call init_residual_file(me, fn_residual)

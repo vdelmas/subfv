@@ -82,71 +82,7 @@ contains
     vp(:, id_vert) = vp(:, id_vert) - 0.5_DOUBLE*h_p(id_vert)/(rho_p*a_p)*grad_p
   end subroutine compute_nodal_velocity_LS
 
-  subroutine compute_nodal_velocity_LSM(mesh, id_vert, sol, grad, vp, mat_h_p, second_order)
-    use ns_global_data_module, only : boundary_2d, scheme
-    implicit none
-
-    type(mesh_type), intent(in) :: mesh
-    integer(kind=ENTIER), intent(in) :: id_vert
-    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
-    real(kind=DOUBLE), dimension(:, :, :), intent(in) :: grad
-    real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(inout) :: vp
-    real(kind=DOUBLE), dimension(3, 3, mesh%n_vert), intent(in) :: mat_h_p
-    logical, intent(in) :: second_order
-
-    integer(kind=ENTIER) :: j, le, re
-    integer(kind=ENTIER) :: id_sub_elem, id_elem
-    integer(kind=ENTIER) :: id_sub_face, id_face
-    real(kind=DOUBLE) :: rho_p, a_p
-    real(kind=DOUBLE), dimension(3) :: grad_p, Bp
-    real(kind=DOUBLE), dimension(5) :: sol_w, sol_l, sol_r
-    real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r
-
-    vp(:, id_vert) = 0.0_DOUBLE
-    rho_p = 0.0_DOUBLE
-    a_p = 0.0_DOUBLE
-    do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
-      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
-      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
-      sol_w = conserv_to_primit(sol(:, id_elem))
-      if( second_order ) sol_w = sol_w + matmul(transpose(grad(:, :, id_elem)), &
-        mesh%vert(id_vert)%coord - mesh%elem(id_elem)%coord)
-      vp(:, id_vert) = vp(:, id_vert) &
-        + mesh%sub_elem(id_sub_elem)%volume * sol_w(2:4)
-      rho_p = rho_p &
-        + mesh%sub_elem(id_sub_elem)%volume * sol_w(1)
-      a_p = a_p &
-        + mesh%sub_elem(id_sub_elem)%volume &
-        * sound_speed_w(sol_w)
-    end do
-    rho_p = rho_p / mesh%vert(id_vert)%volume
-    a_p = a_p / mesh%vert(id_vert)%volume
-    vp(:, id_vert) = vp(:, id_vert) / mesh%vert(id_vert)%volume
-
-    grad_p = 0.0_DOUBLE
-    do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
-      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      le = mesh%sub_face(id_sub_face)%left_elem_neigh
-      re = mesh%sub_face(id_sub_face)%right_elem_neigh
-      call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
-        second_order, sol_w_l, sol_w_r)
-      grad_p = grad_p + (sol_w_r(5) - sol_w_l(5)) &
-        * mesh%sub_face(id_sub_face)%area&
-        * matmul(mat_h_p(:, :, id_vert), mesh%sub_face(id_sub_face)%norm)
-    end do
-    grad_p = grad_p / mesh%vert(id_vert)%volume
-
-    if( mesh%vert(id_vert)%is_bound ) then
-      Bp = wall_normal(mesh, id_vert)
-      if( norm2(Bp) > 1e-12_DOUBLE ) then
-        Bp = Bp/norm2(Bp)
-        grad_p = grad_p - dot_product(grad_p, Bp)*Bp
-        vp(:, id_vert) = vp(:, id_vert) - dot_product(vp(:, id_vert), Bp)*Bp
-      end if
-    end if
-
-    vp(:, id_vert) = vp(:, id_vert) - 0.5_DOUBLE/(rho_p*a_p)*grad_p
-  end subroutine compute_nodal_velocity_LSM
+  ! removed 2026-09-15: compute_nodal_velocity_LSM (dead code, unreachable via schemes.txt, depended on compute_ellip)
 
   subroutine compute_nodal_velocity_LSU(mesh, id_vert, sol, grad, vp, second_order)
     use ns_global_data_module, only : boundary_2d, scheme
@@ -320,61 +256,7 @@ contains
     pp = pp - 0.5_DOUBLE*rho_p*a_p*div_v
   end subroutine compute_nodal_pressure_LSU
 
-  subroutine compute_nodal_pressure_LSM(mesh, id_vert, sol, grad, pp, mat_h_p, second_order)
-    use ns_global_data_module, only : scheme
-    implicit none
-
-    type(mesh_type), intent(in) :: mesh
-    integer(kind=ENTIER), intent(in) :: id_vert
-    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
-    real(kind=DOUBLE), dimension(3, 3, mesh%n_vert), intent(in) :: mat_h_p
-    real(kind=DOUBLE), dimension(:, :, :), intent(in) :: grad
-    real(kind=DOUBLE), intent(inout) :: pp
-    logical, intent(in) :: second_order
-
-    integer(kind=ENTIER) :: j, id_elem, id_sub_elem, le, re
-    integer(kind=ENTIER) :: id_face, id_sub_face
-    real(kind=DOUBLE), dimension(5) :: sol_w
-    real(kind=DOUBLE) :: rho_p, a_p, div_v
-    real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, sol_l, sol_r
-
-    pp = 0.0_DOUBLE
-    rho_p = 0.0_DOUBLE
-    a_p = 0.0_DOUBLE
-    do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
-      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
-      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
-      sol_w = conserv_to_primit(sol(:, id_elem))
-      if( second_order ) sol_w = sol_w + matmul(transpose(grad(:, :, id_elem)), &
-        mesh%vert(id_vert)%coord - mesh%elem(id_elem)%coord)
-      pp = pp &
-        + mesh%sub_elem(id_sub_elem)%volume * sol_w(5)
-      rho_p = rho_p &
-        + mesh%sub_elem(id_sub_elem)%volume * sol_w(1)
-      a_p = a_p &
-        + mesh%sub_elem(id_sub_elem)%volume &
-        * sound_speed_w(sol_w)
-    end do
-    pp = pp / mesh%vert(id_vert)%volume
-    rho_p = rho_p / mesh%vert(id_vert)%volume
-    a_p = a_p / mesh%vert(id_vert)%volume
-
-    div_v = 0.0_DOUBLE
-    do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
-      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      le = mesh%sub_face(id_sub_face)%left_elem_neigh
-      re = mesh%sub_face(id_sub_face)%right_elem_neigh
-      call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
-        second_order, sol_w_l, sol_w_r)
-      div_v = div_v &
-        + dot_product(sol_w_r(2:4) - sol_w_l(2:4), &
-        mesh%sub_face(id_sub_face)%area&
-        * matmul(mat_h_p(:, :, id_vert), mesh%sub_face(id_sub_face)%norm))
-    end do
-    div_v = div_v / mesh%vert(id_vert)%volume
-
-    pp = pp - 0.5_DOUBLE*rho_p*a_p*div_v
-  end subroutine compute_nodal_pressure_LSM
+  ! removed 2026-09-15: compute_nodal_pressure_LSM (dead code, unreachable via schemes.txt, depended on compute_ellip)
 
   subroutine compute_rhs_around_vert_ARMDMAT(mesh, sol, grad, &
       nsen, sum_lambda_vert, flux_sum_vert, &
@@ -486,10 +368,12 @@ contains
           + mesh%sub_face(id_sub_face)%area*lambda
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
             + mesh%sub_face(id_sub_face)%area*lambda
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
         end if
       end if
     end do
@@ -602,133 +486,18 @@ contains
           + mesh%sub_face(id_sub_face)%area*lambda
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
             + mesh%sub_face(id_sub_face)%area*lambda
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
         end if
       end if
     end do
   end subroutine compute_rhs_around_vert_ARMDUMAT
 
-  subroutine compute_rhs_around_vert_ARMDMMAT(mesh, sol, grad, &
-      nsen, sum_lambda_vert, flux_sum_vert, &
-      second_order, id_vert, vp, mat_h_p)
-    use ns_global_data_module, only: bc_style, scheme, &
-      exclude_bound_vert, boundary_2d
-    use linear_solver_module
-    use mpi
-    implicit none
-
-    type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
-    real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(inout) :: vp
-    real(kind=DOUBLE), dimension(3, 3, mesh%n_vert), intent(in) :: mat_h_p
-    real(kind=DOUBLE), dimension(:, :, :), intent(in) :: grad
-    integer(kind=ENTIER), intent(in) :: nsen
-    real(kind=DOUBLE), dimension(nsen), intent(inout) :: &
-      sum_lambda_vert
-    real(kind=DOUBLE), dimension(5, nsen), intent(inout) :: &
-      flux_sum_vert
-    logical, intent(in) :: second_order
-    integer(kind=ENTIER), intent(in) :: id_vert
-
-    integer(kind=ENTIER) :: j, id_sub_face, id_face
-    integer(kind=ENTIER) :: id_elem, id_sub_elem
-    integer(kind=ENTIER) :: le, re, lse, rse, lse_loc, rse_loc
-    real(kind=DOUBLE), dimension(3) :: norm
-
-    real(kind=DOUBLE) :: vnl, vnr, al, ar, lambda, wpcf
-    real(kind=DOUBLE), dimension(5) :: sol_p, sol_l, sol_r, ff
-    real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, fminus, fplus
-    real(kind=DOUBLE), dimension(5,3) :: fp, grad_sol
-    real(kind=DOUBLE), dimension(3, 3) :: SMAX
-
-    rse_loc = 0
-    sol_p = 0.0_DOUBLE
-    do j = 1, mesh%vert(id_vert)%n_sub_elems_neigh
-      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
-      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
-      sol_p = sol_p + mesh%sub_elem(id_sub_elem)%volume * sol(:, id_elem)
-    end do
-    sol_p = sol_p / mesh%vert(id_vert)%volume
-
-    grad_sol = 0.0_DOUBLE
-    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
-      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      le = mesh%sub_face(id_sub_face)%left_elem_neigh
-      re = mesh%sub_face(id_sub_face)%right_elem_neigh
-      lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
-      lse_loc = mesh%sub_elem(lse)%id_loc_around_node
-      rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
-      if( rse > 0 ) then
-        rse_loc = mesh%sub_elem(rse)%id_loc_around_node
-      end if
-      norm = mesh%sub_face(id_sub_face)%norm
-      call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
-        second_order, sol_w_l, sol_w_r)
-      grad_sol = grad_sol + tensor_product(primit_to_conserv(sol_w_r) - primit_to_conserv(sol_w_l), &
-        mesh%sub_face(id_sub_face)%area&
-        *matmul(mat_h_p(:, :, id_vert), mesh%sub_face(id_sub_face)%norm))
-    end do
-    grad_sol = grad_sol / mesh%vert(id_vert)%volume
-
-    call compute_nodal_velocity_LSM(mesh, id_vert, sol, grad, vp, mat_h_p, second_order)
-
-    SMAX = 0.0_DOUBLE
-    SMAX(1, 1) = abs(vp(1, id_vert))
-    SMAX(2, 2) = abs(vp(2, id_vert))
-    SMAX(3, 3) = abs(vp(3, id_vert))
-    fp = tensor_product(sol_p, vp(:, id_vert)) &
-      - 0.5_DOUBLE*matmul(grad_sol, SMAX)
-
-    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
-      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      le = mesh%sub_face(id_sub_face)%left_elem_neigh
-      re = mesh%sub_face(id_sub_face)%right_elem_neigh
-      lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
-      lse_loc = mesh%sub_elem(lse)%id_loc_around_node
-      rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
-      if( rse > 0 ) then
-        rse_loc = mesh%sub_elem(rse)%id_loc_around_node
-      end if
-      norm = mesh%sub_face(id_sub_face)%norm
-
-      call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
-        second_order, sol_w_l, sol_w_r)
-
-      vnl = dot_product(sol_w_l(2:4), norm)
-      vnr = dot_product(sol_w_r(2:4), norm)
-
-      al = sound_speed_w(sol_w_l)
-      ar = sound_speed_w(sol_w_r)
-
-      sol_r = primit_to_conserv(sol_w_r)
-      sol_l = primit_to_conserv(sol_w_l)
-
-      ff = 0.5_DOUBLE*(vnr*sol_r + vnl*sol_l) &
-        - 0.5_DOUBLE*(sol_r - sol_l)*max(abs(vnr), abs(vnl))
-
-      wpcf = 0.5_DOUBLE
-      fminus = wpcf*matmul(fp, norm) + (1.0_DOUBLE-wpcf)*ff
-      fplus = fminus
-
-      !Used for local timestepping
-      lambda = max(1e-8_DOUBLE, -vnl, vnr)+max(al,ar)
-
-      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
-        sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
-          + mesh%sub_face(id_sub_face)%area*lambda
-        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
-
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
-          sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
-            + mesh%sub_face(id_sub_face)%area*lambda
-          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
-        end if
-      end if
-    end do
-  end subroutine compute_rhs_around_vert_ARMDMMAT
+  ! removed 2026-09-15: compute_rhs_around_vert_ARMDMMAT (dead code, unreachable via schemes.txt, depended on compute_ellip)
 
   subroutine compute_rhs_around_vert_ARMD(mesh, sol, grad, &
       nsen, sum_lambda_vert, flux_sum_vert, &
@@ -834,10 +603,12 @@ contains
           + mesh%sub_face(id_sub_face)%area*lambda
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
             + mesh%sub_face(id_sub_face)%area*lambda
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
         end if
       end if
     end do
@@ -944,128 +715,18 @@ contains
           + mesh%sub_face(id_sub_face)%area*lambda
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
             + mesh%sub_face(id_sub_face)%area*lambda
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
         end if
       end if
     end do
   end subroutine compute_rhs_around_vert_ARMDU
 
-  subroutine compute_rhs_around_vert_ARMDM(mesh, sol, grad, &
-      nsen, sum_lambda_vert, flux_sum_vert, &
-      second_order, id_vert, vp, mat_h_p)
-    use ns_global_data_module, only: bc_style, scheme, &
-      exclude_bound_vert, boundary_2d
-    use linear_solver_module
-    use mpi
-    implicit none
-
-    type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
-    real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(inout) :: vp
-    real(kind=DOUBLE), dimension(3, 3, mesh%n_vert), intent(in) :: mat_h_p
-    real(kind=DOUBLE), dimension(:, :, :), intent(in) :: grad
-    integer(kind=ENTIER), intent(in) :: nsen
-    real(kind=DOUBLE), dimension(nsen), intent(inout) :: &
-      sum_lambda_vert
-    real(kind=DOUBLE), dimension(5, nsen), intent(inout) :: &
-      flux_sum_vert
-    logical, intent(in) :: second_order
-    integer(kind=ENTIER), intent(in) :: id_vert
-
-    integer(kind=ENTIER) :: j, id_sub_face, id_face
-    integer(kind=ENTIER) :: id_elem, id_sub_elem
-    integer(kind=ENTIER) :: le, re, lse, rse, lse_loc, rse_loc
-    real(kind=DOUBLE), dimension(3) :: norm
-
-    real(kind=DOUBLE) :: vnl, vnr, al, ar, lambda, wpcf
-    real(kind=DOUBLE), dimension(5) :: sol_p, sol_l, sol_r, ff
-    real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, fminus, fplus
-    real(kind=DOUBLE), dimension(5,3) :: fp, grad_sol
-
-    rse_loc = 0
-    sol_p = 0.0_DOUBLE
-    do j = 1, mesh%vert(id_vert)%n_sub_elems_neigh
-      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
-      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
-      sol_p = sol_p + mesh%sub_elem(id_sub_elem)%volume * sol(:, id_elem)
-    end do
-    sol_p = sol_p / mesh%vert(id_vert)%volume
-
-    grad_sol = 0.0_DOUBLE
-    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
-      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      le = mesh%sub_face(id_sub_face)%left_elem_neigh
-      re = mesh%sub_face(id_sub_face)%right_elem_neigh
-      lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
-      lse_loc = mesh%sub_elem(lse)%id_loc_around_node
-      rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
-      if( rse > 0 ) then
-        rse_loc = mesh%sub_elem(rse)%id_loc_around_node
-      end if
-      norm = mesh%sub_face(id_sub_face)%norm
-      call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
-        second_order, sol_w_l, sol_w_r)
-      grad_sol = grad_sol + tensor_product(primit_to_conserv(sol_w_r) - primit_to_conserv(sol_w_l), &
-        mesh%sub_face(id_sub_face)%area&
-        *matmul(mat_h_p(:, :, id_vert), mesh%sub_face(id_sub_face)%norm))
-    end do
-    grad_sol = grad_sol / mesh%vert(id_vert)%volume
-
-    call compute_nodal_velocity_LSM(mesh, id_vert, sol, grad, vp, mat_h_p, second_order)
-
-    fp = tensor_product(sol_p, vp(:, id_vert)) &
-      - 0.5_DOUBLE*norm2(vp(:, id_vert))*grad_sol
-
-    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
-      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      le = mesh%sub_face(id_sub_face)%left_elem_neigh
-      re = mesh%sub_face(id_sub_face)%right_elem_neigh
-      lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
-      lse_loc = mesh%sub_elem(lse)%id_loc_around_node
-      rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
-      if( rse > 0 ) then
-        rse_loc = mesh%sub_elem(rse)%id_loc_around_node
-      end if
-      norm = mesh%sub_face(id_sub_face)%norm
-
-      call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
-        second_order, sol_w_l, sol_w_r)
-
-      vnl = dot_product(sol_w_l(2:4), norm)
-      vnr = dot_product(sol_w_r(2:4), norm)
-
-      al = sound_speed_w(sol_w_l)
-      ar = sound_speed_w(sol_w_r)
-
-      sol_r = primit_to_conserv(sol_w_r)
-      sol_l = primit_to_conserv(sol_w_l)
-
-      ff = 0.5_DOUBLE*(vnr*sol_r + vnl*sol_l) &
-        - 0.5_DOUBLE*(sol_r - sol_l)*max(abs(vnr), abs(vnl))
-
-      wpcf = 0.5_DOUBLE
-      fminus = wpcf*matmul(fp, norm) + (1.0_DOUBLE-wpcf)*ff
-      fplus = fminus
-
-      !Used for local timestepping
-      lambda = max(1e-8_DOUBLE, -vnl, vnr)+max(al,ar)
-
-      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
-        sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
-          + mesh%sub_face(id_sub_face)%area*lambda
-        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
-
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
-          sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
-            + mesh%sub_face(id_sub_face)%area*lambda
-          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
-        end if
-      end if
-    end do
-  end subroutine compute_rhs_around_vert_ARMDM
+  ! removed 2026-09-15: compute_rhs_around_vert_ARMDM (dead code, unreachable via schemes.txt, depended on compute_ellip)
 
   subroutine compute_rhs_around_vert_AR1D(mesh, sol, grad, &
       nsen, sum_lambda_vert, flux_sum_vert, &
@@ -1138,10 +799,12 @@ contains
           + mesh%sub_face(id_sub_face)%area*lambda
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
             + mesh%sub_face(id_sub_face)%area*lambda
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
         end if
       end if
     end do
@@ -1206,8 +869,10 @@ contains
       if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
         end if
       end if
     end do
@@ -1273,79 +938,16 @@ contains
       if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
         end if
       end if
     end do
   end subroutine compute_rhs_around_vert_LS
 
-  subroutine compute_rhs_around_vert_LSM(mesh, sol, grad, &
-      nsen, flux_sum_vert, &
-      id_vert, vp, mat_h_p, second_order)
-    use ns_global_data_module, only: bc_style, scheme, &
-      exclude_bound_vert, boundary_2d
-    use linear_solver_module
-    use mpi
-    implicit none
-
-    type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
-    real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(inout) :: vp
-    real(kind=DOUBLE), dimension(3, 3, mesh%n_vert), intent(in) :: mat_h_p
-    real(kind=DOUBLE), dimension(:, :, :), intent(in) :: grad
-    integer(kind=ENTIER), intent(in) :: nsen
-    real(kind=DOUBLE), dimension(5, nsen), intent(inout) :: &
-      flux_sum_vert
-    integer(kind=ENTIER), intent(in) :: id_vert
-    logical, intent(in) :: second_order
-
-    integer(kind=ENTIER) :: j, id_sub_face, id_face
-    integer(kind=ENTIER) :: le, re, lse, rse, lse_loc, rse_loc
-    real(kind=DOUBLE), dimension(3) :: norm
-
-    real(kind=DOUBLE) :: pp
-    real(kind=DOUBLE), dimension(5) :: fminus, fplus
-    real(kind=DOUBLE), dimension(5,3) :: fp
-
-    rse_loc = 0
-    call compute_nodal_velocity_LSM(mesh, id_vert, sol, grad, vp, mat_h_p, second_order)
-    call compute_nodal_pressure_LSM(mesh, id_vert, sol, grad, pp, mat_h_p, second_order)
-
-    fp(1, :) = 0.0_DOUBLE
-    fp(2:4, :) = pp*eye3
-    fp(5, :) = pp*vp(:, id_vert)
-
-    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
-      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      le = mesh%sub_face(id_sub_face)%left_elem_neigh
-      re = mesh%sub_face(id_sub_face)%right_elem_neigh
-      lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
-      lse_loc = mesh%sub_elem(lse)%id_loc_around_node
-      rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
-      if( rse > 0 ) then
-        rse_loc = mesh%sub_elem(rse)%id_loc_around_node
-      end if
-      norm = mesh%sub_face(id_sub_face)%norm
-
-      fminus = matmul(fp, norm)
-      fplus = fminus
-
-      if( boundary_2d &
-        .and. abs(mesh%sub_face(id_sub_face)%norm(3)) > 1e-3 ) then
-        fminus = 0.0_DOUBLE
-        fplus = 0.0_DOUBLE
-      end if
-
-      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
-        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
-
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
-          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
-        end if
-      end if
-    end do
-  end subroutine compute_rhs_around_vert_LSM
+  ! removed 2026-09-15: compute_rhs_around_vert_LSM (dead code, unreachable via schemes.txt, depended on compute_ellip)
 
   subroutine compute_rhs_around_vert_AM(mesh, sol, grad, &
       nsen, u_vert, sum_lambda_vert, flux_sum_vert, &
@@ -1476,10 +1078,12 @@ contains
           + mesh%sub_face(id_sub_face)%area*lambda
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
             + mesh%sub_face(id_sub_face)%area*lambda
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
         end if
       end if
     end do
@@ -1647,10 +1251,12 @@ contains
           + mesh%sub_face(id_sub_face)%area*lambda
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
             + mesh%sub_face(id_sub_face)%area*lambda
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
         end if
       end if
     end do
@@ -1792,119 +1398,7 @@ contains
     !h_p = matmul(Q, matmul(diag(Lambda), transpose(Q)))
   end function compute_length_diag
 
-  function compute_ellip(mesh, id_vert) result(mat_h_p)
-    use ns_global_data_module, only: boundary_2d, error_2d_h
-    use linear_solver_module
-    implicit none
-
-    type(mesh_type), intent(in) :: mesh
-    integer(kind=ENTIER), intent(in) :: id_vert
-    real(kind=DOUBLE), dimension(3, 3) :: mat_h_p
-
-    integer(kind=ENTIER) :: iter, maxiter
-    integer(kind=ENTIER) :: nc
-    integer(kind=ENTIER) :: j, id_sub_face, id_face
-    integer(kind=ENTIER) :: id_elem, id_sub_elem
-    integer(kind=ENTIER) :: idvp, idvm, k, idv, kp, km
-    real(kind=DOUBLE), dimension(3) :: ce1, ce2, cp, Ltx, cf, ce
-    real(kind=DOUBLE), dimension(6) :: L, delta_L
-    real(kind=DOUBLE), dimension(6, 6) :: LLt
-    real(kind=DOUBLE), dimension(3, 3) :: Q
-    real(kind=DOUBLE), dimension(3) :: Lambda
-    real(kind=DOUBLE), dimension(:), allocatable :: fL
-    real(kind=DOUBLE), dimension(:, :), allocatable :: xc
-    real(kind=DOUBLE), dimension(:, :), allocatable :: JL
-
-    cp = mesh%vert(id_vert)%coord
-
-    nc = 3*mesh%vert(id_vert)%n_sub_faces_neigh + mesh%vert(id_vert)%n_sub_elems_neigh
-    !nc = 3*mesh%vert(id_vert)%n_sub_faces_neigh
-    allocate(xc(3, nc))
-    allocate(JL(nc, 6))
-    allocate(fL(nc))
-
-    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
-      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
-      id_face = mesh%sub_face(id_sub_face)%mesh_face
-      idvp = 0
-      idvm = 0
-      do k = 1, mesh%face(id_face)%n_vert
-        idv = mesh%face(id_face)%vert(k)
-        if (idv == id_vert) then
-          kp = 1 + mod((k+1)-1, mesh%face(id_face)%n_vert)
-          km = 1 + mod((k-1)-1 + mesh%face(id_face)%n_vert, mesh%face(id_face)%n_vert)
-          idvm = mesh%face(id_face)%vert(km)
-          idvp = mesh%face(id_face)%vert(kp)
-          exit
-        end if
-      end do
-      ce1 = 0.5_DOUBLE*(mesh%vert(idvp)%coord + cp)
-      ce2 = 0.5_DOUBLE*(mesh%vert(idvm)%coord + cp)
-      cf = mesh%face(id_face)%coord
-      xc(:, 3*(j-1) + 1) = 2*(ce1 - cp)
-      xc(:, 3*(j-1) + 2) = 2*(ce2 - cp)
-      xc(:, 3*(j-1) + 3) = 2*(cf - cp)
-    end do
-
-    do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
-      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
-      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
-      ce = mesh%elem(id_elem)%coord
-      xc(:, 3*mesh%vert(id_vert)%n_sub_faces_neigh + j) = 2*(ce - cp)
-    end do
-
-    L = 0.0_DOUBLE
-    if( boundary_2d ) then
-      L(1) = (mesh%vert(id_vert)%volume/error_2d_h)**(-1.0_DOUBLE/2.0_DOUBLE)
-      L(4) = (mesh%vert(id_vert)%volume/error_2d_h)**(-1.0_DOUBLE/2.0_DOUBLE)
-      L(6) = 1.0_DOUBLE/error_2d_h
-    else
-      L(1) = mesh%vert(id_vert)%volume**(-1.0_DOUBLE/3.0_DOUBLE)
-      L(4) = mesh%vert(id_vert)%volume**(-1.0_DOUBLE/3.0_DOUBLE)
-      L(6) = mesh%vert(id_vert)%volume**(-1.0_DOUBLE/3.0_DOUBLE)
-    end if
-
-    maxiter = 100
-    iter = 0
-    delta_L = 1.0_DOUBLE
-    do while (maxval(abs(delta_L)) > 1e-4_DOUBLE .and. iter <= maxiter)
-      iter = iter + 1
-      do j = 1, nc
-        Ltx(1) = L(1)*xc(1, j) + L(2)*xc(2, j) + L(3)*xc(3, j)
-        Ltx(2) =                  L(4)*xc(2, j) + L(5)*xc(3, j)
-        Ltx(3) =                                   L(6)*xc(3, j)
-        JL(j, 1) = 2*xc(1, j)*Ltx(1)
-        JL(j, 2) = 2*xc(2, j)*Ltx(1)
-        JL(j, 3) = 2*xc(3, j)*Ltx(1)
-        JL(j, 4) = 2*xc(2, j)*Ltx(2)
-        JL(j, 5) = 2*xc(3, j)*Ltx(2)
-        JL(j, 6) = 2*xc(3, j)*Ltx(3)
-        fL(j) = dot_product(Ltx, Ltx) - 1.0_DOUBLE
-      end do
-      LLt = matmul(transpose(JL), JL)
-      call pseudo_inverse_inplace_lapack(6, LLt)
-      delta_L = -matmul(LLt, matmul(transpose(JL), fL))
-      L = L + delta_L
-    end do
-
-    if( iter >= maxiter ) then
-      print*, id_vert, "DID NOT CONVERGE ELLIP", maxval(abs(delta_L))
-    end if
-
-    mat_h_p = 0.0_DOUBLE
-    mat_h_p(1, 1) = L(1)
-    mat_h_p(1, 2) = L(2)
-    mat_h_p(1, 3) = L(3)
-    mat_h_p(2, 2) = L(4)
-    mat_h_p(2, 3) = L(5)
-    mat_h_p(3, 3) = L(6)
-
-    mat_h_p = matmul(transpose(mat_h_p), mat_h_p)
-
-    call spectral_decomposition(mat_h_p, Q, Lambda)
-    Lambda = 1.0_DOUBLE / sqrt(Lambda)
-    mat_h_p = matmul(Q, matmul(diag(Lambda), transpose(Q)))
-  end function compute_ellip
+  ! removed 2026-09-15: compute_ellip (dead code, unreachable via schemes.txt, depended on compute_ellip)
 
   function corner_normal(mesh, id_sub_elem) result(norm)
     use ns_global_data_module, only: boundary_2d
@@ -2173,10 +1667,12 @@ contains
           + mesh%sub_face(id_sub_face)%area*lambda
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
             + mesh%sub_face(id_sub_face)%area*lambda
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
         end if
       end if
     end do
@@ -2278,8 +1774,10 @@ contains
       if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
         end if
       end if
     end do
@@ -2386,8 +1884,10 @@ contains
       if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
         end if
       end if
     end do
@@ -2883,8 +2383,10 @@ contains
       if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
         end if
       end if
     end do
@@ -2975,9 +2477,11 @@ contains
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) &
           + mesh%sub_face(id_sub_face)%area*fminus
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) &
             - mesh%sub_face(id_sub_face)%area*fplus
+        end if
         end if
       end if
     end do
@@ -3161,8 +2665,10 @@ contains
       if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+        end if
         end if
       end if
     end do
@@ -3393,14 +2899,383 @@ contains
           + mesh%sub_face(id_sub_face)%area*lambda_lts
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
             + mesh%sub_face(id_sub_face)%area*lambda_lts
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
         end if
+        end if
       end if
     end do
   end subroutine compute_rhs_around_vert_WIP
+
+  ! WIP2: nodal pressure built from the per-sub-face acoustic solver (as in LPF,
+  ! which measured ~450x lower low-Mach floor than the one-sided LPP form because
+  ! its energy-flux velocity is symmetric, hence conservative), with the velocity
+  ! jump scaled by theta = min(1, Ma_node).
+  !
+  ! The jump term -theta*(vnr-vnl) is the "divv" contribution: it is what couples
+  ! the multi-D velocity field into the nodal pressure (and what keeps the Gresho
+  ! vortex alive on quads), but unscaled it is O(Ma) relative to p, one power short
+  ! of the incompressible limit -- the measured consequence is the L2_rho floor.
+  ! Scaling it by Ma restores O(Ma^2) while leaving theta=1 (i.e. the unmodified
+  ! acoustic solver) everywhere the flow is transonic or faster.
+  ! The pressure jump inside vstar is deliberately NOT scaled: it carries the
+  ! pressure/velocity coupling that the low-Mach limit needs.
+  subroutine compute_rhs_around_vert_WIP2(mesh, sol, grad, &
+      nsen, flux_sum_vert, sum_lambda_vert, &
+      id_vert, second_order, low_mach, adv_mode, eps_mode, enth_fix, tp_fix)
+    use ns_global_data_module, only: boundary_2d
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(:, :, :), intent(in) :: grad
+    integer(kind=ENTIER), intent(in) :: nsen
+    real(kind=DOUBLE), dimension(nsen), intent(inout) :: sum_lambda_vert
+    real(kind=DOUBLE), dimension(5, nsen), intent(inout) :: flux_sum_vert
+    integer(kind=ENTIER), intent(in) :: id_vert
+    logical, intent(in) :: second_order
+    logical, intent(in) :: low_mach
+    ! 0 -> WIP's Rusanov-at-vstar advection with the Ducros sensor
+    !      (best low-Mach slope, least accurate on Sedov)
+    ! 1 -> AMISO advection: nodal upwind state blended with a pressure-corrected
+    !      central flux (best on Sedov, slope drops below 1)
+    ! 2 -> shock-sensor blend of the two: AMISO where the Ducros indicator says
+    !      "shock", Rusanov-at-vstar where the flow is smooth/vortical
+    integer(kind=ENTIER), intent(in) :: adv_mode
+    ! Which eps_p carbuncle sensor feeds the advection viscosity. These are the
+    ! four candidates of tex/wip.tex; Vincent's note there is that they give very
+    ! different wall heat fluxes, because the term must fire inside the shock and
+    ! NOT in the boundary layer or at the stagnation point.
+    ! 0 -> compute_corr_ducros       (c) Ducros filter          [4*a_p]
+    ! 1 -> compute_corr_pressure     (d) normalised p jump      [2*a_p]
+    ! 2 -> compute_corr2             (a) -div(v) only           [1*a_p]
+    ! 3 -> compute_corr_pressure_div (b) max(p jump, -div v)    [4*a_p]
+    integer(kind=ENTIER), intent(in) :: eps_mode
+    ! Haenel / MGallice enthalpy preservation (Tallois, papers/talois.pdf, eq 22-23):
+    ! the energy dissipation of the flux must equal the total enthalpy times the
+    ! mass dissipation, else total enthalpy is not preserved across the bow shock.
+    ! Since rho*E = rho*h - p, replacing d(rho*E) by h_bar*d(rho) in the dissipation
+    ! is exactly that condition. Tallois shows the unmodified multidimensional
+    ! (Gallice-2D) solver puts the density maximum off the stagnation point, which
+    ! is what ruins a wall heat flux.
+    logical, intent(in) :: enth_fix
+    ! Tallois PhD section 6.3.3, eq (6.3.3.2): the MULTIDIMENSIONAL low-Mach
+    ! correction. p_l^theta = theta_n*[p_l - lambda_l*(u_n - u_l).n] + (1-theta_n)*q_n
+    ! with theta_n = min(1, |u_n|/a). Here q_n (eq 6.3.3.1) is exactly this code's
+    ! nodal pressure pp, so the low-Mach end (theta_n->0) reproduces WIP2_NOLM
+    ! bit-for-bit, and the shock end (theta_n->1) becomes the one-sided GLACE
+    ! nodal pressure flux built on the nodal velocity. Crucially BOTH ends are
+    ! nodal, so unlike a convex blend with the 1D flux the multidimensional
+    ! character is never lost -- that is the thesis's stated reason for this form.
+    logical, intent(in) :: tp_fix
+
+    integer(kind=ENTIER) :: j, id_sub_face, id_sub_elem, id_elem
+    integer(kind=ENTIER) :: le, re, lse, rse, lse_loc, rse_loc
+    real(kind=DOUBLE), dimension(3) :: norm, v_p
+
+    real(kind=DOUBLE) :: pp, pbar_f, denomsum, weight, invlamb
+    real(kind=DOUBLE) :: lambda_l, lambda_r, lambda_lts
+    real(kind=DOUBLE) :: rhol, rhor, pl, pr, vnl, vnr, al, ar
+    real(kind=DOUBLE) :: a_p, ma_node, theta, corr, vstar
+    real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, sol_w
+    real(kind=DOUBLE), dimension(5) :: sol_l, sol_r, sol_m
+    real(kind=DOUBLE), dimension(5) :: ff_lag, ff_lag_l, ff_lag_r, ff_adv, fminus, fplus
+
+    ! AMISO advection workspace
+    real(kind=DOUBLE) :: min_apf, sum_area_a, lambda_a, wpcf, rhom, am, vm
+    real(kind=DOUBLE), dimension(5) :: sol_p, u_bar, ff_a, fadv_minus, fadv_plus
+    ! shock-sensor blend workspace
+    logical :: need_amiso, need_ducros
+    real(kind=DOUBLE) :: corr_a, w_shock
+    real(kind=DOUBLE) :: h_l, h_r, h_bar
+    real(kind=DOUBLE) :: theta_n, pflux_l, pflux_r, vn_node
+    real(kind=DOUBLE), dimension(3) :: u_node
+    real(kind=DOUBLE), dimension(5) :: djump
+
+    rse_loc = 0
+
+    ! nodal Mach number (volume-weighted), drives the low-Mach scaling
+    a_p = 0.0_DOUBLE
+    v_p = 0.0_DOUBLE
+    do j = 1, mesh%vert(id_vert)%n_sub_elems_neigh
+      id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
+      id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+      sol_w = conserv_to_primit(sol(:, id_elem))
+      a_p = a_p + mesh%sub_elem(id_sub_elem)%volume * sound_speed_w(sol_w)
+      v_p = v_p + mesh%sub_elem(id_sub_elem)%volume * sol_w(2:4)
+    end do
+    a_p = a_p / mesh%vert(id_vert)%volume
+    v_p = v_p / mesh%vert(id_vert)%volume
+    ma_node = norm2(v_p) / a_p
+
+    if (low_mach) then
+      theta = min(1.0_DOUBLE, ma_node)
+    else
+      theta = 1.0_DOUBLE
+    end if
+
+    ! nodal velocity + its Mach, needed by the Tallois multidimensional correction
+    theta_n = 0.0_DOUBLE
+    u_node = 0.0_DOUBLE
+    if (tp_fix) then
+      call compute_nodal_velocity_LVP(mesh, id_vert, sol, grad, u_node, second_order)
+      theta_n = min(1.0_DOUBLE, norm2(u_node)/a_p)
+    end if
+
+    ! carbuncle / shock sensor: each advection variant keeps its own, so that
+    ! switching adv_mode reproduces that family's behaviour exactly
+    need_ducros = (adv_mode == 0 .or. adv_mode == 2)
+
+    corr = 0.0_DOUBLE
+    corr_a = 0.0_DOUBLE
+    if (need_ducros) then
+      select case (eps_mode)
+      case (1)
+        call compute_corr_pressure(mesh, id_vert, sol, grad, corr, second_order)
+      case (2)
+        call compute_corr2(mesh, id_vert, sol, grad, corr, second_order)
+      case (3)
+        call compute_corr_pressure_div(mesh, id_vert, sol, grad, corr, second_order)
+      case default
+        call compute_corr_ducros(mesh, id_vert, sol, grad, corr, second_order)
+      end select
+    end if
+
+    ! Blend weight: compute_corr_ducros returns corr = w * 4 * a_p, where w is
+    ! its dimensionless [0,1] shock indicator (Ducros filter gated by Mach and
+    ! by compression). Recover w by dividing out the 4*a_p it multiplied in,
+    ! so the blend follows the same sensor the dissipation already uses.
+    ! NB: this divides out compute_corr_ducros's own 4*a_p, so it is only valid
+    ! for eps_mode == 0 -- the only blended scheme (WIP2_HYB) is registered so.
+    w_shock = 0.0_DOUBLE
+    if (adv_mode == 2) then
+      w_shock = min(1.0_DOUBLE, max(0.0_DOUBLE, corr/(4.0_DOUBLE*a_p)))
+    end if
+
+    ! With w_shock == 0 the AMISO contribution is multiplied by zero, so skip
+    ! it entirely (exactly equivalent, and it is the common case: the sensor
+    ! only fires at shocks, leaving most of a mesh on the Ducros branch alone).
+    need_amiso = (adv_mode == 1) .or. (adv_mode == 2 .and. w_shock > 0.0_DOUBLE)
+    if (need_amiso) call compute_corr2(mesh, id_vert, sol, grad, corr_a, second_order)
+
+    ! --- AMISO advection: nodal upwind state sol_p (first pass) ---
+    if (need_amiso) then
+      min_apf = huge(1.0_DOUBLE)
+      do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+        id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+        re = mesh%sub_face(id_sub_face)%right_elem_neigh
+        if (re > 0) then
+          min_apf = min(min_apf, mesh%sub_face(id_sub_face)%area)
+        end if
+      end do
+
+      sol_p = 0.0_DOUBLE
+      sum_area_a = 0.0_DOUBLE
+      do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+        id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+        le = mesh%sub_face(id_sub_face)%left_elem_neigh
+        re = mesh%sub_face(id_sub_face)%right_elem_neigh
+        norm = mesh%sub_face(id_sub_face)%norm
+
+        call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
+          second_order, sol_w_l, sol_w_r)
+
+        vnl = dot_product(sol_w_l(2:4), norm)
+        vnr = dot_product(sol_w_r(2:4), norm)
+        lambda_a = max(1e-8_DOUBLE, -vnl, vnr) + corr_a
+
+        sol_l = primit_to_conserv(sol_w_l)
+        sol_r = primit_to_conserv(sol_w_r)
+        u_bar = sol_l*0.5_DOUBLE*(1.0_DOUBLE + vnl/lambda_a) &
+              + sol_r*0.5_DOUBLE*(1.0_DOUBLE - vnr/lambda_a)
+
+        if (re > 0) then
+          wpcf = min_apf/mesh%sub_face(id_sub_face)%area
+          sol_p = sol_p + mesh%sub_face(id_sub_face)%area*wpcf*lambda_a*u_bar
+          sum_area_a = sum_area_a + mesh%sub_face(id_sub_face)%area*wpcf*lambda_a
+        end if
+      end do
+      sol_p = sol_p / sum_area_a
+    end if
+
+    ! --- nodal pressure with the Mach-scaled velocity-jump (divv) term ---
+    pp = 0.0_DOUBLE
+    denomsum = 0.0_DOUBLE
+    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
+      norm = mesh%sub_face(id_sub_face)%norm
+
+      call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
+        second_order, sol_w_l, sol_w_r)
+
+      rhol = sol_w_l(1)
+      vnl = dot_product(sol_w_l(2:4), norm)
+      pl = sol_w_l(5)
+      al = sound_speed_w(sol_w_l)
+
+      rhor = sol_w_r(1)
+      vnr = dot_product(sol_w_r(2:4), norm)
+      pr = sol_w_r(5)
+      ar = sound_speed_w(sol_w_r)
+
+      lambda_l = max(al*rhol, sqrt(rhol*max(0.0_DOUBLE, pr - pl)), -rhol*(vnr - vnl))
+      lambda_r = max(ar*rhor, sqrt(rhor*max(0.0_DOUBLE, pl - pr)), -rhor*(vnr - vnl))
+
+      invlamb = 1.0_DOUBLE/lambda_l + 1.0_DOUBLE/lambda_r
+      pbar_f = (pl/lambda_l + pr/lambda_r - theta*(vnr - vnl))/invlamb
+
+      weight = mesh%sub_face(id_sub_face)%area*invlamb
+      if (re <= 0) weight = 0.5_DOUBLE*weight
+      pp = pp + weight*pbar_f
+      denomsum = denomsum + weight
+    end do
+    pp = pp / denomsum
+
+    ! --- flux assembly ---
+    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
+      lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
+      lse_loc = mesh%sub_elem(lse)%id_loc_around_node
+      rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
+      if (rse > 0) then
+        rse_loc = mesh%sub_elem(rse)%id_loc_around_node
+      end if
+      norm = mesh%sub_face(id_sub_face)%norm
+
+      call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
+        second_order, sol_w_l, sol_w_r)
+
+      sol_l = primit_to_conserv(sol_w_l)
+      rhol = sol_w_l(1)
+      vnl = dot_product(sol_w_l(2:4), norm)
+      pl = sol_w_l(5)
+      al = sound_speed_w(sol_w_l)
+
+      sol_r = primit_to_conserv(sol_w_r)
+      rhor = sol_w_r(1)
+      vnr = dot_product(sol_w_r(2:4), norm)
+      pr = sol_w_r(5)
+      ar = sound_speed_w(sol_w_r)
+
+      lambda_l = max(al*rhol, sqrt(rhol*max(0.0_DOUBLE, pr - pl)), -rhol*(vnr - vnl))
+      lambda_r = max(ar*rhor, sqrt(rhor*max(0.0_DOUBLE, pl - pr)), -rhor*(vnr - vnl))
+
+      ! symmetric, impedance-weighted interface velocity (conservative: fplus=fminus)
+      vstar = (lambda_l*vnl + lambda_r*vnr - (pr - pl))/(lambda_l + lambda_r)
+
+      sol_m = 0.5_DOUBLE*(sol_r + sol_l)
+
+      ff_lag(1) = 0.0_DOUBLE
+      if (tp_fix) then
+        ! one-sided GLACE pressure at the shock end, nodal pressure at the
+        ! low-Mach end; energy velocity blends the same way so theta_n=0 is
+        ! exactly the WIP2_NOLM flux.
+        vn_node = dot_product(u_node, norm)
+        pflux_l = theta_n*(pl - lambda_l*(vn_node - vnl)) + (1.0_DOUBLE - theta_n)*pp
+        pflux_r = theta_n*(pr + lambda_r*(vn_node - vnr)) + (1.0_DOUBLE - theta_n)*pp
+        ff_lag(5) = 0.0_DOUBLE
+      else
+        ff_lag(2:4) = pp * norm
+        ff_lag(5) = pp * vstar
+      end if
+
+      ! jump used by the advection dissipation
+      djump = sol_r - sol_l
+      if (enth_fix) then
+        h_l = (sol_l(5) + pl)/rhol
+        h_r = (sol_r(5) + pr)/rhor
+        h_bar = 0.5_DOUBLE*(h_l + h_r)
+        djump(5) = h_bar*(rhor - rhol)
+      end if
+
+      ! Rusanov-at-vstar advection (WIP form)
+      if (need_ducros) then
+        ff_adv = vstar*sol_m - 0.5_DOUBLE*(abs(vstar) + corr)*djump
+      end if
+
+      ! AMISO advection (asymmetric by construction: the nodal upwind state
+      ! sol_p is approached from each side, so fadv_minus /= fadv_plus)
+      if (need_amiso) then
+        rhom = 0.5_DOUBLE*(rhol + rhor)
+        am = 0.5_DOUBLE*(al + ar)
+        vm = 0.5_DOUBLE*(vnr + vnl) - 0.5_DOUBLE/(rhom*am)*(pr - pl)
+        lambda_a = max(1e-8_DOUBLE, -vnl, vnr) + corr_a
+        ff_a = vm*sol_m - 0.5_DOUBLE*(abs(vm) + corr_a)*djump
+
+        if (re > 0) then
+          wpcf = min_apf/mesh%sub_face(id_sub_face)%area * (1.0_DOUBLE/3.0_DOUBLE)
+          fadv_minus = wpcf*(sol_l*vnl - lambda_a*(sol_p - sol_l)) &
+            + (1.0_DOUBLE - wpcf)*ff_a
+          fadv_plus = wpcf*(sol_r*vnr + lambda_a*(sol_p - sol_r)) &
+            + (1.0_DOUBLE - wpcf)*ff_a
+        else
+          fadv_minus = ff_a
+          fadv_plus = ff_a
+        end if
+      end if
+
+      if (tp_fix) then
+        ! per-side Lagrange flux (the GLACE part is one-sided by construction)
+        ff_lag_l(1) = 0.0_DOUBLE
+        ff_lag_l(2:4) = pflux_l * norm
+        ff_lag_l(5) = pflux_l * (theta_n*vn_node + (1.0_DOUBLE - theta_n)*vstar)
+        ff_lag_r(1) = 0.0_DOUBLE
+        ff_lag_r(2:4) = pflux_r * norm
+        ff_lag_r(5) = pflux_r * (theta_n*vn_node + (1.0_DOUBLE - theta_n)*vstar)
+      else
+        ff_lag_l = ff_lag
+        ff_lag_r = ff_lag
+      end if
+
+      select case (adv_mode)
+      case (1)
+        fminus = fadv_minus + ff_lag_l
+        fplus = fadv_plus + ff_lag_r
+      case (2)
+        if (need_amiso) then
+          fminus = (1.0_DOUBLE - w_shock)*ff_adv + w_shock*fadv_minus + ff_lag_l
+          fplus = (1.0_DOUBLE - w_shock)*ff_adv + w_shock*fadv_plus + ff_lag_r
+        else
+          fminus = ff_adv + ff_lag_l
+          fplus = ff_adv + ff_lag_r
+        end if
+      case default
+        fminus = ff_adv + ff_lag_l
+        fplus = ff_adv + ff_lag_r
+      end select
+
+      if (boundary_2d &
+        .and. abs(mesh%sub_face(id_sub_face)%norm(3)) > 1e-3) then
+        fminus = 0.0_DOUBLE
+        fplus = 0.0_DOUBLE
+      end if
+
+      lambda_lts = max(abs(vnl), abs(vnr)) + max(al, ar)
+
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
+          + mesh%sub_face(id_sub_face)%area*lambda_lts
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) &
+          + mesh%sub_face(id_sub_face)%area*fminus
+
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
+          sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
+            + mesh%sub_face(id_sub_face)%area*lambda_lts
+          flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) &
+            - mesh%sub_face(id_sub_face)%area*fplus
+        end if
+        end if
+      end if
+    end do
+  end subroutine compute_rhs_around_vert_WIP2
 
   subroutine compute_rhs_around_vert_usi3d(mesh, sol, grad, &
       nsen, flux_sum_vert, sum_lambda_vert, &
@@ -3573,11 +3448,13 @@ contains
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) &
           + mesh%sub_face(id_sub_face)%area * fminus
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
             + mesh%sub_face(id_sub_face)%area * lambda_lts
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) &
             - mesh%sub_face(id_sub_face)%area * fplus
+        end if
         end if
       end if
     end do

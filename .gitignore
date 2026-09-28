@@ -61,3 +61,7 @@ residual.dat
 *.log
 *.out
 *.synctex.gz
+
+# Generated animations (same rationale as *.png above)
+*.gif
+*.jpg

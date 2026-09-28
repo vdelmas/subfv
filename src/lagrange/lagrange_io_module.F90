@@ -9,7 +9,7 @@ module lagrange_io_module
   use lagrange_module
   implicit none
 contains
-  subroutine write_sol_lag(mesh, filename, sol, vp, pp, gamma_arr, grad_v, grad_p, div_v, alpha_p_arr, p_limited)
+  subroutine write_sol_lag(mesh, filename, sol, vp, pp, gamma_arr, grad_v, grad_p, div_v, alpha_p_arr, p_limited, h_p_arr)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -22,14 +22,15 @@ contains
     real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: div_v
     real(kind=DOUBLE), dimension(mesh%n_vert), intent(in), optional :: alpha_p_arr
     integer(kind=ENTIER), dimension(mesh%n_elems), intent(in), optional :: p_limited
+    real(kind=DOUBLE), dimension(mesh%n_vert), intent(in), optional :: h_p_arr
     character(len=*), intent(in) :: filename
 
     call write_sol_meta_pvtu_lag(filename)
-    call write_sol_vtu_lag(mesh, filename, sol, vp, pp, gamma_arr, grad_v, grad_p, div_v, alpha_p_arr, p_limited)
+    call write_sol_vtu_lag(mesh, filename, sol, vp, pp, gamma_arr, grad_v, grad_p, div_v, alpha_p_arr, p_limited, h_p_arr)
 
   end subroutine write_sol_lag
 
-  subroutine write_sol_vtu_lag(mesh, basename, sol, vp, pp, gamma_arr, grad_v, grad_p, div_v, alpha_p_arr, p_limited)
+  subroutine write_sol_vtu_lag(mesh, basename, sol, vp, pp, gamma_arr, grad_v, grad_p, div_v, alpha_p_arr, p_limited, h_p_arr)
     use mpi
     implicit none
 
@@ -43,6 +44,7 @@ contains
     real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: div_v
     real(kind=DOUBLE), dimension(mesh%n_vert), intent(in), optional :: alpha_p_arr
     integer(kind=ENTIER), dimension(mesh%n_elems), intent(in), optional :: p_limited
+    real(kind=DOUBLE), dimension(mesh%n_vert), intent(in), optional :: h_p_arr
     character(len=*), intent(in) :: basename
 
     integer(kind=ENTIER) :: me, num_procs, mpi_ierr
@@ -224,6 +226,16 @@ contains
       write(fn, *) "</DataArray>"
     end if
 
+    if (present(h_p_arr)) then
+      write(fn, *) "<DataArray type='Float64' Name='h_p' format='ascii' NumberOfComponents='1'>"
+      do i=1, mesh%n_vert
+        if( .not. mesh%vert(i)%is_ghost ) then
+          write (fn, *) h_p_arr(i)
+        end if
+      end do
+      write(fn, *) "</DataArray>"
+    end if
+
     write(fn, *) "</PointData>"
 
     !Cell data
@@ -400,6 +412,7 @@ contains
       write(fn, *) "<DataArray type='Float64' Name='Vp' format='ascii' NumberOfComponents='3'/>"
       write(fn, *) "<DataArray type='Float64' Name='Pp' format='ascii' NumberOfComponents='1'/>"
       write(fn, *) "<DataArray type='Float64' Name='alpha_p' format='ascii' NumberOfComponents='1'/>"
+      write(fn, *) "<DataArray type='Float64' Name='h_p' format='ascii' NumberOfComponents='1'/>"
       write(fn, *) "</PPointData>"
       write(fn, *) "<PCellData>"
       write(fn, *) "<PDataArray type='Float64' Name='Centroid' NumberOfComponents='3'/>"

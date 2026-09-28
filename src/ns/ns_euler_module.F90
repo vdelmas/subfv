@@ -173,11 +173,14 @@ contains
     use mpi
     use ns_global_data_module, only: bc_style, scheme, exclude_bound_vert, &
       scheme_id, scheme_adv_id, scheme_lag_id, &
-      SCHEME_ZB, SCHEME_WIP, SCHEME_USI3D, &
+      SCHEME_ZB, SCHEME_WIP, SCHEME_WIP2, SCHEME_WIP2_NOLM, SCHEME_WIP2_AADV, SCHEME_WIP2_HYB, &
+      SCHEME_WIP2_EJUMP, SCHEME_WIP2_EDIV, SCHEME_WIP2_EMAX, &
+      SCHEME_WIP2_ENTH, SCHEME_WIP2_ENTH_EJUMP, &
+      SCHEME_WIP2_TP, SCHEME_WIP2_TP_ENTH, SCHEME_USI3D, &
       SCHEME_ADV_AR1D, SCHEME_ADV_AM, SCHEME_ADV_AMISO, &
-      SCHEME_ADV_ARMD, SCHEME_ADV_ARMDU, SCHEME_ADV_ARMDM, &
-      SCHEME_ADV_ARMDMAT, SCHEME_ADV_ARMDUMAT, SCHEME_ADV_ARMDMMAT, &
-      SCHEME_LAG_LS, SCHEME_LAG_LSU, SCHEME_LAG_LSM, SCHEME_ADV_ARMDWIP, &
+      SCHEME_ADV_ARMD, SCHEME_ADV_ARMDU, &
+      SCHEME_ADV_ARMDMAT, SCHEME_ADV_ARMDUMAT, &
+      SCHEME_LAG_LS, SCHEME_LAG_LSU, SCHEME_ADV_ARMDWIP, &
       SCHEME_LAG_LSWIP, SCHEME_LAG_LPP, SCHEME_LAG_LVPPP, SCHEME_LAG_LS1D, SCHEME_LAG_LPF
     use linear_solver_module
     use mpi
@@ -194,6 +197,7 @@ contains
     logical, intent(in) :: second_order
 
     integer(kind=ENTIER) :: j, idse, ide, id_vert, nsfn, nsen, max_nsen
+    integer(kind=ENTIER) :: adv_mode, eps_mode
     real(kind=DOUBLE), dimension(3) :: v_vert
     real(kind=DOUBLE), dimension(:), allocatable :: sum_lambda_vert
     real(kind=DOUBLE), dimension(:, :), allocatable :: flux_sum_vert
@@ -241,10 +245,6 @@ contains
           call compute_rhs_around_vert_ARMDU(mesh, sol, grad, &
             nsen, sum_lambda_vert, &
             flux_sum_vert, second_order, id_vert, vp)
-        case (SCHEME_ADV_ARMDM)
-          call compute_rhs_around_vert_ARMDM(mesh, sol, grad, &
-            nsen, sum_lambda_vert, &
-            flux_sum_vert, second_order, id_vert, vp, mat_h_p)
         case (SCHEME_ADV_ARMDMAT)
           call compute_rhs_around_vert_ARMDMAT(mesh, sol, grad, &
             nsen, sum_lambda_vert, &
@@ -253,10 +253,6 @@ contains
           call compute_rhs_around_vert_ARMDUMAT(mesh, sol, grad, &
             nsen, sum_lambda_vert, &
             flux_sum_vert, second_order, id_vert, vp)
-        case (SCHEME_ADV_ARMDMMAT)
-          call compute_rhs_around_vert_ARMDMMAT(mesh, sol, grad, &
-            nsen, sum_lambda_vert, &
-            flux_sum_vert, second_order, id_vert, vp, mat_h_p)
         case default
           print*,"Unknown ZB advection"
           error stop
@@ -275,10 +271,6 @@ contains
           call compute_rhs_around_vert_LSU(mesh, sol, grad, &
             nsen, flux_sum_vert, &
             id_vert, vp, second_order)
-        case (SCHEME_LAG_LSM)
-          call compute_rhs_around_vert_LSM(mesh, sol, grad, &
-            nsen, flux_sum_vert, &
-            id_vert, vp, mat_h_p, second_order)
         case (SCHEME_LAG_LPP)
           call compute_rhs_around_vert_LPP(mesh, sol, grad, &
             nsen, flux_sum_vert, id_vert, second_order)
@@ -312,6 +304,47 @@ contains
         call compute_rhs_around_vert_WIP(mesh, sol, grad, &
           nsen, flux_sum_vert, sum_lambda_vert, &
           id_vert, vp, h_p, second_order)
+
+        do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
+          idse = mesh%vert(id_vert)%sub_elem_neigh(j)
+          ide = mesh%sub_elem(idse)%mesh_elem
+          rhs(:, ide) = rhs(:, ide) - flux_sum_vert(:, j)
+          sum_lambda(ide) = sum_lambda(ide) + sum_lambda_vert(j)
+        end do
+      end do
+    else if (scheme_id == SCHEME_WIP2 .or. scheme_id == SCHEME_WIP2_NOLM &
+        .or. scheme_id == SCHEME_WIP2_AADV .or. scheme_id == SCHEME_WIP2_HYB &
+        .or. scheme_id == SCHEME_WIP2_EJUMP .or. scheme_id == SCHEME_WIP2_EDIV &
+        .or. scheme_id == SCHEME_WIP2_EMAX .or. scheme_id == SCHEME_WIP2_ENTH &
+        .or. scheme_id == SCHEME_WIP2_ENTH_EJUMP .or. scheme_id == SCHEME_WIP2_TP &
+        .or. scheme_id == SCHEME_WIP2_TP_ENTH) then
+      do id_vert = 1, mesh%n_vert
+        nsfn = mesh%vert(id_vert)%n_sub_faces_neigh
+        nsen = mesh%vert(id_vert)%n_sub_elems_neigh
+        sum_lambda_vert(1:nsen) = 0.0_DOUBLE
+        flux_sum_vert(:, 1:nsen) = 0.0_DOUBLE
+        if (scheme_id == SCHEME_WIP2_AADV) then
+          adv_mode = 1
+        else if (scheme_id == SCHEME_WIP2_HYB) then
+          adv_mode = 2
+        else
+          adv_mode = 0
+        end if
+        if (scheme_id == SCHEME_WIP2_EJUMP .or. scheme_id == SCHEME_WIP2_ENTH_EJUMP) then
+          eps_mode = 1
+        else if (scheme_id == SCHEME_WIP2_EDIV) then
+          eps_mode = 2
+        else if (scheme_id == SCHEME_WIP2_EMAX) then
+          eps_mode = 3
+        else
+          eps_mode = 0
+        end if
+        call compute_rhs_around_vert_WIP2(mesh, sol, grad, &
+          nsen, flux_sum_vert, sum_lambda_vert, &
+          id_vert, second_order, scheme_id == SCHEME_WIP2, adv_mode, eps_mode, &
+          scheme_id == SCHEME_WIP2_ENTH .or. scheme_id == SCHEME_WIP2_ENTH_EJUMP &
+          .or. scheme_id == SCHEME_WIP2_TP_ENTH, &
+          scheme_id == SCHEME_WIP2_TP .or. scheme_id == SCHEME_WIP2_TP_ENTH)
 
         do j=1, mesh%vert(id_vert)%n_sub_elems_neigh
           idse = mesh%vert(id_vert)%sub_elem_neigh(j)
@@ -366,6 +399,7 @@ contains
       SCHEME_MULTI_POINT, SCHEME_MULTI_POINT_ISO, SCHEME_MULTI_POINT_PRESSURE, &
       SCHEME_MULTI_POINT_PRESSURE_PH, &
       SCHEME_THREE_WAVE, SCHEME_TWO_WAVE, SCHEME_MODIFIED_THREE_WAVE, &
+      SCHEME_THREE_WAVE_ENTHALPY, SCHEME_MULTI_POINT_ENTHALPY, SCHEME_THREE_WAVE_ENTHALPY2, &
       SCHEME_MULTI_POINT_VILAR
     use linear_solver_module
     use mpi
@@ -420,7 +454,10 @@ contains
     warea = minval(warea)/warea
 
     select case (scheme_id)
-    case (SCHEME_MULTI_POINT)
+    case (SCHEME_MULTI_POINT, SCHEME_MULTI_POINT_ENTHALPY)
+      ! The nodal velocity comes from the paper's linear system (16), which involves only the
+      ! slopes and the face velocities -- no energy -- so the enthalpy-preserving variant
+      ! shares this step with multi_point unchanged.
       lambda(:, :) = 0.0_DOUBLE
       if( mesh%vert(id_vert)%is_bound .and. exclude_bound_vert) then
         v_vert = 0.0_DOUBLE
@@ -515,6 +552,33 @@ contains
       case (SCHEME_MODIFIED_THREE_WAVE)
         call modified_three_wave(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
           mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
+      case (SCHEME_THREE_WAVE_ENTHALPY)
+        call three_wave_enthalpy(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+          mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
+      case (SCHEME_THREE_WAVE_ENTHALPY2)
+        call three_wave_enthalpy2(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+          mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
+      case (SCHEME_MULTI_POINT_ENTHALPY)
+        ! Mirrors the SCHEME_MULTI_POINT branch, except that the boundary-vertex fallback is
+        ! the enthalpy-preserving 1D solver rather than two_wave: the paper applies the
+        ! one-dimensional scheme at boundary nodes ("ensuring conservation, which is critical
+        ! for accuracy"), and falling back to two_wave there would reintroduce an enthalpy
+        ! defect on exactly the wall cells the property is wanted on.
+        if( mesh%vert(id_vert)%is_bound .and. exclude_bound_vert) then
+          call three_wave_enthalpy(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+            mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sl, sr)
+        else
+          if (is_wall(re) ) then
+            call multi_point_enthalpy(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+              mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), 0.0_DOUBLE, &
+              lambda(1, j), lambda(2, j), sl, sr)
+          else
+            call multi_point_enthalpy(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
+              mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), &
+              dot_product(v_vert, mesh%sub_face(id_sub_face)%norm), &
+              lambda(1, j), lambda(2, j), sl, sr)
+          end if
+        end if
       case (SCHEME_MULTI_POINT_VILAR)
         call multi_point_vilar(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
           mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), sol_p_vilar, sl, sr)
@@ -537,10 +601,12 @@ contains
         flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) &
           + mesh%sub_face(id_sub_face)%area*lr_flux(:, 1, j)
 
-        if (rse > 0 .and. mesh%sub_elem(rse)%mesh_vert == id_vert) then
+        if (rse > 0) then
+        if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
           sum_lambda_vert(rse_loc) = sum_lambda_vert(rse_loc) &
             + mesh%sub_face(id_sub_face)%area*max(0.0_DOUBLE, sr)
           flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) + mesh%sub_face(id_sub_face)%area*lr_flux(:, 2, j)
+        end if
         end if
       end if
     end do
