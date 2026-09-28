@@ -40,13 +40,13 @@ module silvia_base_module
   integer(kind=ENTIER) :: n_bc = 0
   character(len=255), dimension(mnbc) :: bc_name
   ! bc_val for Euler (rho, u, v, w, p)
-  character(len=255), dimension(mnbc) :: bc_type
+  character(len=255), dimension(mnbc) :: bc_type = ""
   real(kind=DOUBLE), dimension(5, mnbc) :: bc_val
   ! bc_val_V for Viscous (u, v, w)
-  character(len=255), dimension(mnbc) :: bc_type_V
+  character(len=255), dimension(mnbc) :: bc_type_V = ""
   real(kind=DOUBLE), dimension(3, mnbc) :: bc_val_V
   ! bc_val_T for Heat (T)
-  character(len=255), dimension(mnbc) :: bc_type_T
+  character(len=255), dimension(mnbc) :: bc_type_T = ""
   real(kind=DOUBLE), dimension(mnbc) :: bc_val_T
 
   ! Precomputed BC type IDs — filled by init_flags after reading input
@@ -254,6 +254,59 @@ contains
     close (unit=funit)
   end subroutine read_input_parameters
 
+  subroutine init_flags()
+    implicit none
+
+    integer :: i, p1, p2
+    character(len=255) :: t, t_adv, t_lag
+    logical :: recognized
+
+    allocate(bc_V_id(n_bc), bc_T_id(n_bc), bc_euler_id(n_bc))
+    do i = 1, n_bc
+      t = trim(adjustl(bc_type_V(i)))
+      if (t == "dirichlet") then
+        bc_V_id(i) = BC_V_DIRICHLET
+      else if (t == "neumann" .or. t == "") then
+        bc_V_id(i) = BC_V_NEUMANN
+      else
+        print *, "ERROR: bc_type_V unrecognized for BC ", i, ": '", trim(t), "'"
+        error stop
+      end if
+      t = trim(adjustl(bc_type_T(i)))
+      if (t == "dirichlet") then
+        bc_T_id(i) = BC_T_DIRICHLET
+      else if (t == "neumann" .or. t == "") then
+        bc_T_id(i) = BC_T_NEUMANN
+      else
+        print *, "ERROR: bc_type_T unrecognized for BC ", i, ": '", trim(t), "'"
+        error stop
+      end if
+      t = trim(adjustl(bc_type(i)))
+      if (t == "wall" .or. t == "") then
+        bc_euler_id(i) = BC_EULER_WALL
+      else if (t == "adherence_wall") then
+        bc_euler_id(i) = BC_EULER_ADHERENCE_WALL
+      else if (t == "freestream") then
+        bc_euler_id(i) = BC_EULER_FREESTREAM
+      else if (t == "outflowsupersonic") then
+        bc_euler_id(i) = BC_EULER_OUTFLOWSUPERSONIC
+      else if (t == "inflow_pond") then
+        bc_euler_id(i) = BC_EULER_INFLOW_POND
+      else if (t == "inout_double_mach") then
+        bc_euler_id(i) = BC_EULER_INOUT_DOUBLE_MACH
+      else if (t == "double_mach_bottom") then
+        bc_euler_id(i) = BC_EULER_DOUBLE_MACH_BOTTOM
+      else if (t == "potential_flow_2d") then
+        bc_euler_id(i) = BC_EULER_POTENTIAL_FLOW_2D
+      else if (t == "potential_flow_3d") then
+        bc_euler_id(i) = BC_EULER_POTENTIAL_FLOW_3D
+      else
+        print *, "ERROR: bc_type unrecognized for BC ", i, ": '", trim(t), "'"
+        error stop
+      end if
+    end do
+  end subroutine init_flags
+
   pure function primit_to_conserv(w) result(u)
     implicit none
 
@@ -426,7 +479,8 @@ contains
 
     rhs        = 0.0_DOUBLE
     sum_lambda = 0.0_DOUBLE
-    call face_flux_loop(mesh, sol, prim, grad, hess, rhs, sum_lambda, t)
+    ! call face_flux_loop(mesh, sol, prim, grad, hess, rhs, sum_lambda, t)
+    call subface_flux_loop(mesh, sol, prim, grad, hess, rhs, sum_lambda, t)
 
     ! Divide by cell volume
     block
@@ -440,6 +494,131 @@ contains
 
   end subroutine compute_rhs
 
+  subroutine subface_flux_loop(mesh, sol, prim, grad, hess, rhs, sum_lambda, t)
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: sol, prim
+    real(kind=DOUBLE), dimension(5, 3, mesh%n_elems), intent(in) :: grad
+    real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(in) :: hess
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(inout) :: rhs
+    real(kind=DOUBLE), dimension(mesh%n_elems),    intent(inout) :: sum_lambda
+    real(kind=DOUBLE), intent(in) :: t
+
+    integer(kind=ENTIER) :: iface, il, ir, iv, k, n_fvert, n_qpts, q, inode
+    integer(kind=ENTIER) :: iloop
+    integer(kind=ENTIER) :: i, j, id_sub_face, id_face
+    real(kind=DOUBLE), dimension(3) :: norm, xface
+    real(kind=DOUBLE), dimension(:, :), allocatable :: face_coords, qpts
+    real(kind=DOUBLE), dimension(:),    allocatable :: qwts
+    real(kind=DOUBLE), dimension(5) :: wL, wR, flux, sol_l, sol_r
+    real(kind=DOUBLE) :: lambda
+    logical :: is_zface
+
+
+    do i = 1, mesh%n_vert
+
+      !Compute LR for every subface
+
+
+      !Solve the nodal system 
+
+      !Compute the multi_point flux
+      do j = 1, mesh%vert(i)%n_sub_faces_neigh
+        id_sub_face = mesh%vert(i)%sub_face_neigh(j)
+        id_face = mesh%sub_face(id_sub_face)%mesh_face
+        il   = mesh%sub_face(id_sub_face)%left_elem_neigh
+        ir   = mesh%sub_face(id_sub_face)%right_elem_neigh
+        norm = mesh%sub_face(id_sub_face)%norm
+
+        xface = mesh%face(id_face)%coord !fix to get correct order
+
+        wL = reconstruct(prim, grad, hess, il, xface, mesh%elem(il)%coord)
+        if (ir > 0) then
+          wR = reconstruct(prim, grad, hess, ir, xface, mesh%elem(ir)%coord)
+        else
+          sol_l = primit_to_conserv(wL)
+          call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
+          wR = conserv_to_primit(sol_r)
+        end if
+
+        flux = rusanov(wL, wR, norm) * mesh%sub_face(id_sub_face)%area
+
+        lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
+                     abs(dot_product(wR(2:4), norm)) + cs(wR)) * mesh%sub_face(id_sub_face)%area
+
+        rhs(:, il)  = rhs(:, il)  - flux
+        sum_lambda(il) = sum_lambda(il) + lambda
+        if (ir > 0) then
+          rhs(:, ir)     = rhs(:, ir)     + flux
+          sum_lambda(ir) = sum_lambda(ir) + lambda
+        end if
+      end do
+    end do
+  end subroutine subface_flux_loop
+
+  subroutine compute_right_state(mesh, id_sub_face, re, sol_l, sol_r)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: id_sub_face, re
+    real(kind=DOUBLE), dimension(5), intent(in) :: sol_l
+    real(kind=DOUBLE), dimension(5), intent(inout) :: sol_r
+
+    integer(kind=ENTIER) :: id_face
+    real(kind=DOUBLE), dimension(3) :: face_coord
+    real(kind=DOUBLE), dimension(5) :: w_pf
+
+    if (re > 0) then
+      print*, "re > 0, bad use of compute right sate !"
+      error stop
+    else if (re == 0) then !Default option wall
+      sol_r(:) = sol_l
+      sol_r(2:4) = sol_r(2:4) &
+        - 2.0_DOUBLE*dot_product(sol_r(2:4), mesh%sub_face(id_sub_face)%norm)*mesh%sub_face(id_sub_face)%norm
+    else !!Boundary
+      select case (bc_euler_id(-re))
+      case (BC_EULER_OUTFLOWSUPERSONIC)
+        sol_r = sol_l
+      case (BC_EULER_FREESTREAM)
+        sol_r = primit_to_conserv(bc_val(:, -re))
+      case (BC_EULER_INFLOW_POND)
+        sol_r = primit_to_conserv(bc_val(:, -re))
+        if (dot_product(sol_r(2:4), mesh%sub_face(id_sub_face)%norm) > 0.0_DOUBLE) then
+          sol_r = sol_l
+        end if
+      case (BC_EULER_WALL)
+        sol_r(:) = sol_l
+        sol_r(2:4) = sol_r(2:4) &
+          - 2.0_DOUBLE*dot_product(sol_r(2:4), mesh%sub_face(id_sub_face)%norm)*mesh%sub_face(id_sub_face)%norm
+      case (BC_EULER_ADHERENCE_WALL)
+        sol_r(:) = sol_l
+        sol_r(2:4) = 2.0_DOUBLE*sol_l(1)*bc_val(2:4, -re) - sol_l(2:4)
+        sol_r(5) = sol_l(5) - 0.5_DOUBLE*sol_l(1)*norm2(sol_l(2:4)/sol_l(1))**2 &
+          + 0.5_DOUBLE*sol_l(1)*norm2(sol_r(2:4)/sol_r(1))**2
+      case (BC_EULER_INOUT_DOUBLE_MACH)
+        id_face = mesh%sub_face(id_sub_face)%mesh_face
+        face_coord = mesh%face(id_face)%coord
+        if (face_coord(2) > 1.732_DOUBLE*(face_coord(1) - 0.1667_DOUBLE - 10.0_DOUBLE*t)) then
+          sol_r = primit_to_conserv((/8.0_DOUBLE, 7.145_DOUBLE, -4.125_DOUBLE, 0.0_DOUBLE, 116.5_DOUBLE/))
+        else
+          sol_r = primit_to_conserv((/1.4_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 1.0_DOUBLE/))
+        end if
+      case (BC_EULER_DOUBLE_MACH_BOTTOM)
+        id_face = mesh%sub_face(id_sub_face)%mesh_face
+        face_coord = mesh%face(id_face)%coord
+        if (face_coord(1) < 0.1667_DOUBLE) then
+          sol_r = primit_to_conserv((/8.0_DOUBLE, 7.145_DOUBLE, -4.125_DOUBLE, 0.0_DOUBLE, 116.5_DOUBLE/))
+        else
+          sol_r(:) = sol_l
+          sol_r(2:4) = sol_r(2:4) &
+            - 2.0_DOUBLE*dot_product(sol_r(2:4), mesh%sub_face(id_sub_face)%norm)*mesh%sub_face(id_sub_face)%norm
+        end if
+      case default
+        print *, "BC TYPE NOT RECOGNIZED !"
+        error stop
+      end select
+    end if
+  end subroutine compute_right_state
+
   subroutine face_flux_loop(mesh, sol, prim, grad, hess, rhs, sum_lambda, t)
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: sol, prim
@@ -450,11 +629,11 @@ contains
     real(kind=DOUBLE), intent(in) :: t
 
     integer(kind=ENTIER) :: iface, il, ir, iv, k, n_fvert, n_qpts, q
-    integer(kind=ENTIER) :: iloop
+    integer(kind=ENTIER) :: iloop, id_sub_face
     real(kind=DOUBLE), dimension(3) :: norm, xface
     real(kind=DOUBLE), dimension(:, :), allocatable :: face_coords, qpts
     real(kind=DOUBLE), dimension(:),    allocatable :: qwts
-    real(kind=DOUBLE), dimension(5) :: wL, wR, flux
+    real(kind=DOUBLE), dimension(5) :: wL, wR, flux, sol_l, sol_r
     real(kind=DOUBLE) :: lambda
     logical :: is_zface
 
@@ -508,8 +687,12 @@ contains
         else
           ! Boundary: reconstruct left then apply BC
           ! here is outflowsupersonic
-          wR = wL
+          !wR = wL
           !wR = ghost_prim(xface, norm, wL, -ir, t)
+          id_sub_face = mesh%face(iface)%sub_face(1)
+          sol_l = primit_to_conserv(wL)
+          call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
+          wR = conserv_to_primit(sol_r)
         end if
 
         ! Numerical flux (physical: per-area * area_weight_at_qpt).

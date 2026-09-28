@@ -136,6 +136,15 @@ target_link_libraries(euler_ho PUBLIC shock_adapt_move)
 # so shock_adapt's independence from ns/lagrange/euler_ho is preserved).
 target_link_libraries(shock_adapt PUBLIC arbitrary_high_order)
 
+# ── Silvia library ────────────────────────────────────────────────────────────
+add_library(silvia STATIC
+  src/silvia/silvia_base_module.F90
+  src/silvia/silvia_errors_module.F90
+)
+target_link_libraries(silvia PUBLIC core arbitrary_high_order)
+set_target_properties(silvia PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mod/silvia)
+target_include_directories(silvia PUBLIC ${CMAKE_BINARY_DIR}/mod/silvia)
+
 # ── Exécutables ───────────────────────────────────────────────────────────────
 add_executable(subfvns           src/ns/ns_main.F90)
 add_executable(subfvshear        src/shear/shear_main.F90)
@@ -147,6 +156,7 @@ add_executable(subfveulerho      src/euler_ho/euler_ho_main.F90)
 add_executable(subfvahotest      src/arbitrary_high_order/arbitrary_high_order_main.F90)
 add_executable(subfvale          src/ale/ale_main.F90)
 add_executable(subfvshockadapt   src/shock_adapt/shock_adapt_main.F90)
+add_executable(subfvsilvia       src/silvia/silvia_main.F90)
 
 target_link_libraries(subfvns          ns)
 target_link_libraries(subfvshear       ns)
@@ -158,8 +168,9 @@ target_link_libraries(subfveulerho     euler_ho)
 target_link_libraries(subfvahotest     arbitrary_high_order)
 target_link_libraries(subfvale         ale)
 target_link_libraries(subfvshockadapt  shock_adapt)
+target_link_libraries(subfvsilvia      silvia)
 
-install(TARGETS subfvns subfvshear subfvacoustic subfvlagrange subfvgreshoconv subfvrbf subfvale subfvshockadapt
+install(TARGETS subfvns subfvshear subfvacoustic subfvlagrange subfvgreshoconv subfvrbf subfvale subfvshockadapt subfvsilvia
   RUNTIME DESTINATION bin
 )
 

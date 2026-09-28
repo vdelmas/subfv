@@ -32,6 +32,7 @@ program main
     call MPI_COMM_RANK(MPI_COMM_WORLD, me, mpi_ierr)
 
     call read_input_parameters('input_data.f')
+    call init_flags()
 
     call read_mesh_msh(mesh, meshfile_path, meshfile, &
         n_bc, bc_name, me, num_procs, mpi_send_recv)
