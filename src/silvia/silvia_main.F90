@@ -8,7 +8,6 @@ program main
     use mesh_connectivity_module
     use io_module
     use silvia_base_module
-    use silvia_reconstruction_module
     use silvia_errors_module
   
     implicit none
@@ -24,7 +23,7 @@ program main
     
     real(kind=DOUBLE) :: area, h_err, l2err
     real(kind=DOUBLE), dimension(3) :: n
-    real(kind=DOUBLE), dimension(:,:), allocatable :: sol, sol_w
+    real(kind=DOUBLE), dimension(:,:), allocatable :: sol, sol_w, sol1, sol2
     real(kind=DOUBLE), dimension(:,:), allocatable :: rhs
     real(kind=DOUBLE), allocatable :: sum_lambda(:)
 
@@ -43,6 +42,13 @@ program main
     allocate(sol_w(5,mesh%n_elems))
     allocate(rhs(5,mesh%n_elems))
     allocate(sum_lambda(mesh%n_elems))
+
+    if (order>=2) then
+      allocate(sol1(5,mesh%n_elems))
+      if (order>=3) then
+        allocate(sol2(5,mesh%n_elems))
+      end if
+    end if
 
     do i=1, mesh%n_elems
       sol(:,i) = (/1.0_DOUBLE,1.0_DOUBLE,1.0_DOUBLE,1.0_DOUBLE,100.0_DOUBLE/)
@@ -64,17 +70,63 @@ program main
     
     ! do while (t<tmax .AND. iter<n_max_iter)
     do while (t<tmax)  
+      if (t + dt > tmax) dt = tmax - t
+
       call mpi_barrier(mpi_comm_world, mpi_ierr)
+
+      ! SSP-RK3 stage 1: u1 = u0 + dt * L(u0). A time-dependent BC uses the
       do i=1, mesh%n_elems
         sol_w(:,i) = conserv_to_primit(sol(:,i))
       end do
-
       call compute_rhs(mesh, sol, sol_w, rhs, sum_lambda, t)
       call compute_dt(mesh, sum_lambda, dt)
       call MPI_ALLREDUCE(MPI_IN_PLACE, dt, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
 
-      sol = sol + dt * rhs
-      if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)
+      select case (order)
+        case (1)
+          !
+          sol = sol + dt * rhs
+          if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)  
+          !
+        case (2)
+          !
+          ! First step of SSP RK 
+          sol1 = sol + dt * rhs
+          if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol1)
+          ! Second step of SSP RK 
+          do i=1, mesh%n_elems
+            sol_w(:,i) = conserv_to_primit(sol1(:,i))
+          end do
+          call compute_rhs(mesh, sol1, sol_w, rhs, sum_lambda, t)
+          sol = 0.5_DOUBLE * sol + 0.5_DOUBLE * (sol1 + dt * rhs)
+          if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol2)
+          ! 
+        case (3)
+          ! 
+          ! First step of SSP RK
+          sol1 = sol + dt * rhs
+          if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol1)
+          ! Second step of SSP RK 
+          do i=1, mesh%n_elems
+            sol_w(:,i) = conserv_to_primit(sol1(:,i))
+          end do
+          call compute_rhs(mesh, sol1, sol_w, rhs, sum_lambda, t)
+          sol2 = 0.75_DOUBLE * sol + 0.25_DOUBLE * (sol1 + dt * rhs)
+          if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol2)
+          ! Third step of SSP RK 
+          do i=1, mesh%n_elems
+            sol_w(:,i) = conserv_to_primit(sol2(:,i))
+          end do
+          call compute_rhs(mesh, sol2, sol_w, rhs, sum_lambda, t)
+          sol  = (1.0_DOUBLE/3.0_DOUBLE) * sol + (2.0_DOUBLE/3.0_DOUBLE) * (sol2 + dt * rhs)
+          if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)
+          !
+        case default
+          !
+          sol = sol + dt * rhs
+          if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)  
+          ! 
+        end select
 
       ! Periodic output
       if (n_iter_write_sol > 1) then
