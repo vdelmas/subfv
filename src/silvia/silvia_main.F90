@@ -9,6 +9,7 @@ program main
     use io_module
     use silvia_base_module
     use silvia_errors_module
+    use ns_global_data_module, only: ns_bc_style => bc_style, ns_boundary_2d => boundary_2d
   
     implicit none
 
@@ -27,19 +28,28 @@ program main
     real(kind=DOUBLE), dimension(:,:), allocatable :: rhs
     real(kind=DOUBLE), allocatable :: sum_lambda(:)
 
+    real(kind=DOUBLE), allocatable :: grad(:, :, :)  ! (5, 3, n_elems)
+    real(kind=DOUBLE), allocatable :: hess(:, :, :, :) ! (5, 3, 3, n_elems)
+
     call MPI_INIT(mpi_ierr)
     call MPI_COMM_SIZE(MPI_COMM_WORLD, num_procs, mpi_ierr)
     call MPI_COMM_RANK(MPI_COMM_WORLD, me, mpi_ierr)
 
     call read_input_parameters('input_data.f')
+    ! The ns nodal solver reads these from its own global module
+    ns_bc_style = bc_style
+    ns_boundary_2d = boundary_2d
     call init_flags()
 
     call read_mesh_msh(mesh, meshfile_path, meshfile, &
         n_bc, bc_name, me, num_procs, mpi_send_recv)
     call build_mesh(mesh, num_procs, mpi_send_recv, .true., boundary_2d)
     call compute_geometry_mesh(mesh, .true., boundary_2d)
+    if (order >= 3) call compute_cell_moments(mesh)
 
     allocate(sol(5,mesh%n_elems))
+    allocate(grad(5,3,mesh%n_elems))
+    allocate(hess(5,3,3,mesh%n_elems))
     allocate(sol_w(5,mesh%n_elems))
     allocate(rhs(5,mesh%n_elems))
     allocate(sum_lambda(mesh%n_elems))
@@ -79,7 +89,7 @@ program main
       do i=1, mesh%n_elems
         sol_w(:,i) = conserv_to_primit(sol(:,i))
       end do
-      call compute_rhs(mesh, sol, sol_w, rhs, sum_lambda, t)
+      call compute_rhs(mesh, sol, sol_w, grad, hess, rhs, sum_lambda, t, num_procs, mpi_send_recv)
       call compute_dt(mesh, sum_lambda, dt)
       call MPI_ALLREDUCE(MPI_IN_PLACE, dt, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
 
@@ -98,7 +108,7 @@ program main
           do i=1, mesh%n_elems
             sol_w(:,i) = conserv_to_primit(sol1(:,i))
           end do
-          call compute_rhs(mesh, sol1, sol_w, rhs, sum_lambda, t)
+          call compute_rhs(mesh, sol1, sol_w, grad, hess, rhs, sum_lambda, t, num_procs, mpi_send_recv)
           sol = 0.5_DOUBLE * sol + 0.5_DOUBLE * (sol1 + dt * rhs)
           if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol2)
           ! 
@@ -111,14 +121,14 @@ program main
           do i=1, mesh%n_elems
             sol_w(:,i) = conserv_to_primit(sol1(:,i))
           end do
-          call compute_rhs(mesh, sol1, sol_w, rhs, sum_lambda, t)
+          call compute_rhs(mesh, sol1, sol_w, grad, hess, rhs, sum_lambda, t, num_procs, mpi_send_recv)
           sol2 = 0.75_DOUBLE * sol + 0.25_DOUBLE * (sol1 + dt * rhs)
           if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol2)
           ! Third step of SSP RK 
           do i=1, mesh%n_elems
             sol_w(:,i) = conserv_to_primit(sol2(:,i))
           end do
-          call compute_rhs(mesh, sol2, sol_w, rhs, sum_lambda, t)
+          call compute_rhs(mesh, sol2, sol_w, grad, hess, rhs, sum_lambda, t, num_procs, mpi_send_recv)
           sol  = (1.0_DOUBLE/3.0_DOUBLE) * sol + (2.0_DOUBLE/3.0_DOUBLE) * (sol2 + dt * rhs)
           if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)
           !
@@ -178,7 +188,11 @@ subroutine write_vtu(mesh, sol, me, idx)
     real(kind=DOUBLE), allocatable :: prim_loc(:, :), rho(:), ux(:), uy(:), uz(:), p(:), temp(:)
     real(kind=DOUBLE), allocatable :: centroid(:, :)
     real(kind=DOUBLE), parameter :: r_gas = 287.0_DOUBLE ! air, for T = p/(rho*R)
-    integer(kind=ENTIER) :: i
+    integer(kind=ENTIER) :: i, iv
+    logical :: saved_use_gg
+    real(kind=DOUBLE), allocatable :: dphi_cell(:, :), dphi_v(:, :)
+    logical, allocatable :: valid_v(:)
+    real(kind=DOUBLE), allocatable :: grad_rho_cell(:, :), grad_rho_vert(:, :)
 
     write(fname, '(a,i0)') 'output_', idx
 
@@ -201,6 +215,36 @@ subroutine write_vtu(mesh, sol, me, idx)
       centroid(:, i) = mesh%elem(i)%coord
     end do
 
+    ! Density-gradient diagnostic (for schlieren), same as euler_ho's write_vtu:
+    ! computed at output time with the aho Green-Gauss nodal fit.
+    saved_use_gg = aho_use_green_gauss
+    aho_use_green_gauss = .true.
+    allocate(dphi_cell(15, mesh%n_elems))
+    call compute_next_order_derivative(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, &
+      prim_loc, dphi_cell, deriv_order=1_ENTIER, &
+      dphi_v_out=dphi_v, valid_v_out=valid_v)
+    aho_use_green_gauss = saved_use_gg
+
+    ! dphi(:,e) is laid out (dir-1)*5+v; var 1 is rho, so indices 1/6/11 are
+    ! d(rho)/dx, d(rho)/dy, d(rho)/dz.
+    allocate(grad_rho_cell(3, mesh%n_elems))
+    grad_rho_cell(1, :) = dphi_cell(1, :)
+    grad_rho_cell(2, :) = dphi_cell(6, :)
+    grad_rho_cell(3, :) = dphi_cell(11, :)
+
+    ! Boundary vertices are skipped by the accumulation loop, so valid_v alone
+    ! isn't trustworthy there -- check is_bound first.
+    allocate(grad_rho_vert(3, mesh%n_vert))
+    do iv = 1, mesh%n_vert
+      if (mesh%vert(iv)%is_bound .or. .not. valid_v(iv)) then
+        grad_rho_vert(:, iv) = 0.0_DOUBLE
+      else
+        grad_rho_vert(1, iv) = dphi_v(1, iv)
+        grad_rho_vert(2, iv) = dphi_v(6, iv)
+        grad_rho_vert(3, iv) = dphi_v(11, iv)
+      end if
+    end do
+
     call open_file_vtu(mesh, trim(adjustl(fname)), fn_v, fn_pv)
     call write_file_vtu_start_cell_data(mesh, trim(adjustl(fname)), fn_v, fn_pv)
     call write_file_vtu_cell_scalar(mesh, trim(adjustl(fname)), fn_v, fn_pv, rho, 'rho')
@@ -210,10 +254,15 @@ subroutine write_vtu(mesh, sol, me, idx)
     call write_file_vtu_cell_scalar(mesh, trim(adjustl(fname)), fn_v, fn_pv, p,   'p')
     call write_file_vtu_cell_scalar(mesh, trim(adjustl(fname)), fn_v, fn_pv, temp, 'T')
     call write_file_vtu_cell_vector(mesh, trim(adjustl(fname)), fn_v, fn_pv, centroid, 'Centroid')
+    call write_file_vtu_cell_vector(mesh, trim(adjustl(fname)), fn_v, fn_pv, grad_rho_cell, 'grad_rho_cell')
     call write_file_vtu_end_cell_data(mesh, trim(adjustl(fname)), fn_v, fn_pv)
+    call write_file_vtu_start_vert_data(mesh, trim(adjustl(fname)), fn_v, fn_pv)
+    call write_file_vtu_vert_vector(mesh, trim(adjustl(fname)), fn_v, fn_pv, grad_rho_vert, 'grad_rho_vert')
+    call write_file_vtu_end_vert_data(mesh, trim(adjustl(fname)), fn_v, fn_pv)
     call close_file_vtu(mesh, trim(adjustl(fname)), fn_v, fn_pv)
 
     deallocate(prim_loc, rho, ux, uy, uz, p, temp, centroid)
+    deallocate(dphi_cell, dphi_v, valid_v, grad_rho_cell, grad_rho_vert)
   end subroutine write_vtu
 end program main
 

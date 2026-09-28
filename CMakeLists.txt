@@ -141,7 +141,7 @@ add_library(silvia STATIC
   src/silvia/silvia_base_module.F90
   src/silvia/silvia_errors_module.F90
 )
-target_link_libraries(silvia PUBLIC core arbitrary_high_order)
+target_link_libraries(silvia PUBLIC core arbitrary_high_order ns)
 set_target_properties(silvia PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mod/silvia)
 target_include_directories(silvia PUBLIC ${CMAKE_BINARY_DIR}/mod/silvia)
 

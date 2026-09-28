@@ -2,7 +2,9 @@ module silvia_base_module
   use precision_module
   use mesh_module
   use quadrature_module
-  use arbitrary_high_order_module, only: compute_next_order_derivative
+  use mpi_module
+  use arbitrary_high_order_module, only: compute_next_order_derivative, &
+    aho_use_green_gauss => use_green_gauss
   implicit none
   
   integer, parameter :: mnbc = 10 !Maximum number of boundaries
@@ -183,13 +185,13 @@ module silvia_base_module
   public :: compute_dt
   public :: compute_rhs
   ! public :: test_reconstruction_exactness
-  ! public :: compute_cell_moments
+  public :: compute_cell_moments
   public :: primit_to_conserv
   public :: conserv_to_primit
   public :: print_bcs
   public :: count_elems
   public :: face_geometry
-	public :: reconstruct, ls_reconstruction, solve_ls, gauss_solve
+	public :: reconstruct, aho_reconstruction
 
   ! Cache of each cell's own second geometric moment about its centroid,
   ! M_jk(i) = (1/V_i) * int_cell (x_j - xc_j)(x_k - xc_k) dV -- a pure
@@ -445,56 +447,41 @@ contains
     end do
   end subroutine compute_dt
 
-  subroutine compute_rhs(mesh, sol, prim, rhs, sum_lambda, t)
+  subroutine compute_rhs(mesh, sol, prim, grad, hess, rhs, sum_lambda, t, &
+      num_procs, mpi_send_recv)
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: sol
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: prim
+    real(kind=DOUBLE), dimension(5, 3, mesh%n_elems), intent(inout) :: grad
+    real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(inout) :: hess
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(out) :: rhs
     real(kind=DOUBLE), dimension(mesh%n_elems),    intent(out) :: sum_lambda
-    ! Current stage's time, for a time-dependent BC (e.g. 'dmr_top'). Not
-    ! tracked per-RK-substage (all 3 SSP-RK3 stages of one step reuse the
-    ! step's start time) -- a minor, deliberate simplification for a
-    ! qualitative test, not exact substage timing.
     real(kind=DOUBLE), intent(in) :: t
+    integer, intent(in) :: num_procs
+    type(mpi_send_recv_type), intent(inout) :: mpi_send_recv
 
-    ! Per-cell gradients (5 primitives x 3 spatial dims)
-    real(kind=DOUBLE), allocatable :: grad(:, :, :)  ! (5, 3, n_elems)
-    real(kind=DOUBLE), allocatable :: hess(:, :, :, :) ! (5, 3, 3, n_elems)
+    integer(kind=ENTIER) :: i
 
-    allocate(grad(5, 3, mesh%n_elems))
     grad = 0.0_DOUBLE
+    hess = 0.0_DOUBLE
+    if (order >= 2) call aho_reconstruction(mesh, prim, grad, hess, num_procs, mpi_send_recv)
 
-    if (order >= 3) then
-      allocate(hess(5, 3, 3, mesh%n_elems))
-      hess = 0.0_DOUBLE
-    end if
-
-    if (order >= 2) then
-      ! if (use_aho_reconstruction) then
-      !   call aho_reconstruction(mesh, prim, grad, hess)
-      ! else
-        call ls_reconstruction(mesh, prim, grad, hess)
-      ! end if
-    end if
+    !BJ
 
     rhs        = 0.0_DOUBLE
     sum_lambda = 0.0_DOUBLE
-    ! call face_flux_loop(mesh, sol, prim, grad, hess, rhs, sum_lambda, t)
     call subface_flux_loop(mesh, sol, prim, grad, hess, rhs, sum_lambda, t)
 
-    ! Divide by cell volume
-    block
-      integer(kind=ENTIER) :: i
-      do i = 1, mesh%n_elems
-        if (.not. mesh%elem(i)%is_ghost) then
-          rhs(:, i) = rhs(:, i) / mesh%elem(i)%volume
-        end if
-      end do
-    end block
-
+    do i = 1, mesh%n_elems
+      rhs(:, i) = rhs(:, i) / mesh%elem(i)%volume
+    end do
   end subroutine compute_rhs
 
   subroutine subface_flux_loop(mesh, sol, prim, grad, hess, rhs, sum_lambda, t)
+    use ns_euler_rs_module, only: compute_lambdas_and_solve_nodal_velocity_new, &
+      multi_point
+    implicit none
+
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: sol, prim
     real(kind=DOUBLE), dimension(5, 3, mesh%n_elems), intent(in) :: grad
@@ -510,18 +497,28 @@ contains
     real(kind=DOUBLE), dimension(:, :), allocatable :: face_coords, qpts
     real(kind=DOUBLE), dimension(:),    allocatable :: qwts
     real(kind=DOUBLE), dimension(5) :: wL, wR, flux, sol_l, sol_r
+    real(kind=DOUBLE), dimension(5,2) :: lr_flux
     real(kind=DOUBLE) :: lambda
     logical :: is_zface
+
+    integer(kind=ENTIER) :: ng
+    real(kind=DOUBLE), dimension(:, :), allocatable :: sol_w_l, sol_w_r, norm_list
+    real(kind=DOUBLE), dimension(:), allocatable :: lambda_l, lambda_r, weight
+    real(kind=DOUBLE), dimension(3) :: v_node
+    real(kind=DOUBLE) :: vn_nodal, sl, sr, area
 
 
     do i = 1, mesh%n_vert
 
       !Compute LR for every subface
+      ng = mesh%vert(i)%n_sub_faces_neigh
+      allocate(sol_w_l(5, ng))
+      allocate(sol_w_r(5, ng))
+      allocate(lambda_l(ng))
+      allocate(lambda_r(ng))
+      allocate(weight(ng))
+      allocate(norm_list(3, ng))
 
-
-      !Solve the nodal system 
-
-      !Compute the multi_point flux
       do j = 1, mesh%vert(i)%n_sub_faces_neigh
         id_sub_face = mesh%vert(i)%sub_face_neigh(j)
         id_face = mesh%sub_face(id_sub_face)%mesh_face
@@ -529,7 +526,8 @@ contains
         ir   = mesh%sub_face(id_sub_face)%right_elem_neigh
         norm = mesh%sub_face(id_sub_face)%norm
 
-        xface = mesh%face(id_face)%coord !fix to get correct order
+        !xface = mesh%face(id_face)%coord !fix to get correct order
+        xface = mesh%vert(i)%coord
 
         wL = reconstruct(prim, grad, hess, il, xface, mesh%elem(il)%coord)
         if (ir > 0) then
@@ -540,18 +538,53 @@ contains
           wR = conserv_to_primit(sol_r)
         end if
 
+        sol_w_l(:, j) = wL
+        sol_w_r(:, j) = wR
+        lambda_l(j) = 0.0_DOUBLE
+        lambda_r(j) = 0.0_DOUBLE
+        weight(j) = mesh%sub_face(id_sub_face)%area
+        norm_list(:, j) = mesh%sub_face(id_sub_face)%norm
+      end do
+
+      !Solve the nodal system 
+      call compute_lambdas_and_solve_nodal_velocity_new(ng, weight,&
+         norm_list, lambda_l, lambda_r, sol_w_l, sol_w_r, v_node)
+
+      !Compute the multi_point flux
+      do j = 1, mesh%vert(i)%n_sub_faces_neigh
+        id_sub_face = mesh%vert(i)%sub_face_neigh(j)
+        id_face = mesh%sub_face(id_sub_face)%mesh_face
+        il   = mesh%sub_face(id_sub_face)%left_elem_neigh
+        ir   = mesh%sub_face(id_sub_face)%right_elem_neigh
+        norm = mesh%sub_face(id_sub_face)%norm
+
+        wL = sol_w_l(:, j)
+        wR = sol_w_r(:, j)
         flux = rusanov(wL, wR, norm) * mesh%sub_face(id_sub_face)%area
 
-        lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
-                     abs(dot_product(wR(2:4), norm)) + cs(wR)) * mesh%sub_face(id_sub_face)%area
+        ! Same as ns: zero normal nodal velocity on wall sub-faces
+        ! (re == 0 is the default wall in compute_right_state)
+        vn_nodal = dot_product(v_node, norm)
+        if (ir == 0) then
+          vn_nodal = 0.0_DOUBLE
+        else if (ir < 0) then
+          if (bc_euler_id(-ir) == BC_EULER_WALL) vn_nodal = 0.0_DOUBLE
+        end if
+        call multi_point(sol_w_l(:, j), sol_w_r(:, j), norm, lr_flux, vn_nodal, &
+          lambda_l(j), lambda_r(j), sl, sr)
 
-        rhs(:, il)  = rhs(:, il)  - flux
-        sum_lambda(il) = sum_lambda(il) + lambda
+        ! lr_flux is per unit area; lr_flux(:, 2) is already the right cell's
+        ! outgoing flux (multi_point negates it)
+        area = mesh%sub_face(id_sub_face)%area
+        rhs(:, il)  = rhs(:, il)  - area*lr_flux(:, 1)
+        sum_lambda(il) = sum_lambda(il) + max(0.0_DOUBLE, -sl)*area
         if (ir > 0) then
-          rhs(:, ir)     = rhs(:, ir)     + flux
-          sum_lambda(ir) = sum_lambda(ir) + lambda
+          rhs(:, ir)     = rhs(:, ir)     - area*lr_flux(:, 2)
+          sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*area
         end if
       end do
+
+      deallocate(sol_w_l, sol_w_r, lambda_l, lambda_r, weight, norm_list)
     end do
   end subroutine subface_flux_loop
 
@@ -974,431 +1007,93 @@ contains
   ! Internal subroutines
   ! ================================================================
 
-  ! Cell-centred least-squares polynomial reconstruction.
-  !
-  ! For each non-ghost cell i, collects all vertex-neighbours (cells sharing
-  ! at least one vertex), then fits a degree-(order-1) polynomial to their
-  ! mean values by solving the normal equations (A^T A) x = A^T b.
-  !
-  ! Polynomial basis (boundary_2d=T, i.e. 2D):
-  !   order 2: [dx, dy]                                    (2 coefficients)
-  !   order 3: [dx, dy, dx²/2, dx·dy, dy²/2]              (5 coefficients)
-  ! Full 3D:
-  !   order 2: [dx, dy, dz]                                (3 coefficients)
-  !   order 3: [dx, dy, dz, dx²/2, dx·dy, dx·dz,
-  !              dy²/2, dy·dz, dz²/2]                      (9 coefficients)
-  !
-  ! Coefficients are stored in the existing grad/hess arrays so that the
-  ! reconstruct() function needs no changes.
-  subroutine ls_reconstruction(mesh, prim, grad, hess)
+  ! Second geometric moment of each cell about its own centroid, so that
+  ! reconstruct()'s order-3 Taylor polynomial has the correct cell AVERAGE,
+  ! not just the correct centroid value (same as euler_ho's version).
+  subroutine compute_cell_moments(mesh)
+    type(mesh_type), intent(in) :: mesh
+
+    integer(kind=ENTIER) :: i, k, n_v, jj, kk
+    real(kind=DOUBLE), dimension(:, :), allocatable :: vcoords, pts
+    real(kind=DOUBLE), dimension(:), allocatable :: wts
+    real(kind=DOUBLE), dimension(3) :: xc
+
+    if (allocated(cell_moment)) deallocate(cell_moment)
+    allocate(cell_moment(3, 3, mesh%n_elems))
+    cell_moment = 0.0_DOUBLE
+
+    do i = 1, mesh%n_elems
+      n_v = mesh%elem(i)%n_vert
+      if (n_v /= 4 .and. n_v /= 5 .and. n_v /= 6 .and. n_v /= 8) cycle
+      allocate(vcoords(3, n_v))
+      do k = 1, n_v
+        vcoords(:, k) = mesh%vert(mesh%elem(i)%vert(k))%coord
+      end do
+      call volume_quad_pts(n_v, vcoords, 2_ENTIER, pts, wts)
+      deallocate(vcoords)
+
+      xc = mesh%elem(i)%coord
+      do jj = 1, 3
+        do kk = 1, 3
+          cell_moment(jj, kk, i) = sum(wts * (pts(jj, :) - xc(jj)) * (pts(kk, :) - xc(kk))) &
+            / max(mesh%elem(i)%volume, 1.0e-300_DOUBLE)
+        end do
+      end do
+      deallocate(pts, wts)
+    end do
+  end subroutine compute_cell_moments
+
+  ! Gradient (and Hessian at order >= 3) of the 5 primitives from
+  ! arbitrary_high_order_module, same settings as euler_ho's
+  ! aho_reconstruction: Green-Gauss nodal derivatives blended to the cells.
+  ! grad is exchanged across MPI ranks before being differentiated again,
+  ! since a ghost cell's vertex stencil can be incomplete.
+  subroutine aho_reconstruction(mesh, prim, grad, hess, num_procs, mpi_send_recv)
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: prim
     real(kind=DOUBLE), dimension(5, 3, mesh%n_elems), intent(inout) :: grad
     real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(inout) :: hess
+    integer, intent(in) :: num_procs
+    type(mpi_send_recv_type), intent(inout) :: mpi_send_recv
 
-    integer(kind=ENTIER) :: i, iv, mf, iface, il, ir, jn, kv, nv
-    integer(kind=ENTIER) :: n_coeff, n_neigh, n_needed
-    integer(kind=ENTIER) :: ring_start, ring_end, ic, ivv
-    integer(kind=ENTIER), dimension(500) :: neigh_list
-    real(kind=DOUBLE), allocatable :: Amat(:, :)
-    real(kind=DOUBLE), dimension(500) :: wt_arr   ! sqrt(1/dist) per neighbour
-    real(kind=DOUBLE), dimension(9, 9) :: ATA
-    real(kind=DOUBLE), dimension(9)    :: ATb, x_coeff
-    real(kind=DOUBLE) :: ddx, ddy, ddz, dist, wt, Lref, sdx, sdy, sdz
-    real(kind=DOUBLE), dimension(3) :: xci, xcj
+    real(kind=DOUBLE), dimension(:, :), allocatable :: grad_flat, hess_flat
+    integer(kind=ENTIER) :: e, v, dir1, dir2
 
-    if (boundary_2d) then
-      n_coeff = merge(5, 2, order >= 3)
-    else
-      n_coeff = merge(9, 3, order >= 3)
-    end if
+    aho_use_green_gauss = .true.
 
-    do i = 1, mesh%n_elems
-      if (mesh%elem(i)%is_ghost) cycle
+    ! Flat layout of the aho module: component (dir-1)*nc_in + v
+    allocate(grad_flat(15, mesh%n_elems))
+    call compute_next_order_derivative(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, &
+      prim, grad_flat, deriv_order=1_ENTIER)
+    if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 15_ENTIER, grad_flat)
 
-      xci    = mesh%elem(i)%coord
-      n_neigh = 0
-
-      ! Collect unique real vertex-neighbours of cell i (ring 1)
-      do nv = 1, mesh%elem(i)%n_vert
-        iv = mesh%elem(i)%vert(nv)
-        do mf = 1, mesh%vert(iv)%n_faces_neigh
-          iface = mesh%vert(iv)%face_neigh(mf)
-          call add_unique_neighbor(mesh%face(iface)%left_neigh)
-          call add_unique_neighbor(mesh%face(iface)%right_neigh)
+    do e = 1, mesh%n_elems
+      do dir1 = 1, 3
+        do v = 1, 5
+          grad(v, dir1, e) = grad_flat((dir1-1)*5 + v, e)
         end do
       end do
+    end do
 
-      ! Ring-expand (neighbours of neighbours, etc.) when the immediate
-      ! vertex-neighbour ring doesn't have enough cells to determine the
-      ! unknowns actually alive on THIS mesh -- e.g. a nominal order-3 fit
-      ! has 5 unknowns (boundary_2d: dx,dy,dxx,dxy,dyy), but on a
-      ! single-row-in-y mesh (subfv's Sod tube convention) every neighbour
-      ! shares the same y, so dy/dxy/dyy are identically zero columns and
-      ! only 2 unknowns (dx,dxx) are really determinable -- n_needed
-      ! (below) tracks that reduced count, recomputed as the ring grows,
-      ! so the stencil stays as narrow (and thus as locally accurate) as
-      ! the data actually require instead of always demanding the full,
-      ! nominal n_coeff neighbours even when most of those unknowns are
-      ! degenerate. Previously this used a fixed n_coeff target and simply
-      ! gave up (`cycle`, leaving grad=hess at their initialized 0) when
-      ! the immediate ring fell short of it, silently degrading every
-      ! order-3 ls_reconstruction cell to order 1 on the whole Sod-tube
-      ! mesh family. Mirrors arbitrary_high_order_module's
-      ! gather_ls_neighbors ring growth; the degeneracy detection mirrors
-      ! its compute_nodal_derivative_at_vertex direction-spread check.
-      ring_start = 1
-      do
-        n_needed = count_needed_coeffs()
-        if (n_neigh >= n_needed .or. n_neigh >= 500) exit
-        ring_end = n_neigh
-        do ic = ring_start, ring_end
-          do ivv = 1, mesh%elem(neigh_list(ic))%n_vert
-            iv = mesh%elem(neigh_list(ic))%vert(ivv)
-            do mf = 1, mesh%vert(iv)%n_faces_neigh
-              iface = mesh%vert(iv)%face_neigh(mf)
-              call add_unique_neighbor(mesh%face(iface)%left_neigh)
-              call add_unique_neighbor(mesh%face(iface)%right_neigh)
+    if (order >= 3 .and. allocated(hess)) then
+      allocate(hess_flat(45, mesh%n_elems))
+      call compute_next_order_derivative(mesh, 3_ENTIER, 15_ENTIER, boundary_2d, &
+        grad_flat, hess_flat, deriv_order=2_ENTIER)
+      if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 45_ENTIER, hess_flat)
+
+      do e = 1, mesh%n_elems
+        do dir2 = 1, 3
+          do dir1 = 1, 3
+            do v = 1, 5
+              hess(v, dir1, dir2, e) = hess_flat((dir2-1)*15 + (dir1-1)*5 + v, e)
             end do
           end do
         end do
-        if (ring_end == n_neigh) exit   ! stencil can't grow further (tiny/disconnected mesh)
-        ring_start = ring_end + 1
       end do
+      deallocate(hess_flat)
+    end if
 
-      if (n_neigh < n_needed) cycle   ! still under-determined after ring expansion: leave grad=0
-
-      allocate(Amat(n_neigh, n_coeff))
-
-      ! Characteristic length for THIS cell, used to nondimensionalize the
-      ! design matrix columns before solving (see Lref note below) --
-      ! cube root of the cell volume is a reasonable, cheap proxy for its
-      ! own size regardless of cell shape.
-      Lref = max(mesh%elem(i)%volume, 1.0e-300_DOUBLE)**(1.0_DOUBLE/3.0_DOUBLE)
-
-      ! Build the design matrix A weighted by w_j = 1/dist_j (inverse-distance).
-      ! Row j of Amat is scaled by sqrt(w_j) = 1/sqrt(dist_j) so that
-      ! ATA = A^T W A  and  ATb = A^T W b  (with W = diag(w_j)). Columns are
-      ! built from ddx/Lref etc (order-1 in the SCALED offset), not raw
-      ! ddx -- found necessary 2026-09-14: with raw offsets, the linear-term
-      ! columns (~dx*wt) and quadratic-term columns (~dx^2*wt) differ in
-      ! scale by a factor of ~1/dx, which at a fine mesh (dx=0.01) inflates
-      ! ATA's condition number enough to genuinely corrupt the solve (order-3
-      ! ls_reconstruction was found NOT exact -- Linf 5e-4 instead of machine
-      ! precision -- on a degree-2 test polynomial on a genuinely-3D
-      ! pseudo-1D mesh; a plain absolute-vs-relative pivot-tolerance fix,
-      ! tried first, made no difference, pointing at conditioning rather
-      ! than a threshold). x_coeff comes back in these SCALED units and is
-      ! divided back down by the matching power of Lref where grad/hess are
-      ! assigned below.
-      do jn = 1, n_neigh
-        xcj = mesh%elem(neigh_list(jn))%coord
-        ddx = xcj(1) - xci(1)
-        ddy = xcj(2) - xci(2)
-        ddz = xcj(3) - xci(3)
-        if (boundary_2d) then
-          dist = sqrt(ddx**2 + ddy**2)
-        else
-          dist = sqrt(ddx**2 + ddy**2 + ddz**2)
-        end if
-        wt = 1.0_DOUBLE / sqrt(max(dist, 1.0e-14_DOUBLE))   ! sqrt(1/dist)
-        wt_arr(jn) = wt
-        sdx = ddx / Lref
-        sdy = ddy / Lref
-        sdz = ddz / Lref
-
-        if (boundary_2d) then
-          Amat(jn, 1) = sdx * wt
-          Amat(jn, 2) = sdy * wt
-          if (order >= 3) then
-            Amat(jn, 3) = sdx * sdx * 0.5_DOUBLE * wt
-            Amat(jn, 4) = sdx * sdy             * wt
-            Amat(jn, 5) = sdy * sdy * 0.5_DOUBLE * wt
-          end if
-        else
-          Amat(jn, 1) = sdx * wt
-          Amat(jn, 2) = sdy * wt
-          Amat(jn, 3) = sdz * wt
-          if (order >= 3) then
-            Amat(jn, 4) = sdx * sdx * 0.5_DOUBLE * wt
-            Amat(jn, 5) = sdx * sdy             * wt
-            Amat(jn, 6) = sdx * sdz             * wt
-            Amat(jn, 7) = sdy * sdy * 0.5_DOUBLE * wt
-            Amat(jn, 8) = sdy * sdz             * wt
-            Amat(jn, 9) = sdz * sdz * 0.5_DOUBLE * wt
-          end if
-        end if
-      end do
-
-      ! Weighted normal matrix A^T W A  (n_coeff x n_coeff)
-      ATA(1:n_coeff, 1:n_coeff) = matmul(transpose(Amat), Amat)
-
-      ! Solve once per primitive variable (ATb = A^T W b)
-      do kv = 1, 5
-        ATb(1:n_coeff) = 0.0_DOUBLE
-        do jn = 1, n_neigh
-          ATb(1:n_coeff) = ATb(1:n_coeff) + Amat(jn, :) * wt_arr(jn) * &
-            (prim(kv, neigh_list(jn)) - prim(kv, i))
-        end do
-
-        call solve_ls(ATA, ATb, x_coeff, n_coeff)
-
-        ! x_coeff came back in Lref-scaled units (see Amat construction
-        ! above): d/dx = (1/Lref) d/d(sdx), d^2/dx^2 = (1/Lref^2) d^2/d(sdx)^2.
-        grad(kv, 1, i) = x_coeff(1) / Lref
-        grad(kv, 2, i) = x_coeff(2) / Lref
-        if (boundary_2d) then
-          grad(kv, 3, i) = 0.0_DOUBLE
-        else
-          grad(kv, 3, i) = x_coeff(3) / Lref
-        end if
-
-        if (order >= 3 .and. allocated(hess)) then
-          hess(kv, :, :, i) = 0.0_DOUBLE
-          if (boundary_2d) then
-            hess(kv, 1, 1, i) = x_coeff(3) / Lref**2
-            hess(kv, 1, 2, i) = x_coeff(4) / Lref**2
-            hess(kv, 2, 1, i) = x_coeff(4) / Lref**2
-            hess(kv, 2, 2, i) = x_coeff(5) / Lref**2
-          else
-            hess(kv, 1, 1, i) = x_coeff(4) / Lref**2
-            hess(kv, 1, 2, i) = x_coeff(5) / Lref**2
-            hess(kv, 2, 1, i) = x_coeff(5) / Lref**2
-            hess(kv, 1, 3, i) = x_coeff(6) / Lref**2
-            hess(kv, 3, 1, i) = x_coeff(6) / Lref**2
-            hess(kv, 2, 2, i) = x_coeff(7) / Lref**2
-            hess(kv, 2, 3, i) = x_coeff(8) / Lref**2
-            hess(kv, 3, 2, i) = x_coeff(8) / Lref**2
-            hess(kv, 3, 3, i) = x_coeff(9) / Lref**2
-          end if
-        end if
-
-      end do
-
-      deallocate(Amat)
-    end do
-
-  contains
-
-    ! Add cell `cand` to neigh_list(1:n_neigh) (host-associated, declared
-    ! above in ls_reconstruction) if it is a real, non-ghost cell other
-    ! than i itself and not already present.
-    subroutine add_unique_neighbor(cand)
-      integer(kind=ENTIER), intent(in) :: cand
-      integer(kind=ENTIER) :: jn
-      logical :: found
-
-      ! if (cand <= 0 .or. cand == i .or. mesh%elem(cand)%is_ghost) return
-      if (cand <= 0 .or. cand == i) return
-      found = .false.
-      do jn = 1, n_neigh
-        if (neigh_list(jn) == cand) then
-          found = .true.
-          exit
-        end if
-      end do
-      if (.not. found .and. n_neigh < 500) then
-        n_neigh = n_neigh + 1
-        neigh_list(n_neigh) = cand
-      end if
-    end subroutine add_unique_neighbor
-
-    ! Number of unknowns actually determinable from the CURRENT
-    ! neigh_list(1:n_neigh) (host-associated), given which raw coordinate
-    ! directions have any spread among these neighbours relative to i.
-    ! x is assumed always alive (a mesh degenerate even in x is not
-    ! handled specially). A degenerate y drops y itself and every
-    ! quadratic term involving it (xy, yy); same for z. Reduces exactly
-    ! to the nominal n_coeff (5 or 9 for order>=3, 2 or 3 otherwise) on
-    ! any ordinary 2D/3D mesh where all directions are alive.
-    function count_needed_coeffs() result(n_needed)
-      integer(kind=ENTIER) :: n_needed
-      real(kind=DOUBLE) :: spread_x, spread_y, spread_z
-      real(kind=DOUBLE) :: ddxj, ddyj, ddzj
-      logical :: y_alive, z_alive
-      integer(kind=ENTIER) :: jn2, n_lin
-
-      spread_x = 0.0_DOUBLE
-      spread_y = 0.0_DOUBLE
-      spread_z = 0.0_DOUBLE
-      do jn2 = 1, n_neigh
-        ddxj = mesh%elem(neigh_list(jn2))%coord(1) - xci(1)
-        ddyj = mesh%elem(neigh_list(jn2))%coord(2) - xci(2)
-        ddzj = mesh%elem(neigh_list(jn2))%coord(3) - xci(3)
-        spread_x = max(spread_x, abs(ddxj))
-        spread_y = max(spread_y, abs(ddyj))
-        spread_z = max(spread_z, abs(ddzj))
-      end do
-
-      y_alive = spread_y >= 1.0e-8_DOUBLE * max(spread_x, 1.0e-300_DOUBLE)
-      z_alive = (.not. boundary_2d) .and. &
-        (spread_z >= 1.0e-8_DOUBLE * max(spread_x, 1.0e-300_DOUBLE))
-
-      n_lin = 1
-      if (y_alive) n_lin = n_lin + 1
-      if (z_alive) n_lin = n_lin + 1
-
-      n_needed = n_lin
-      if (order >= 3) n_needed = n_needed + n_lin * (n_lin + 1) / 2
-    end function count_needed_coeffs
-
-  end subroutine ls_reconstruction
-
-  ! Solves ATA_in * x = rhs_in (ATA_in = A^T W A, a Gram/normal matrix,
-  ! always symmetric PSD). Drops directions with no information in the
-  ! data -- e.g. the y-gradient unknown on a mesh that is a single row of
-  ! cells in y (ls_reconstruction's Sod-tube mesh: boundary_2d, every
-  ! neighbour at the same y, so the whole y-row/column of ATA is exactly
-  ! zero) -- and solves only the reduced, well-posed subsystem for the
-  ! rest, rather than giving up on the whole vector.
-  !
-  ! BUG FIXED (previously): a plain Gaussian elimination with partial
-  ! pivoting returned x=0 for EVERY unknown, including well-determined
-  ! ones, the instant it hit any near-zero pivot -- so on the Sod mesh
-  ! above, the perfectly-determined x-gradient was ALSO silently zeroed
-  ! alongside the genuinely-degenerate y one, making ls_reconstruction
-  ! produce bit-identical output to plain order 1 at every order (2 and
-  ! 3) on that whole mesh family. Because ATA is a Gram matrix, a
-  ! genuinely-degenerate direction j has its ENTIRE row/column j equal to
-  ! zero (not just a small pivot reached after row operations), so this
-  ! is detected directly from the untouched input, up front, rather than
-  ! discovered mid-elimination -- and only actually-degenerate directions
-  ! are dropped.
-  subroutine solve_ls(ATA_in, rhs_in, x, n)
-    integer(kind=ENTIER), intent(in) :: n
-    real(kind=DOUBLE), dimension(9, 9), intent(in) :: ATA_in
-    real(kind=DOUBLE), dimension(9),    intent(in) :: rhs_in
-    real(kind=DOUBLE), dimension(9),    intent(out) :: x
-
-    integer(kind=ENTIER), dimension(9) :: idx
-    integer(kind=ENTIER) :: n_keep, ii, jj, fail_at
-    real(kind=DOUBLE), dimension(9, 9) :: ATA_red
-    real(kind=DOUBLE), dimension(9) :: rhs_red, x_red
-    real(kind=DOUBLE) :: col_tol
-
-    x = 0.0_DOUBLE
-
-    ! Relative to the matrix's own scale, same reasoning as gauss_solve's
-    ! piv_tol: an absolute floor here misclassifies a genuinely-alive but
-    ! naturally-small quadratic-term column (scale ~dx^2*wt, vs ~dx*wt for
-    ! the linear-term columns) as degenerate purely from that scale gap.
-    col_tol = 1.0e-12_DOUBLE * maxval(abs(ATA_in(1:n, 1:n)))
-
-    n_keep = 0
-    do jj = 1, n
-      if (any(abs(ATA_in(1:n, jj)) > col_tol)) then
-        n_keep = n_keep + 1
-        idx(n_keep) = jj
-      end if
-    end do
-
-    ! Iteratively solve the currently-active subset (idx(1:n_keep)); if
-    ! gauss_solve hits a genuinely-degenerate pivot MID-elimination (a
-    ! direction that looked alive column-wise above but turns out to be a
-    ! linear combination of others once the others are eliminated against
-    ! it -- e.g. a symmetric structured-mesh stencil where some quadratic
-    ! cross-term direction is exactly indeterminate), drop just that one
-    ! direction and retry with the rest, rather than discarding the whole
-    ! vector. Found necessary 2026-09-14: on a genuinely-3D pseudo-1D mesh
-    ! (regular hex cells), the old single-shot gauss_solve threw away
-    ! EVERY coefficient, including perfectly well-determined ones like the
-    ! plain x-gradient, the moment ANY one of the 9 order-3 directions hit
-    ! a degenerate pivot -- caught because order-3 ls_reconstruction was
-    ! found not exact (Linf 5e-4, not machine precision) on a degree-2
-    ! test polynomial on that mesh.
-    do
-      if (n_keep == 0) return
-
-      do ii = 1, n_keep
-        do jj = 1, n_keep
-          ATA_red(ii, jj) = ATA_in(idx(ii), idx(jj))
-        end do
-        rhs_red(ii) = rhs_in(idx(ii))
-      end do
-
-      call gauss_solve(ATA_red, rhs_red, x_red, n_keep, fail_at)
-
-      if (fail_at == 0) then
-        do ii = 1, n_keep
-          x(idx(ii)) = x_red(ii)
-        end do
-        return
-      end if
-
-      ! Drop the direction that failed and retry with the rest.
-      do ii = fail_at, n_keep - 1
-        idx(ii) = idx(ii + 1)
-      end do
-      n_keep = n_keep - 1
-    end do
-  end subroutine solve_ls
-
-  ! Gaussian elimination with partial pivoting for small dense systems.
-  ! Solves ATA_in * x = rhs_in. On a degenerate pivot at step jj, returns
-  ! immediately with fail_at=jj (x left at 0) instead of guessing --
-  ! solve_ls's caller loop drops direction jj and retries with the rest,
-  ! rather than discarding every other, well-determined direction along
-  ! with the one genuinely-degenerate one (see solve_ls's own comment).
-  ! fail_at=0 signals a complete, successful solve.
-  subroutine gauss_solve(ATA_in, rhs_in, x, n, fail_at)
-    integer(kind=ENTIER), intent(in) :: n
-    real(kind=DOUBLE), dimension(9, 9), intent(in) :: ATA_in
-    real(kind=DOUBLE), dimension(9),    intent(in) :: rhs_in
-    real(kind=DOUBLE), dimension(9),    intent(out) :: x
-    integer(kind=ENTIER), intent(out) :: fail_at
-
-    real(kind=DOUBLE), dimension(9, 10) :: aug
-    integer(kind=ENTIER) :: ii, jj, kk, piv_row
-    real(kind=DOUBLE) :: pivot_val, fac, tmp, piv_tol
-
-    x = 0.0_DOUBLE
-    fail_at = 0
-    aug(:, 1:n)  = ATA_in(1:9, 1:n)
-    aug(:, n+1)  = rhs_in
-
-    ! Degeneracy threshold RELATIVE to the matrix's own scale, not an
-    ! absolute constant -- an absolute floor misclassifies a legitimately
-    ! nonzero but naturally-small pivot (e.g. from a quadratic-term
-    ! column, scale ~dx^2*wt, vs ~dx*wt for linear-term columns) as
-    ! degenerate purely from that scale gap, not from true rank-deficiency.
-    piv_tol = 1.0e-12_DOUBLE * maxval(abs(ATA_in(1:n, 1:n)))
-
-    do jj = 1, n
-      piv_row   = jj
-      pivot_val = abs(aug(jj, jj))
-      do ii = jj + 1, n
-        if (abs(aug(ii, jj)) > pivot_val) then
-          pivot_val = abs(aug(ii, jj))
-          piv_row   = ii
-        end if
-      end do
-
-      if (piv_row /= jj) then
-        do kk = jj, n + 1
-          tmp            = aug(jj,      kk)
-          aug(jj,      kk) = aug(piv_row, kk)
-          aug(piv_row, kk) = tmp
-        end do
-      end if
-
-      if (abs(aug(jj, jj)) < piv_tol) then
-        fail_at = jj
-        return
-      end if
-
-      do ii = jj + 1, n
-        fac = aug(ii, jj) / aug(jj, jj)
-        aug(ii, jj:n+1) = aug(ii, jj:n+1) - fac * aug(jj, jj:n+1)
-      end do
-    end do
-
-    do ii = n, 1, -1
-      x(ii) = aug(ii, n + 1)
-      do kk = ii + 1, n
-        x(ii) = x(ii) - aug(ii, kk) * x(kk)
-      end do
-      x(ii) = x(ii) / aug(ii, ii)
-    end do
-  end subroutine gauss_solve
+    deallocate(grad_flat)
+  end subroutine aho_reconstruction
 
 end module silvia_base_module

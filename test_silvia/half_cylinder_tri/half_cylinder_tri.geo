@@ -1,5 +1,6 @@
-insize=0.04;
-outsize=0.08;
+// coarse mesh (fine: insize=0.04; outsize=0.08;)
+insize=0.15;
+outsize=0.30;
 Point(1) = {-1, 0, 0, 1.0};
 Extrude {-1.5, 0, 0} { Point{1}; }
 Extrude {{0, 0, 1}, {0, 0, 0}, Pi/2} { Curve{1}; }
