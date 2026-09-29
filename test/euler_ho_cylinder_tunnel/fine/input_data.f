@@ -20,7 +20,7 @@
   aho_method = 1
   use_weno_blend = .true.
   use_cweno_center = .false.
-  eps_weight_num_gg = 1.0e-6
+  eps_weight_num = 1.0e-6
   use_max_lambda_dt = .true.
   n_sol_vtu = 10
   compute_error = .false.

@@ -13,9 +13,6 @@ module euler_ho_module
     aho_module_cweno_center_weight => cweno_center_weight, &
     aho_module_cweno_center_power => cweno_center_power, &
     aho_module_eps_weight_num => eps_weight_num, &
-    aho_module_eps_weight_num_deep => eps_weight_num_deep, &
-    aho_module_eps_weight_num_gg => eps_weight_num_gg, &
-    aho_module_eps_weight_num_deep_gg => eps_weight_num_deep_gg, &
     aho_module_weno_power => weno_power, &
     aho_module_grad_norm_derate => grad_norm_derate, &
     aho_module_grad_norm_derate_gg => grad_norm_derate_gg, &
@@ -71,10 +68,10 @@ module euler_ho_module
   logical, public :: use_grad_bias_correction  = .true.
   logical, public :: use_rk4 = .false.
   logical, public :: use_max_lambda_dt = .false.
+  ! Single WENO floor (weight=1/(eps+OI^p)), same value at every recursion level and for both LS
+  ! and GG -- see arbitrary_high_order_module's own eps_weight_num declaration for why a separate,
+  ! larger floor for hess/third was dropped rather than kept as an unused knob.
   real(kind=DOUBLE), public :: eps_weight_num      = 1.0e-2_DOUBLE
-  real(kind=DOUBLE), public :: eps_weight_num_deep = 1.0_DOUBLE
-  real(kind=DOUBLE), public :: eps_weight_num_gg = 1.0e-2_DOUBLE
-  real(kind=DOUBLE), public :: eps_weight_num_deep_gg = 1.0_DOUBLE
   integer(kind=ENTIER), public :: weno_power       = 1
   real(kind=DOUBLE), public :: grad_norm_derate    = 1.0e4_DOUBLE
   real(kind=DOUBLE), public :: grad_norm_derate_gg = 1.0e4_DOUBLE
@@ -217,8 +214,8 @@ contains
       compute_error, error_2d, aho_method, kill_recons, use_weno_blend, &
       use_cweno_center, cweno_center_weight, cweno_center_power, use_grad_bias_correction, use_rk4, &
       use_max_lambda_dt, flux_scheme, &
-      eps_weight_num, eps_weight_num_deep, weno_power, grad_norm_derate, &
-      grad_norm_derate_gg, use_alt_gg_weight, eps_weight_num_gg, eps_weight_num_deep_gg, &
+      eps_weight_num, weno_power, grad_norm_derate, &
+      grad_norm_derate_gg, use_alt_gg_weight, &
       n_adapt_cycles, adapt_start_iter, adapt_interval_iter, &
       adapt_grad_threshold, adapt_max_move_frac, adapt_relax
 
@@ -916,13 +913,10 @@ contains
     aho_module_cweno_center_weight = cweno_center_weight
     aho_module_cweno_center_power = cweno_center_power
     aho_module_eps_weight_num = eps_weight_num
-    aho_module_eps_weight_num_deep = eps_weight_num_deep
     aho_module_weno_power = weno_power
     aho_module_grad_norm_derate = grad_norm_derate
     aho_module_grad_norm_derate_gg = grad_norm_derate_gg
     aho_module_use_alt_gg_weight = use_alt_gg_weight
-    aho_module_eps_weight_num_gg = eps_weight_num_gg
-    aho_module_eps_weight_num_deep_gg = eps_weight_num_deep_gg
 
     if (aho_flat_buf_n_elems /= mesh%n_elems) then
       if (allocated(grad_flat_buf)) deallocate(grad_flat_buf, hess_flat_buf, third_flat_buf)
