@@ -26,6 +26,63 @@ target_link_libraries(core PUBLIC MPI::MPI_Fortran LAPACK::LAPACK BLAS::BLAS)
 set_target_properties(core PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mod/core)
 target_include_directories(core PUBLIC ${CMAKE_BINARY_DIR}/mod/core)
 
+# ── Parallel CGNS reading + in-code partitioning (src/partition/) ─────────────
+# A .cgns meshfile is then read block-wise by every rank, partitioned
+# (ParMETIS) and given its node-based ghost layer in the code itself, with
+# no subfv-gmsh pre-partitioning. Needs CGNS built on parallel HDF5 and,
+# optionally, ParMETIS (otherwise only SUBFV_PARTITIONER=block is available).
+option(SUBFV_ENABLE_CGNS "Read .cgns meshes in parallel with in-code partitioning" ON)
+if(SUBFV_ENABLE_CGNS)
+  set(CGNS_ROOT "$ENV{HOME}/opt/cgns" CACHE PATH "CGNS install prefix")
+  set(HDF5_ROOT "$ENV{HOME}/opt/hdf5" CACHE PATH "HDF5 (parallel) install prefix")
+  set(PARMETIS_ROOT "$ENV{HOME}/opt/parmetis" CACHE PATH "ParMETIS/METIS/GKlib install prefix")
+  find_library(CGNS_LIBRARY cgns HINTS ${CGNS_ROOT}/lib)
+  find_path(CGNS_MOD_DIR cgns.mod HINTS ${CGNS_ROOT}/include)
+  find_library(HDF5_C_LIBRARY hdf5 HINTS ${HDF5_ROOT}/lib NO_DEFAULT_PATH)
+  if(NOT CGNS_LIBRARY OR NOT CGNS_MOD_DIR OR NOT HDF5_C_LIBRARY)
+    message(WARNING "subfv: CGNS/HDF5 not found (CGNS_ROOT=${CGNS_ROOT}, HDF5_ROOT=${HDF5_ROOT}): "
+      "building WITHOUT the parallel .cgns reader (.msh + subfv-gmsh only)")
+    set(SUBFV_ENABLE_CGNS OFF)
+  endif()
+endif()
+if(SUBFV_ENABLE_CGNS)
+  target_sources(core PRIVATE
+    src/partition/dist_utils_module.F90
+    src/partition/cgns_dist_read_module.F90
+    src/partition/dist_mesh_module.F90
+  )
+  target_include_directories(core PUBLIC ${CGNS_MOD_DIR})
+  target_compile_definitions(core PRIVATE SUBFV_HAVE_CGNS)
+  target_link_libraries(core PUBLIC ${CGNS_LIBRARY} ${HDF5_C_LIBRARY})
+
+  find_library(PARMETIS_LIBRARY parmetis HINTS ${PARMETIS_ROOT}/lib NO_DEFAULT_PATH)
+  find_library(METIS_LIBRARY metis HINTS ${PARMETIS_ROOT}/lib NO_DEFAULT_PATH)
+  find_library(GKLIB_LIBRARY GKlib HINTS ${PARMETIS_ROOT}/lib NO_DEFAULT_PATH)
+  # ParMETIS is called directly from Fortran (its own Fortran entry points), which
+  # requires 32-bit idx_t/real_t to match integer(c_int)/real(c_float).
+  find_file(METIS_HEADER metis.h HINTS ${PARMETIS_ROOT}/include NO_DEFAULT_PATH)
+  if(METIS_HEADER)
+    file(STRINGS ${METIS_HEADER} METIS_IDXW REGEX "^#define IDXTYPEWIDTH")
+    file(STRINGS ${METIS_HEADER} METIS_REALW REGEX "^#define REALTYPEWIDTH")
+    if(NOT METIS_IDXW MATCHES "32" OR NOT METIS_REALW MATCHES "32")
+      message(WARNING "subfv: ParMETIS not built with 32-bit idx_t/real_t, ignoring it")
+      set(PARMETIS_LIBRARY PARMETIS_LIBRARY-NOTFOUND)
+    endif()
+  endif()
+  if(PARMETIS_LIBRARY AND METIS_LIBRARY)
+    target_compile_definitions(core PRIVATE SUBFV_HAVE_PARMETIS)
+    target_link_libraries(core PUBLIC ${PARMETIS_LIBRARY} ${METIS_LIBRARY})
+    if(GKLIB_LIBRARY)
+      target_link_libraries(core PUBLIC ${GKLIB_LIBRARY})
+    endif()
+    # the static ParMETIS archive needs the C MPI library, placed after it (--as-needed)
+    target_link_libraries(core PUBLIC ${MPI_mpi_LIBRARY})
+    message(STATUS "subfv: CGNS reader with ParMETIS partitioning")
+  else()
+    message(STATUS "subfv: CGNS reader without ParMETIS (block partition only)")
+  endif()
+endif()
+
 # ── NS library (partagée par subfvns et subfvshear) ───────────────────────────
 add_library(ns STATIC
   src/ns/ns_global_data_module.F90

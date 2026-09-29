@@ -3,6 +3,9 @@ module mesh_reading_module
   use precision_module
   use mesh_module
   use sort_module
+#ifdef SUBFV_HAVE_CGNS
+  use dist_mesh_module, only: read_mesh_cgns_dist
+#endif
   implicit none
 
   private
@@ -165,6 +168,23 @@ contains
     integer(kind=ENTIER) :: funit, ppos
     character(len=255) :: text, me_str, mpi_meshfile
     real(kind=DOUBLE) :: version
+
+    ! A .cgns mesh is read by every rank block-wise and partitioned in the
+    ! code (src/partition/), no subfv-gmsh pre-split files involved.
+    ppos = scan(trim(meshfile), ".", BACK=.TRUE.)
+    if (ppos > 0) then
+      if (trim(meshfile(ppos:)) == ".cgns") then
+#ifdef SUBFV_HAVE_CGNS
+        call read_mesh_cgns_dist(mesh, meshfile_path, meshfile, n_bc, bc_name, me, &
+          num_procs, mpi_send_recv)
+        return
+#else
+        print *, achar(27)//"[31m[-] .cgns mesh given but subfv was built without "// &
+          "-DSUBFV_ENABLE_CGNS=ON"//achar(27)//"[0m"
+        error stop
+#endif
+      end if
+    end if
 
     if (num_procs > 1) then
       ppos = scan(trim(meshfile), ".", BACK=.TRUE.)
