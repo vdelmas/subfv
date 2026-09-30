@@ -307,6 +307,22 @@ contains
         error stop
       end if
     end do
+    ! Parse scheme string to integer ID
+    t = trim(adjustl(scheme))
+    if (t == "multi_point") then
+      scheme_id = SCHEME_MULTI_POINT
+    else if (t == "multi_point_iso") then
+      scheme_id = SCHEME_MULTI_POINT_ISO
+    else if (t == "three_wave") then
+      scheme_id = SCHEME_THREE_WAVE
+    else if (t == "two_wave") then
+      scheme_id = SCHEME_TWO_WAVE
+    else if (t == "modified_three_wave") then
+      scheme_id = SCHEME_MODIFIED_THREE_WAVE
+    else
+      print *, "ERROR: scheme unrecognized: '", trim(t), "'"
+      error stop
+    end if
   end subroutine init_flags
 
   pure function primit_to_conserv(w) result(u)
@@ -576,9 +592,17 @@ contains
         ! lr_flux is per unit area; lr_flux(:, 2) is already the right cell's
         ! outgoing flux (multi_point negates it)
         area = mesh%sub_face(id_sub_face)%area
+
+        lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
+                 abs(dot_product(wR(2:4), norm)) + cs(wR)) * mesh%sub_face(id_sub_face)%area
+
+        ! rhs(:, il)  = rhs(:, il)  - flux
+        ! sum_lambda(il) = sum_lambda(il) + lambda
         rhs(:, il)  = rhs(:, il)  - area*lr_flux(:, 1)
         sum_lambda(il) = sum_lambda(il) + max(0.0_DOUBLE, -sl)*area
         if (ir > 0) then
+          ! rhs(:, ir)  = rhs(:, ir)  + flux
+          ! sum_lambda(ir) = sum_lambda(ir) + lambda
           rhs(:, ir)     = rhs(:, ir)     - area*lr_flux(:, 2)
           sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*area
         end if
