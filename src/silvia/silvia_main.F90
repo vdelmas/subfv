@@ -41,7 +41,7 @@ program main
     ns_boundary_2d = boundary_2d
     call init_flags()
 
-    if (me == 0) print *, "SUBFV METHOD ORDER ", order
+    if (me == 0) print *, "SUBFV METHOD ORDER ", order, "TYPE ", scheme_id
 
     call read_mesh_msh(mesh, meshfile_path, meshfile, &
         n_bc, bc_name, me, num_procs, mpi_send_recv)
@@ -76,9 +76,11 @@ program main
     ! call face_geometry(mesh)
 
     t=0.0_DOUBLE
+    dt=0.0_DOUBLE
     iter=0
     iter_write_sol = 0
     call write_vtu(mesh, sol, me, iter_write_sol)
+    if (me==0) print*, 'output save at iter=', iter, ' dt=', dt, ' time=', t
     iter_write_sol = 1
     
     do while (t<tmax .AND. iter<n_max_iter)
@@ -94,8 +96,6 @@ program main
       call compute_rhs(mesh, sol, sol_w, grad, hess, rhs, sum_lambda, t, num_procs, mpi_send_recv)
       call compute_dt(mesh, sum_lambda, dt)
       call MPI_ALLREDUCE(MPI_IN_PLACE, dt, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
-
-      if (me == 0) print *, "t=", t, "dt=", dt, "tmax=", tmax, "cfl=", cfl
 
       select case (order)
         case (1)
@@ -144,9 +144,10 @@ program main
         end select
 
       ! Periodic output
-      ! if (n_iter_write_sol > 1) then
-        ! if (t >= real(iter_write_sol, DOUBLE) * tmax / real(n_iter_write_sol - 1, DOUBLE)) then
+      if (n_iter_write_sol > 1) then
+        if (t >= real(iter_write_sol, DOUBLE) * tmax / real(n_iter_write_sol - 1, DOUBLE)) then
           call write_vtu(mesh, sol, me, iter_write_sol)
+          if (me==0) print*, 'output save at iter=', iter, ' dt=', dt, ' time=', t
           if (compute_error) then
             call compute_error_test(mesh, sol, t, 1.0_DOUBLE, h_err, l2err)
             call MPI_ALLREDUCE(MPI_IN_PLACE, h_err, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
@@ -154,23 +155,15 @@ program main
             if (me == 0) print *, "t=", t, "h=", h_err, "L2(rho)=", l2err
           end if
           iter_write_sol = iter_write_sol + 1
-      !   end if
-      ! end if
-      
-      ! print*, 'iter=', iter, ' dt=', dt, ' time=', t
+        end if
+      end if
       t = t + dt
       iter = iter + 1
-      ! call write_vtu(mesh, sol, 0, iter)
     end do
-
-    ! call count_elems(mesh,n_elems_loc,n_elems_ghost)
-    ! print*, "rank", me, "n_elems_locali", n_elems_loc, "n_elems_ghost", n_elems_ghost
-
-    ! call MPI_ALLREDUCE(n_elems_loc, n_elems_tot, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
-    ! print*, "rank", me, "n_elems_totali", n_elems_tot      
 
     ! Final output
     call write_vtu(mesh, sol, me, -1)
+    if (me==0) print*, 'output save at iter=', iter, ' dt=', dt, ' time=', t
     if (compute_error) then
       call compute_error_test(mesh, sol, t, 1.0_DOUBLE, h_err, l2err)
       call MPI_ALLREDUCE(MPI_IN_PLACE, h_err, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
