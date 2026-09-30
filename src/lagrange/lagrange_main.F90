@@ -23,6 +23,9 @@ program main
   real(kind=DOUBLE) :: cfl, cfl_max = 0.8, b2d_h = 1.0
   real(kind=DOUBLE) :: h_extrude = 1.0
   integer(kind=ENTIER) :: init = 0
+  ! Diagnostic: drop boundary vertices from the o2 nodal gradient fit, as the Euler
+  ! code does, instead of mirroring. Default .false. = behaviour unchanged.
+  logical :: grad_bound_skip = .false.
   character(len=255) :: scheme = ""
   character(len=255), dimension(n_max_bc) :: bc_name
   character(len=255), dimension(n_max_bc) :: bc_type
@@ -63,10 +66,14 @@ program main
     meshfile_path, meshfile, &
     t_max, cfl, &
     init, &
+    grad_bound_skip, &
+    lambda_acoustic_only, ppvp_jump_mode, ppvp_nodal_average, diag_entropy, &
+    sedov_nodal_deposit, sedov_energy, &
     scheme, method_length, b2d_h, &
     n_bc, bc_name, bc_type, bc_val, &
     sol_uniform, boundary_2d, &
-    n_sol_vtu, second_order, iso_weight_mode, compute_error, grad_weno, grad_gg_corrected, grad_eps_weno
+    n_sol_vtu, second_order, iso_weight_mode, compute_error, grad_weno, grad_gg_corrected, grad_eps_weno, &
+    gresho_mach, gamma_uniform
 
   call MPI_INIT(mpi_ierr)
   call MPI_COMM_SIZE(MPI_COMM_WORLD, num_procs, mpi_ierr)
@@ -75,6 +82,20 @@ program main
   open(newunit=fn, file="input_data.f")
   read(unit=fn, nml=INPUT_PARAM)
   close(fn)
+
+  ! "classic_rhoa" is the EUCCLHYD-original variant of "classic": the sub-face
+  ! swept-mass coefficient uses the pure acoustic impedance lambda = rho*a,
+  ! without the pressure-/velocity-jump (Dukowicz-like) terms. Selecting it by
+  ! scheme name rather than by the lambda_acoustic_only namelist flag alone
+  ! keeps the two variants distinguishable in a campaign's inputs and logs.
+  if (scheme == "classic_rhoa") lambda_acoustic_only = .true.
+  if (me == 0) then
+    if (lambda_acoustic_only) then
+      print*, "lambda = rho*a (EUCCLHYD original)"
+    else
+      print*, "lambda = max(rho*a, pressure-jump, velocity-jump)"
+    end if
+  end if
 
   call read_mesh_msh(mesh, meshfile_path, meshfile, &
     n_bc, bc_name, me, num_procs, mpi_send_recv)
@@ -116,7 +137,12 @@ program main
   allocate(gamma_arr(mesh%n_elems))
   allocate(vp_is_imposed(mesh%n_vert))
 
-  if (init == 5) then
+  ! gamma_uniform > 0 overrides the per-init default. Needed for the *classic*
+  ! Noh problem, which is posed with gamma = 5/3 (post-shock rho = 16 in 2D
+  ! cylindrical, shock at r = t/3) whereas init == 3 defaults to 1.4 here.
+  if (gamma_uniform > 0.0_DOUBLE) then
+    gamma_arr = gamma_uniform
+  else if (init == 5) then
     gamma_arr = 5.0_DOUBLE / 3.0_DOUBLE
   else
     gamma_arr = 1.4_DOUBLE
@@ -197,14 +223,14 @@ program main
     if (second_order) then
       call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)
       call compute_gradients(mesh, sol, gamma_arr, dt, grad_v, grad_p, div_v, p_limited, grad_weno, &
-        grad_gg_corrected, grad_eps_weno)
+        grad_gg_corrected, grad_eps_weno, bound_skip=grad_bound_skip)
       ! Exchange ghost cell gradients so second-order RHS can reconstruct across MPI boundaries
       call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 3, grad_p)
       call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 9, grad_v)
       call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 1, div_v)
     end if
 
-    if( scheme == "classic" ) then
+    if( scheme == "classic" .or. scheme == "classic_rhoa" ) then
       call compute_rhs_lagrange(mesh, sol, vp, &
         dt, rhs, n_bc, bc_type, bc_val, boundary_2d, mass, gamma_arr, vp_is_imposed, &
         second_order, grad_v, grad_p, div_v, alpha_p_arr)
@@ -225,6 +251,19 @@ program main
       call compute_rhs_lagrange_sidil(mesh, sol, vp, &
         dt, rhs, n_bc, bc_type, bc_val, boundary_2d, mass, method_length, h_extrude, &
         gamma_arr, vp_is_imposed, h_p_arr)
+    else if( scheme == "vp_ep" ) then
+      ! vitesse nodale + energie nodale, puis solveur 1D par sous-face.
+      call compute_rhs_lagrange_vp_ep(mesh, sol, vp, &
+        dt, rhs, n_bc, bc_type, bc_val, boundary_2d, mass, gamma_arr, vp_is_imposed, &
+        second_order, grad_v, grad_p, div_v)
+    else if( scheme == "vp_pp" .or. scheme == "nodal_vp" .or. scheme == "vp_pp_ppvp" ) then
+      ! vitesse nodale ET pression nodale, toutes deux issues de systemes nodaux :
+      ! pas de h_p, donc aucune dependance a method_length / b2d_h.
+      ! "nodal_vp" est l'ancien nom du schema, conserve en alias : beaucoup de
+      ! input_data.f de runs deja effectues le portent encore.
+      call compute_rhs_lagrange_vp_pp(mesh, sol, vp, &
+        dt, rhs, n_bc, bc_type, bc_val, boundary_2d, mass, gamma_arr, vp_is_imposed, &
+        second_order, grad_v, grad_p, div_v, scheme == "vp_pp_ppvp")
     else
       print*, "No scheme !"
       error stop
@@ -253,6 +292,8 @@ program main
     call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)
     t = t + dt
     if( mod(iter, 100) == 0 .and. me == 0 ) print*, t, dt
+    if( diag_entropy .and. mod(iter, 100) == 0 ) &
+      call print_entropy_diag(mesh, t, me, num_procs)
 
     if( t >= i_sol_vtu * t_max / real(n_sol_vtu - 1) ) then
       write(fln, *) i_sol_vtu

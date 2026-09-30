@@ -11,6 +11,64 @@ module lagrange_module
 
   real(kind=DOUBLE), parameter :: gamma = 7.0_DOUBLE/5.0_DOUBLE
 
+  ! .true. = impedance acoustique pure z_c = rho_c a_c dans la matrice de coin, comme
+  ! EUCCLHYD d'origine. .false. (defaut) = comportement historique de ce code.
+  logical, public :: lambda_acoustic_only = .false.
+  ! Terme de saut X de la 3e quantite nodale du schema 'vp_pp_ppvp' (voir
+  ! compute_rhs_lagrange_vp_pp). 'vp_dv' : X = (u_p.n)(v_r - v_l), seule forme qui
+  ! soit a la fois homogene a v^2 ET anti-invariante par retournement de la face.
+  ! Avec ce choix q_bar = v_node * p_bar : c'est exactement la construction de pp,
+  ! portee par la vitesse nodale de la face. 'dp' : le saut porte sur p au lieu de
+  ! v, rendu homogene par les impedances -- conserve pour comparaison.
+  character(len=16), public :: ppvp_jump_mode = 'vp_dv'
+  ! .true. : ppvp est UNE valeur par noeud (moyenne en 1/lambda sur les sous-faces),
+  ! comme pp. Mesure : une sous-face dont la vitesse nodale est orthogonale a la
+  ! normale ne balaie aucun volume, donc son flux d'energie consistant est nul --
+  ! mais la valeur nodale lui est appliquee quand meme. Sur le petit disque, 48
+  ! sous-faces dans ce cas, et exactement 48 valeurs NaN : dans un ambiant a 1e-12
+  ! d'energie interne, ce flux parasite la rend negative immediatement.
+  ! .false. : ppvp est evalue PAR SOUS-FACE, q_bar = p_bar * v_et, qui s'annule de
+  ! lui-meme quand la sous-face ne travaille pas.
+  logical, public :: ppvp_nodal_average = .true.
+
+  ! --- diagnostic de production d'entropie -----------------------------------
+  ! Pour une maille c, en partant des equations semi-discretes et de Gibbs :
+  !   m T ds/dt = somme_f A_f (p_c - Pi_f) (u_p - u_c).n_f      [entropy_prod]
+  ! Avec la fermeture UNILATERALE Pi_f = p_c - lambda_c (u_p-u_c).n_f cela vaut
+  !   somme_f A_f lambda_c [(u_p-u_c).n_f]^2 >= 0               [entropy_ref]
+  ! qui est positif par construction. 'vp_pp' utilise au contraire UNE pression
+  ! nodale pp commune aux deux cotes, donc (p_c - pp) n'a aucun signe impose et
+  ! rien ne garantit entropy_prod >= 0. Le rapport entropy_prod/entropy_ref dit
+  ! de combien on s'ecarte de la dissipation qu'on aurait avec l'unilateral.
+  logical, public :: diag_entropy = .false.
+  real(kind=DOUBLE), allocatable, public :: entropy_prod(:), entropy_ref(:)
+
+  ! Energie nodale du schema 'vp_ep', une valeur par noeud (cf.
+  ! compute_rhs_lagrange_vp_ep). Publique pour pouvoir etre relue/ecrite.
+  real(kind=DOUBLE), allocatable, public :: ep_node(:)
+
+  ! Sedov (init=1) : ou deposer l'energie.
+  ! .false. (defaut) = comportement historique, tout dans l'UNIQUE cellule dont le
+  !   centroide est le plus proche de l'origine.
+  ! .true.  = si un SOMMET du maillage est a l'origine, repartir l'energie sur toutes
+  !   les cellules adjacentes a ce sommet, au prorata de leur volume (l'energie
+  !   specifique deposee est donc uniforme sur la zone) ; si c'est au contraire une
+  !   CELLULE qui est centree sur l'origine, tout y est depose comme avant.
+  ! Sans cela, sur un maillage ou l'origine est un sommet (Voronoi radial sans germe
+  ! central, quart de disque a la Vilar), toute l'energie tombe dans une seule des
+  ! cellules qui entourent le point, ce qui brise la symetrie du depot.
+  logical, public :: sedov_nodal_deposit = .false.
+  ! Energie totale deposee. <= 0 (defaut) = valeur historique, calibree pour un domaine
+  ! COMPLET (front a r=1, pic 6 a t=1). Sur un quart de plan avec conditions de symetrie
+  ! il faut le quart de cette valeur, sinon le choc est quatre fois trop fort.
+  real(kind=DOUBLE), public :: sedov_energy = -1.0_DOUBLE
+
+  ! Mach number of the Gresho vortex (init = 11): sets the pressure level
+  ! p0 = 1/(gamma*Ma^2). Settable from the INPUT_PARAM namelist.
+  real(kind=DOUBLE) :: gresho_mach = 1.0e-2_DOUBLE
+  ! > 0 overrides the per-init default gamma (see lagrange_main); 0 = keep default
+  real(kind=DOUBLE) :: gamma_uniform = 0.0_DOUBLE
+
   ! Taylor-Green vortex (init = 10) -- the reference convergence test case for
   ! cell-centred Lagrangian hydrodynamics (Vilar, PhD 2012, Sec. 4.2.4). C0 has to
   ! keep the pressure positive: min[cos+cos] = -2, so C0 > rho0*U0^2/2.
@@ -194,10 +252,24 @@ contains
                   - 0.5_DOUBLE*dt*taur*dot_product(grad_p(:, idr), mesh%face(id_face)%norm)
         end if
 
-        lambda(1, j) = max(sqrt(gl*pl*sol_lr(1,1,j))/sol_lr(1,1,j), &
-          sqrt(max(0.0_DOUBLE, pr-pl)/sol_lr(1,1,j)), -(vr-vl)/sol_lr(1,1,j))
-        lambda(2, j) = max(sqrt(gr*pr*sol_lr(1,2,j))/sol_lr(1,2,j), &
-          sqrt(max(0.0_DOUBLE, pl-pr)/sol_lr(1,2,j)), -(vr-vl)/sol_lr(1,2,j))
+        ! lambda = l'impedance de la matrice de coin M_pc. EUCCLHYD (Maire et al.,
+        ! repris dans Vilar 2012 sec. 3.3.6) prend l'impedance acoustique PURE,
+        ! M_pc = z_c [l-(n-@n-) + l+(n+@n+)] avec z_c = rho_c a_c, obtenue en ecrivant
+        ! l'invariant de Riemann Pi_pc - P_c = -z_c (U_p - U_c).n_pc le long de chaque
+        ! demi-arete. Les deux termes supplementaires ci-dessous (saut de pression et
+        ! saut de vitesse) sont un ajout de type deux-chocs propre a ce code : ils
+        ! n'apparaissent pas dans EUCCLHYD et ajoutent de la dissipation la ou les sauts
+        ! sont forts. A noter que les branches de BORD plus bas utilisent deja z_c seul,
+        ! donc l'interieur et le bord ne suivent pas la meme definition aujourd'hui.
+        if (lambda_acoustic_only) then
+          lambda(1, j) = sqrt(gl*pl*sol_lr(1,1,j))/sol_lr(1,1,j)
+          lambda(2, j) = sqrt(gr*pr*sol_lr(1,2,j))/sol_lr(1,2,j)
+        else
+          lambda(1, j) = max(sqrt(gl*pl*sol_lr(1,1,j))/sol_lr(1,1,j), &
+            sqrt(max(0.0_DOUBLE, pr-pl)/sol_lr(1,1,j)), -(vr-vl)/sol_lr(1,1,j))
+          lambda(2, j) = max(sqrt(gr*pr*sol_lr(1,2,j))/sol_lr(1,2,j), &
+            sqrt(max(0.0_DOUBLE, pl-pr)/sol_lr(1,2,j)), -(vr-vl)/sol_lr(1,2,j))
+        end if
 
         if (.not. vp_is_imposed_i) then
           v_bar = (lambda(1,j)*vl + lambda(2,j)*vr - (pr - pl)) / (lambda(2,j) + lambda(1,j))
@@ -312,7 +384,7 @@ contains
   end subroutine compute_rhs_around_node
 
   subroutine compute_gradients(mesh, sol, gamma_arr, dt, grad_v, grad_p, div_v, p_limited, weno, &
-      gg_corrected, eps_weno_in)
+      gg_corrected, eps_weno_in, bound_skip)
     use linear_solver_module, only: tensor_product_3, inverse_3_by_3
     ! Nodal WENO Green-Gauss gradients weighted by ||grad_p||.
     ! div_v = trace(grad_v).
@@ -341,6 +413,18 @@ contains
     ! larger eps (e.g. 1e-2) pushes it back towards the plain volume-weighted
     ! (linear) combination wherever ||S_p||^4 is small compared to eps.
     real(kind=DOUBLE), intent(in), optional :: eps_weno_in
+    ! Diagnostic switch, DEFAULT .false. -> behaviour unchanged.
+    ! .true. drops boundary vertices from the nodal gradient fit entirely, the way
+    ! ns_euler_recon_module::compute_nodal_grad does (it guards the fit with
+    ! `if (re > 0)` and then sets nodal_grad = 0 at is_bound vertices). The current
+    ! path instead MIRRORS the missing neighbour (pr = pl, vr = vl - 2(vl.n)n). The
+    ! Taylor-Green wall excess is order-2-only -- 15x the deep-interior error at o2,
+    ! none at all at o1, stable over three refinements -- and o1 and o2 share the same
+    ! nodal solve, so the o2 gradient reconstruction at the wall is the suspect and
+    ! this switch is what isolates it. Skipping the whole boundary VERTEX (rather than
+    ! individual boundary sub-faces) subsumes the `re > 0` guard and sidesteps the
+    ! boundary_2d z-cap trap: with b2d every vertex has z-cap sub-faces.
+    logical, intent(in), optional :: bound_skip
 
     integer(kind=ENTIER) :: i, j, id_sub_face, id_sub_elem, id_face, id_elem, idl, idr
     real(kind=DOUBLE) :: omega_p, pl, pr, area, w_p, norm_Sp, p0
@@ -348,7 +432,7 @@ contains
     real(kind=DOUBLE), dimension(3) :: S_p, vl_vec, vr_vec, dv_vec, n, dx
     real(kind=DOUBLE), dimension(3, 3) :: S_p_gv, mat, mat_inv
     real(kind=DOUBLE), dimension(:), allocatable :: sum_omega_p, sum_omega_gv
-    logical :: use_weno, use_corr, mat_ok
+    logical :: use_weno, use_corr, mat_ok, skip_bound
     real(kind=DOUBLE) :: det_mat
     real(kind=DOUBLE), dimension(3, 3) :: mat_inv_t
 
@@ -370,7 +454,13 @@ contains
     sum_omega_p  = 0.0_DOUBLE
     sum_omega_gv = 0.0_DOUBLE
 
+    skip_bound = .false.
+    if (present(bound_skip)) skip_bound = bound_skip
+
     do i = 1, mesh%n_vert
+      if (skip_bound) then
+        if (mesh%vert(i)%is_bound) cycle
+      end if
       omega_p = mesh%vert(i)%volume
       S_p    = 0.0_DOUBLE
       S_p_gv = 0.0_DOUBLE
@@ -853,6 +943,895 @@ contains
     end do
   end subroutine compute_rhs_lagrange_sidil
 
+  ! Extrapolation GRP d'un demi-etat de la moyenne de maille vers le NOEUD, avec le
+  ! demi-pas de temps. Meme forme que dans 'classic' (compute_rhs_around_node), ou
+  ! elle est ecrite deux fois en ligne ; ici elle sert quatre fois (systeme de
+  ! vitesse et systeme de pression, cote gauche et cote droit), d'ou la routine.
+  ! a est evalue sur la valeur MOYENNE de p, avant reconstruction, comme dans
+  ! 'classic'. p et v sont modifies sur place.
+  subroutine grp_half_step(mesh, ic, i_vert, nrm, dt, tau, g, grad_v, grad_p, div_v, p, v)
+    implicit none
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: ic, i_vert
+    real(kind=DOUBLE), dimension(3), intent(in) :: nrm
+    real(kind=DOUBLE), intent(in) :: dt, tau, g
+    real(kind=DOUBLE), dimension(3, 3, mesh%n_elems), intent(in) :: grad_v
+    real(kind=DOUBLE), dimension(3, mesh%n_elems), intent(in) :: grad_p
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: div_v
+    real(kind=DOUBLE), intent(inout) :: p, v
+    real(kind=DOUBLE), dimension(3) :: dx
+    real(kind=DOUBLE) :: a
+
+    a  = sqrt(g*p*tau)
+    dx = mesh%vert(i_vert)%coord - mesh%elem(ic)%coord
+    v = v + dot_product(matmul(grad_v(:,:,ic), dx), nrm) &
+          - 0.5_DOUBLE*dt*tau*dot_product(grad_p(:, ic), nrm)
+    p = p + dot_product(grad_p(:, ic), dx) - 0.5_DOUBLE*dt*a**2/tau*div_v(ic)
+  end subroutine grp_half_step
+
+  ! ---------------------------------------------------------------------------
+  ! 'vp_pp' (anciennement 'nodal_vp'): nodal velocity AND nodal pressure, both obtained from NODAL
+  ! SYSTEMS, so that no nodal length h_p is needed anywhere.
+  !
+  ! Motivation. 'sidil' gets its two nodal quantities by correcting volume
+  ! averages with length-scaled terms,
+  !     v_p = <v> - (h_p/(2 rho_p a_p)) grad_p,   p_p = <p> - (h_p/2) rho_p a_p div_v,
+  ! which makes the scheme depend on an ad-hoc h_p (compute_length). Here both
+  ! come out of the same Riemann-solver data as the fluxes:
+  !
+  !   velocity   [sum_f A_f (lam_l+lam_r) n(x)n] u_p = sum_f A_f (lam_l+lam_r) vbar_f n
+  !              vbar_f = (lam_l v_l + lam_r v_r - (p_r-p_l))/(lam_l+lam_r)
+  !              i.e. the EUCCLHYD nodal solver, as in 'classic' (sub-face
+  !              based, one impedance per side of each sub-face -- not GLACE,
+  !              which builds corner vectors instead).
+  !
+  !   pressure   p_p = sum_f A_f L_f pbar_f / sum_f A_f L_f,   L_f = 1/lam_l + 1/lam_r
+  !              pbar_f = (p_l/lam_l + p_r/lam_r - (v_r-v_l)) / L_f
+  !              i.e. the impedance-weighted nodal pressure of the multi-point
+  !              pressure solver (Del Grosso, Barsukow, Loubere & Maire 2026),
+  !              whose velocity-jump term is the multi-d divergence.
+  !
+  ! Unlike 'classic', which closes with the one-sided pressures
+  ! p_l - lam_l (u_p.n - v_l), a SINGLE p_p is used on both sides of a sub-face,
+  ! so the flux is symmetric and the scheme conservative by construction.
+  !
+  ! Boundary faces carry no right state, so they enter the pressure average with
+  ! weight 1/lam_l and the one-sided value p_l - lam_l (u_p.n - v_l), evaluated
+  ! after the velocity system has been solved. b2d z-normal faces are excluded
+  ! from the pressure average entirely (they are not physical faces).
+  subroutine compute_rhs_lagrange_vp_pp(mesh, sol, vp, dt, rhs, &
+      n_bc, bc_type, bc_val, b2d, mass, gamma_arr, vp_is_imposed, &
+      second_order, grad_v, grad_p, div_v, use_ppvp)
+    use linear_solver_module, only: inverse_3_by_3
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), intent(in) :: dt
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(inout) :: vp
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(inout) :: rhs
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: mass
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
+    logical, dimension(mesh%n_vert), intent(in) :: vp_is_imposed
+    integer(kind=ENTIER), intent(in) :: n_bc
+    character(len=255), dimension(n_bc) :: bc_type
+    real(kind=DOUBLE), dimension(5, n_bc) :: bc_val
+    logical, intent(in) :: b2d
+    logical, intent(in) :: second_order
+    real(kind=DOUBLE), dimension(3, 3, mesh%n_elems), intent(in) :: grad_v
+    real(kind=DOUBLE), dimension(3, mesh%n_elems), intent(in) :: grad_p
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: div_v
+    ! .true. = schema 'vp_pp_ppvp' : une TROISIEME quantite nodale ppvp porte le
+    ! flux d'energie a la place du produit pp*(u_p.n) de deux quantites resolues
+    ! separement. Construite exactement comme pp : meme ponderation en 1/lambda,
+    ! meme exclusion des faces z, meme etat miroir aux bords.
+    logical, intent(in) :: use_ppvp
+
+    integer(kind=ENTIER) :: i, j, id_elem, id_face, id_sub_face, nsfn
+    integer(kind=ENTIER) :: idl, idr, var
+    real(kind=DOUBLE), dimension(3, 3) :: Mp, Mp_inv
+    real(kind=DOUBLE), dimension(3) :: Rp, Bp, first_wall_norm
+    real(kind=DOUBLE), dimension(5) :: flux
+    real(kind=DOUBLE) :: vl, vr, pl, pr, taul, taur, gl, gr
+    real(kind=DOUBLE) :: lam_l, lam_r, v_bar, p_bar, invlam
+    real(kind=DOUBLE) :: pp, s_num, s_den, v_et, Pw, cross_z, area, v_target
+    real(kind=DOUBLE) :: ppvp, q_num, q_den, q_bar, ql, qr, v_node, xjump
+    real(kind=DOUBLE), dimension(:), allocatable :: ppvp_face
+    logical :: is_corner, have_first_wall_norm, is_zface
+
+    rhs = 0.0_DOUBLE
+    if (diag_entropy) then
+      if (.not. allocated(entropy_prod)) then
+        allocate(entropy_prod(mesh%n_elems), entropy_ref(mesh%n_elems))
+      end if
+      entropy_prod = 0.0_DOUBLE
+      entropy_ref  = 0.0_DOUBLE
+    end if
+    if (use_ppvp .and. .not. ppvp_nodal_average) then
+      allocate(ppvp_face(maxval(mesh%vert(:)%n_sub_faces_neigh)))
+    end if
+    do i = 1, mesh%n_vert
+      if (.not. vp_is_imposed(i)) vp(:, i) = 0.0_DOUBLE
+    end do
+
+    do i = 1, mesh%n_vert
+      nsfn = mesh%vert(i)%n_sub_faces_neigh
+
+      ! ---- pass 1: nodal velocity system ----------------------------------
+      Mp = 0.0_DOUBLE
+      Rp = 0.0_DOUBLE
+      Bp = 0.0_DOUBLE
+      is_corner = .false.
+      have_first_wall_norm = .false.
+      first_wall_norm = 0.0_DOUBLE
+
+      do j = 1, nsfn
+        id_sub_face = mesh%vert(i)%sub_face_neigh(j)
+        id_face = mesh%sub_face(id_sub_face)%mesh_face
+        idl = mesh%face(id_face)%left_neigh
+        idr = mesh%face(id_face)%right_neigh
+        area = mesh%sub_face(id_sub_face)%area
+
+        gl = gamma_arr(idl)
+        taul = sol(1, idl)
+        pl = pressure(sol(:, idl), gl)
+        vl = dot_product(sol(2:4, idl), mesh%face(id_face)%norm)
+        if (second_order) call grp_half_step(mesh, idl, i, mesh%face(id_face)%norm, &
+          dt, taul, gl, grad_v, grad_p, div_v, pl, vl)
+
+        if (idr > 0) then
+          gr = gamma_arr(idr)
+          taur = sol(1, idr)
+          pr = pressure(sol(:, idr), gr)
+          vr = dot_product(sol(2:4, idr), mesh%face(id_face)%norm)
+          if (second_order) call grp_half_step(mesh, idr, i, mesh%face(id_face)%norm, &
+            dt, taur, gr, grad_v, grad_p, div_v, pr, vr)
+
+          lam_l = max(sqrt(gl*pl*taul)/taul, &
+            sqrt(max(0.0_DOUBLE, pr-pl)/taul), -(vr-vl)/taul)
+          lam_r = max(sqrt(gr*pr*taur)/taur, &
+            sqrt(max(0.0_DOUBLE, pl-pr)/taur), -(vr-vl)/taur)
+
+          if (.not. vp_is_imposed(i)) then
+            v_bar = (lam_l*vl + lam_r*vr - (pr - pl))/(lam_l + lam_r)
+            Mp = Mp + area*(lam_l + lam_r) &
+              * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
+            Rp = Rp + area*(lam_l + lam_r)*mesh%face(id_face)%norm*v_bar
+          end if
+        else
+          lam_l = sqrt(gl*pl*taul)/taul
+          is_zface = (b2d .and. abs(mesh%face(id_face)%norm(3)) > 1e-8_DOUBLE)
+          if (.not. vp_is_imposed(i)) then
+            if (is_zface) then
+              Mp = Mp + area*2.0_DOUBLE*lam_l &
+                * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
+            else if (idr < 0 .and. trim(bc_type(-idr)) == 'pressure') then
+              Mp = Mp + area*lam_l &
+                * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
+              Rp = Rp + area*(bc_val(1,-idr) + lam_l*vl)*mesh%face(id_face)%norm
+            else
+              if (.not. have_first_wall_norm) then
+                first_wall_norm = mesh%face(id_face)%norm
+                have_first_wall_norm = .true.
+              else
+                cross_z = first_wall_norm(1)*mesh%face(id_face)%norm(2) &
+                        - first_wall_norm(2)*mesh%face(id_face)%norm(1)
+                if (abs(cross_z) > 1.0e-8_DOUBLE) is_corner = .true.
+              end if
+              Bp = Bp + area*mesh%face(id_face)%norm
+              Mp = Mp + area*lam_l &
+                * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
+              Rp = Rp + area*(pl + lam_l*vl)*mesh%face(id_face)%norm
+            end if
+          end if
+        end if
+      end do
+
+      if (.not. vp_is_imposed(i)) then
+        if (is_corner) then
+          vp(:, i) = 0.0_DOUBLE
+        else if (maxval(abs(Bp)) > 1e-8_DOUBLE) then
+          call inverse_3_by_3(Mp, Mp_inv)
+          Pw = dot_product(Rp, matmul(Mp_inv, Bp))/dot_product(Bp, matmul(Mp_inv, Bp))
+          vp(:, i) = matmul(Mp_inv, Rp - Pw*Bp)
+        else
+          call inverse_3_by_3(Mp, Mp_inv)
+          vp(:, i) = matmul(Mp_inv, Rp)
+        end if
+      end if
+
+      ! ---- pass 2: nodal pressure system ----------------------------------
+      s_num = 0.0_DOUBLE
+      s_den = 0.0_DOUBLE
+      do j = 1, nsfn
+        id_sub_face = mesh%vert(i)%sub_face_neigh(j)
+        id_face = mesh%sub_face(id_sub_face)%mesh_face
+        idl = mesh%face(id_face)%left_neigh
+        idr = mesh%face(id_face)%right_neigh
+        area = mesh%sub_face(id_sub_face)%area
+
+        ! z-cap exclusion, strict form (|n_z| ~ 1), as in compute_nodal_pressure_sidil
+        ! after the z-cap leak fix -- not the loose |n_z|>1e-8 used elsewhere.
+        if (b2d .and. abs(mesh%face(id_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE) cycle
+
+        gl = gamma_arr(idl)
+        taul = sol(1, idl)
+        pl = pressure(sol(:, idl), gl)
+        vl = dot_product(sol(2:4, idl), mesh%face(id_face)%norm)
+        if (second_order) call grp_half_step(mesh, idl, i, mesh%face(id_face)%norm, &
+          dt, taul, gl, grad_v, grad_p, div_v, pl, vl)
+
+        if (idr > 0) then
+          gr = gamma_arr(idr)
+          taur = sol(1, idr)
+          pr = pressure(sol(:, idr), gr)
+          vr = dot_product(sol(2:4, idr), mesh%face(id_face)%norm)
+          if (second_order) call grp_half_step(mesh, idr, i, mesh%face(id_face)%norm, &
+            dt, taur, gr, grad_v, grad_p, div_v, pr, vr)
+        else
+          ! Boundary: build the MIRROR ghost state and then use the very same
+          ! two-state formula, which is how both precedents in this code do it --
+          ! compute_nodal_pressure_sidil here, and ns_euler_recon_module's
+          ! BC_EULER_WALL on the Euler side. No special branch in the solver, and
+          ! no dependence on the nodal velocity. A piston wall simply mirrors
+          ! about its own velocity instead of about zero.
+          v_target = 0.0_DOUBLE
+          if (idr < 0) then
+            if (-idr <= n_bc) then
+              if (trim(bc_type(-idr)) == 'piston') then
+                v_target = dot_product(bc_val(2:4, -idr), mesh%face(id_face)%norm)
+              end if
+            end if
+          end if
+          gr = gl
+          taur = taul
+          pr = pl
+          vr = vl + 2.0_DOUBLE*(v_target - vl)
+        end if
+
+        lam_l = max(sqrt(gl*pl*taul)/taul, &
+          sqrt(max(0.0_DOUBLE, pr-pl)/taul), -(vr-vl)/taul)
+        lam_r = max(sqrt(gr*pr*taur)/taur, &
+          sqrt(max(0.0_DOUBLE, pl-pr)/taur), -(vr-vl)/taur)
+        invlam = 1.0_DOUBLE/lam_l + 1.0_DOUBLE/lam_r
+        p_bar = (pl/lam_l + pr/lam_r - (vr - vl))/invlam
+
+        s_num = s_num + area*invlam*p_bar
+        s_den = s_den + area*invlam
+      end do
+
+      if (s_den > 0.0_DOUBLE) then
+        pp = s_num/s_den
+      else
+        pp = 0.0_DOUBLE
+      end if
+
+      ! ---- pass 3 (schema vp_pp_ppvp): quantite nodale ppvp ----------------
+      ! q = p*(u.n) est la densite de flux d'energie. On la moyenne sur le MEME
+      ! modele que pp (ponderation en 1/lambda) au lieu de former le produit
+      ! pp*(u_p.n) de deux quantites resolues separement.
+      !
+      ! Le terme de saut X doit satisfaire DEUX contraintes :
+      !   - homogeneite : q/lambda est en v^2, donc X aussi ;
+      !   - parite : sous retournement de la face (echange gauche/droite et n -> -n),
+      !     q change de signe donc q_bar doit etre ANTI-invariant. Or delta_q est
+      !     INVARIANT (les deux changements de signe se compensent), tout comme
+      !     p_bar*delta_v et v_bar*delta_p. Il faut un nombre IMPAIR de facteurs
+      !     anti-invariants : (u_p.n)*delta_v convient, delta_q non.
+      ppvp = 0.0_DOUBLE
+      if (use_ppvp) then
+        if (allocated(ppvp_face)) ppvp_face = 0.0_DOUBLE
+        q_num = 0.0_DOUBLE
+        q_den = 0.0_DOUBLE
+        do j = 1, nsfn
+          id_sub_face = mesh%vert(i)%sub_face_neigh(j)
+          id_face = mesh%sub_face(id_sub_face)%mesh_face
+          idl = mesh%face(id_face)%left_neigh
+          idr = mesh%face(id_face)%right_neigh
+          area = mesh%sub_face(id_sub_face)%area
+
+          if (b2d .and. abs(mesh%face(id_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE) cycle
+
+          gl = gamma_arr(idl)
+          taul = sol(1, idl)
+          pl = pressure(sol(:, idl), gl)
+          vl = dot_product(sol(2:4, idl), mesh%face(id_face)%norm)
+          if (second_order) call grp_half_step(mesh, idl, i, mesh%face(id_face)%norm, &
+            dt, taul, gl, grad_v, grad_p, div_v, pl, vl)
+
+          if (idr > 0) then
+            gr = gamma_arr(idr)
+            taur = sol(1, idr)
+            pr = pressure(sol(:, idr), gr)
+            vr = dot_product(sol(2:4, idr), mesh%face(id_face)%norm)
+            if (second_order) call grp_half_step(mesh, idr, i, mesh%face(id_face)%norm, &
+              dt, taur, gr, grad_v, grad_p, div_v, pr, vr)
+          else
+            ! meme etat miroir que la passe de pression
+            v_target = 0.0_DOUBLE
+            if (idr < 0) then
+              if (-idr <= n_bc) then
+                if (trim(bc_type(-idr)) == 'piston') then
+                  v_target = dot_product(bc_val(2:4, -idr), mesh%face(id_face)%norm)
+                end if
+              end if
+            end if
+            gr = gl
+            taur = taul
+            pr = pl
+            vr = vl + 2.0_DOUBLE*(v_target - vl)
+          end if
+
+          lam_l = max(sqrt(gl*pl*taul)/taul, &
+            sqrt(max(0.0_DOUBLE, pr-pl)/taul), -(vr-vl)/taul)
+          lam_r = max(sqrt(gr*pr*taur)/taur, &
+            sqrt(max(0.0_DOUBLE, pl-pr)/taur), -(vr-vl)/taur)
+          invlam = 1.0_DOUBLE/lam_l + 1.0_DOUBLE/lam_r
+
+          ! q = p * (u_p.n) : le produit porte la vitesse NODALE, pas celle des
+          ! mailles. Avec les vitesses de maille, q_l = q_r = 0 a t=0 (fluide au
+          ! repos) et ppvp serait identiquement nul quelle que soit la ponderation
+          ! -- le souffle ne fournirait aucun travail et le schema ne demarrerait
+          ! pas. C'est aussi ce que dit le nom : ppvp = pp * vp.
+          v_node = dot_product(vp(:, i), mesh%face(id_face)%norm)
+          ql = pl*v_node
+          qr = pr*v_node
+          if (trim(ppvp_jump_mode) == 'dp') then
+            ! variante : le saut porte sur p (donc sur q a v_node fixe), rendu
+            ! homogene par les impedances.
+            xjump = v_node*(pr - pl)*invlam*0.5_DOUBLE
+          else
+            xjump = v_node*(vr - vl)
+          end if
+          q_bar = (ql/lam_l + qr/lam_r - xjump)/invlam
+
+          if (ppvp_nodal_average) then
+            q_num = q_num + area*invlam*q_bar
+            q_den = q_den + area*invlam
+          else
+            ! variante par sous-face : on stocke q_bar la ou le flux le relira
+            ppvp_face(j) = q_bar
+          end if
+        end do
+        if (ppvp_nodal_average .and. q_den > 0.0_DOUBLE) ppvp = q_num/q_den
+      end if
+
+      ! ---- flux assembly: one nodal pressure, one nodal velocity ----------
+      do j = 1, nsfn
+        id_sub_face = mesh%vert(i)%sub_face_neigh(j)
+        id_face = mesh%sub_face(id_sub_face)%mesh_face
+        idl = mesh%face(id_face)%left_neigh
+        idr = mesh%face(id_face)%right_neigh
+
+        v_et = dot_product(vp(:, i), mesh%face(id_face)%norm)
+
+        if (diag_entropy) then
+          ! contribution de cette sous-face aux deux mailles. La normale sortante
+          ! est +n pour idl et -n pour idr, d'ou le changement de signe.
+          call add_entropy_diag(mesh, idl, id_face, &
+            mesh%sub_face(id_sub_face)%area, 1.0_DOUBLE, vp(:, i), sol, gamma_arr, pp)
+          if (idr > 0) call add_entropy_diag(mesh, idr, id_face, &
+            mesh%sub_face(id_sub_face)%area, -1.0_DOUBLE, vp(:, i), sol, gamma_arr, pp)
+        end if
+
+        flux(1)   = -v_et
+        flux(2:4) = pp*mesh%face(id_face)%norm
+        if (use_ppvp) then
+          if (ppvp_nodal_average) then
+            flux(5) = ppvp
+          else
+            flux(5) = ppvp_face(j)
+          end if
+        else
+          flux(5) = pp*v_et
+        end if
+
+        do var = 1, 5
+          rhs(var, idl) = rhs(var, idl) &
+            - mesh%sub_face(id_sub_face)%area/mass(idl)*flux(var)
+        end do
+        if (idr > 0) then
+          do var = 1, 5
+            rhs(var, idr) = rhs(var, idr) &
+              + mesh%sub_face(id_sub_face)%area/mass(idr)*flux(var)
+          end do
+        end if
+      end do
+    end do
+  end subroutine compute_rhs_lagrange_vp_pp
+
+  ! Contribution d'une sous-face a la production d'entropie de la maille ic.
+  ! sgn = +1 si la normale stockee est sortante pour ic, -1 sinon.
+  subroutine add_entropy_diag(mesh, ic, id_face, area, sgn, u_p, sol, gamma_arr, pp)
+    implicit none
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: ic, id_face
+    real(kind=DOUBLE), intent(in) :: area, sgn, pp
+    real(kind=DOUBLE), dimension(3), intent(in) :: u_p
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
+    real(kind=DOUBLE), dimension(3) :: nout
+    real(kind=DOUBLE) :: pc, tauc, lamc, du
+
+    nout = sgn*mesh%face(id_face)%norm
+    pc   = pressure(sol(:, ic), gamma_arr(ic))
+    tauc = sol(1, ic)
+    lamc = sqrt(max(0.0_DOUBLE, gamma_arr(ic)*pc*tauc))/tauc
+    du   = dot_product(u_p - sol(2:4, ic), nout)
+    entropy_prod(ic) = entropy_prod(ic) + area*(pc - pp)*du
+    entropy_ref(ic)  = entropy_ref(ic)  + area*lamc*du*du
+  end subroutine add_entropy_diag
+
+  ! Resume du diagnostic, appele depuis la boucle en temps.
+  subroutine print_entropy_diag(mesh, t, me, num_procs)
+    implicit none
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), intent(in) :: t
+    integer(kind=ENTIER), intent(in) :: me, num_procs
+    integer(kind=ENTIER) :: i, nneg, ntot, ierr
+    real(kind=DOUBLE) :: sprod, sref, worst, r_worst, rr
+
+    if (.not. allocated(entropy_prod)) return
+    nneg = 0; ntot = 0; sprod = 0.0_DOUBLE; sref = 0.0_DOUBLE
+    worst = 0.0_DOUBLE; r_worst = -1.0_DOUBLE
+    do i = 1, mesh%n_elems
+      if (mesh%elem(i)%is_ghost) cycle
+      ntot = ntot + 1
+      sprod = sprod + entropy_prod(i)
+      sref  = sref  + entropy_ref(i)
+      if (entropy_prod(i) < 0.0_DOUBLE) then
+        nneg = nneg + 1
+        if (entropy_prod(i) < worst) then
+          worst = entropy_prod(i)
+          rr = norm2(mesh%elem(i)%coord(:2))
+          r_worst = rr
+        end if
+      end if
+    end do
+    if (num_procs > 1) then
+      call MPI_ALLREDUCE(MPI_IN_PLACE, nneg, 1, MPI_INTEGER, MPI_SUM, MPI_COMM_WORLD, ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE, ntot, 1, MPI_INTEGER, MPI_SUM, MPI_COMM_WORLD, ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE, sprod, 1, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE, sref, 1, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE, worst, 1, MPI_DOUBLE_PRECISION, MPI_MIN, MPI_COMM_WORLD, ierr)
+    end if
+    if (me == 0) then
+      print '(a,es12.5,a,i7,a,i7,a,f7.3,a,es12.5,a,es12.5,a,f7.4)', &
+        "[entropie] t=", t, "  mailles<0: ", nneg, " /", ntot, " = ", &
+        100.0_DOUBLE*real(nneg, DOUBLE)/max(real(ntot, DOUBLE), 1.0_DOUBLE), &
+        " %  somme_prod=", sprod, "  somme_ref=", sref, "  ratio=", &
+        sprod/max(abs(sref), 1.0e-300_DOUBLE)
+    end if
+  end subroutine print_entropy_diag
+
+  ! ---------------------------------------------------------------------------
+  ! 'vp_ep' : vitesse nodale vp ET energie nodale ep, calculees d'abord, puis
+  ! injectees dans un solveur de Riemann 1D applique sous-face par sous-face.
+  !
+  ! Trois etages nettement separes, pour pouvoir travailler sur l'un sans toucher
+  ! aux autres :
+  !
+  !   PASSE 1  vitesse nodale u_p. Identique a celle de 'vp_pp' : c'est le
+  !            systeme nodal d'EUCCLHYD
+  !              [somme_f A_f (lam_l+lam_r) n@n] u_p
+  !                = somme_f A_f {p_l - p_r + lam_l v_l + lam_r v_r} n
+  !            avec le traitement des parois, des faces z (boundary_2d) et des
+  !            coins inchange.
+  !
+  !   PASSE 2  energie nodale e_p, rangee dans ep_node(i). << A DEFINIR >> :
+  !            la routine nodal_energy ci-dessous est un PLACEHOLDER.
+  !
+  !   PASSE 3  assemblage des flux. Chaque sous-face appelle rs_vp_ep, qui recoit
+  !            sol_w_l, sol_w_r, la normale, PLUS u_p.n et e_p, et rend les deux
+  !            flux unilateraux. << A DEFINIR >> : rs_vp_ep est aussi un
+  !            PLACEHOLDER, cf. sa propre en-tete.
+  !
+  ! Convention de signe des flux, identique au reste du module :
+  !     rhs(:, idl) -= A_f/mass(idl) * flux_l
+  !     rhs(:, idr) += A_f/mass(idr) * flux_r
+  ! et sol = (tau, u, v, w, E) avec E l'energie totale MASSIQUE.
+  subroutine compute_rhs_lagrange_vp_ep(mesh, sol, vp, dt, rhs, &
+      n_bc, bc_type, bc_val, b2d, mass, gamma_arr, vp_is_imposed, &
+      second_order, grad_v, grad_p, div_v)
+    use linear_solver_module, only: inverse_3_by_3
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), intent(in) :: dt
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(inout) :: vp
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(inout) :: rhs
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: mass
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
+    logical, dimension(mesh%n_vert), intent(in) :: vp_is_imposed
+    integer(kind=ENTIER), intent(in) :: n_bc
+    character(len=255), dimension(n_bc) :: bc_type
+    real(kind=DOUBLE), dimension(5, n_bc) :: bc_val
+    logical, intent(in) :: b2d
+    logical, intent(in) :: second_order
+    real(kind=DOUBLE), dimension(3, 3, mesh%n_elems), intent(in) :: grad_v
+    real(kind=DOUBLE), dimension(3, mesh%n_elems), intent(in) :: grad_p
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: div_v
+
+    integer(kind=ENTIER) :: i, j, id_face, id_sub_face, nsfn, idl, idr, var
+    real(kind=DOUBLE), dimension(3, 3) :: Mp, Mp_inv
+    real(kind=DOUBLE), dimension(3) :: Rp, Bp, first_wall_norm
+    real(kind=DOUBLE), dimension(5) :: flux_l, flux_r
+    real(kind=DOUBLE) :: vl, vr, pl, pr, taul, taur, gl, gr
+    real(kind=DOUBLE) :: lam_l, lam_r, v_bar, Pw, cross_z, area, v_target, v_et
+    logical :: is_corner, have_first_wall_norm, is_zface
+
+    rhs = 0.0_DOUBLE
+    if (.not. allocated(ep_node)) allocate(ep_node(mesh%n_vert))
+    ep_node = 0.0_DOUBLE
+    do i = 1, mesh%n_vert
+      if (.not. vp_is_imposed(i)) vp(:, i) = 0.0_DOUBLE
+    end do
+
+    do i = 1, mesh%n_vert
+      nsfn = mesh%vert(i)%n_sub_faces_neigh
+
+      ! ---- PASSE 1 : vitesse nodale (identique a vp_pp) ----------------------
+      Mp = 0.0_DOUBLE
+      Rp = 0.0_DOUBLE
+      Bp = 0.0_DOUBLE
+      is_corner = .false.
+      have_first_wall_norm = .false.
+      first_wall_norm = 0.0_DOUBLE
+
+      do j = 1, nsfn
+        id_sub_face = mesh%vert(i)%sub_face_neigh(j)
+        id_face = mesh%sub_face(id_sub_face)%mesh_face
+        idl = mesh%face(id_face)%left_neigh
+        idr = mesh%face(id_face)%right_neigh
+        area = mesh%sub_face(id_sub_face)%area
+
+        gl = gamma_arr(idl)
+        taul = sol(1, idl)
+        pl = pressure(sol(:, idl), gl)
+        vl = dot_product(sol(2:4, idl), mesh%face(id_face)%norm)
+        if (second_order) call grp_half_step(mesh, idl, i, mesh%face(id_face)%norm, &
+          dt, taul, gl, grad_v, grad_p, div_v, pl, vl)
+
+        if (idr > 0) then
+          gr = gamma_arr(idr)
+          taur = sol(1, idr)
+          pr = pressure(sol(:, idr), gr)
+          vr = dot_product(sol(2:4, idr), mesh%face(id_face)%norm)
+          if (second_order) call grp_half_step(mesh, idr, i, mesh%face(id_face)%norm, &
+            dt, taur, gr, grad_v, grad_p, div_v, pr, vr)
+
+          lam_l = max(sqrt(gl*pl*taul)/taul, &
+            sqrt(max(0.0_DOUBLE, pr-pl)/taul), -(vr-vl)/taul)
+          lam_r = max(sqrt(gr*pr*taur)/taur, &
+            sqrt(max(0.0_DOUBLE, pl-pr)/taur), -(vr-vl)/taur)
+
+          if (.not. vp_is_imposed(i)) then
+            v_bar = (lam_l*vl + lam_r*vr - (pr - pl))/(lam_l + lam_r)
+            Mp = Mp + area*(lam_l + lam_r) &
+              * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
+            Rp = Rp + area*(lam_l + lam_r)*mesh%face(id_face)%norm*v_bar
+          end if
+        else
+          lam_l = sqrt(gl*pl*taul)/taul
+          is_zface = (b2d .and. abs(mesh%face(id_face)%norm(3)) > 1e-8_DOUBLE)
+          if (.not. vp_is_imposed(i)) then
+            if (is_zface) then
+              Mp = Mp + area*2.0_DOUBLE*lam_l &
+                * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
+            else if (idr < 0 .and. trim(bc_type(-idr)) == 'pressure') then
+              Mp = Mp + area*lam_l &
+                * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
+              Rp = Rp + area*(bc_val(1,-idr) + lam_l*vl)*mesh%face(id_face)%norm
+            else
+              if (.not. have_first_wall_norm) then
+                first_wall_norm = mesh%face(id_face)%norm
+                have_first_wall_norm = .true.
+              else
+                cross_z = first_wall_norm(1)*mesh%face(id_face)%norm(2) &
+                        - first_wall_norm(2)*mesh%face(id_face)%norm(1)
+                if (abs(cross_z) > 1.0e-8_DOUBLE) is_corner = .true.
+              end if
+              Bp = Bp + area*mesh%face(id_face)%norm
+              Mp = Mp + area*lam_l &
+                * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
+              Rp = Rp + area*(pl + lam_l*vl)*mesh%face(id_face)%norm
+            end if
+          end if
+        end if
+      end do
+
+      if (.not. vp_is_imposed(i)) then
+        if (is_corner) then
+          vp(:, i) = 0.0_DOUBLE
+        else if (maxval(abs(Bp)) > 1e-8_DOUBLE) then
+          call inverse_3_by_3(Mp, Mp_inv)
+          Pw = dot_product(Rp, matmul(Mp_inv, Bp))/dot_product(Bp, matmul(Mp_inv, Bp))
+          vp(:, i) = matmul(Mp_inv, Rp - Pw*Bp)
+        else
+          call inverse_3_by_3(Mp, Mp_inv)
+          vp(:, i) = matmul(Mp_inv, Rp)
+        end if
+      end if
+
+
+      ! ---- PASSE 2 : energie nodale ------------------------------------------
+      ep_node(i) = nodal_energy(mesh, i, nsfn, sol, gamma_arr, vp(:, i), b2d, &
+        n_bc, bc_type, bc_val, dt, second_order, grad_v, grad_p, div_v)
+
+      ! ---- PASSE 3 : assemblage des flux -------------------------------------
+      do j = 1, nsfn
+        id_sub_face = mesh%vert(i)%sub_face_neigh(j)
+        id_face = mesh%sub_face(id_sub_face)%mesh_face
+        idl = mesh%face(id_face)%left_neigh
+        idr = mesh%face(id_face)%right_neigh
+        v_et = dot_product(vp(:, i), mesh%face(id_face)%norm)
+
+        ! Les faces z (boundary_2d) sont exclues, exactement comme dans
+        ! nodal_energy. C'est indispensable et pas cosmetique : le flux d'energie
+        !     pv_c = p_c v_c -/+ lam_c (e_p - e_c)
+        ! contient un terme SANS facteur vitesse, qui ne s'annule donc pas quand
+        ! u_p.n = 0 -- ce qui est le cas sur une face z. Le flux de 'classic',
+        ! Pi*(u_p.n), s'annule lui de lui-meme, d'ou sa conservation. Si ces faces
+        ! entrent dans le flux mais pas dans la moyenne definissant e_p, la
+        ! telescopie qui rend le schema conservatif est rompue : mesure, -4.5 %
+        ! d'energie totale sur le disque, -3.0 % sur le quad. Avec l'exclusion,
+        ! la conservation est EXACTE.
+        if (b2d .and. abs(mesh%face(id_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE) cycle
+
+        if (idr > 0) then
+          if (second_order) then
+            pl = pressure(sol(:, idl), gamma_arr(idl))
+            vl = dot_product(sol(2:4, idl), mesh%face(id_face)%norm)
+            pr = pressure(sol(:, idr), gamma_arr(idr))
+            vr = dot_product(sol(2:4, idr), mesh%face(id_face)%norm)
+            call grp_half_step(mesh, idl, i, mesh%face(id_face)%norm, dt, &
+              sol(1, idl), gamma_arr(idl), grad_v, grad_p, div_v, pl, vl)
+            call grp_half_step(mesh, idr, i, mesh%face(id_face)%norm, dt, &
+              sol(1, idr), gamma_arr(idr), grad_v, grad_p, div_v, pr, vr)
+            call rs_vp_ep(sol(:, idl), sol(:, idr), gamma_arr(idl), gamma_arr(idr), &
+              mesh%face(id_face)%norm, v_et, ep_node(i), flux_l, flux_r, &
+              pl, vl, pr, vr)
+          else
+            call rs_vp_ep(sol(:, idl), sol(:, idr), gamma_arr(idl), gamma_arr(idr), &
+              mesh%face(id_face)%norm, v_et, ep_node(i), flux_l, flux_r)
+          end if
+        else
+          ! bord : etat miroir, comme dans la passe de pression de vp_pp
+          v_target = 0.0_DOUBLE
+          if (idr < 0) then
+            if (-idr <= n_bc) then
+              if (trim(bc_type(-idr)) == 'piston') then
+                v_target = dot_product(bc_val(2:4, -idr), mesh%face(id_face)%norm)
+              end if
+            end if
+          end if
+          call rs_vp_ep(sol(:, idl), mirror_state(sol(:, idl), &
+            mesh%face(id_face)%norm, v_target), gamma_arr(idl), gamma_arr(idl), &
+            mesh%face(id_face)%norm, v_et, ep_node(i), flux_l, flux_r)
+        end if
+
+        do var = 1, 5
+          rhs(var, idl) = rhs(var, idl) &
+            - mesh%sub_face(id_sub_face)%area/mass(idl)*flux_l(var)
+        end do
+        if (idr > 0) then
+          do var = 1, 5
+            rhs(var, idr) = rhs(var, idr) &
+              + mesh%sub_face(id_sub_face)%area/mass(idr)*flux_r(var)
+          end do
+        end if
+      end do
+    end do
+  end subroutine compute_rhs_lagrange_vp_ep
+
+  ! ===========================================================================
+  ! << A DEFINIR >>  Energie nodale e_p du schema 'vp_ep'.
+  !
+  ! Appelee une fois par noeud, APRES que la vitesse nodale u_p soit connue.
+  ! Elle a acces a toutes les sous-faces du noeud, donc aux etats des mailles
+  ! voisines, a leurs impedances et a u_p.
+  !
+  ! Formule retenue (cf. corps) : moyenne ponderee en LAMBDA de l'energie totale
+  ! massique, corrigee par le saut du FLUX d'energie p*v_n. C'est la duale exacte
+  ! de la vitesse nodale. L'energie utilisee est sol(5), l'energie TOTALE
+  ! massique ; si l'energie INTERNE etait voulue, c'est la seule ligne a changer.
+  !
+  ! Rappels utiles :
+  !   sol(:,c) = (tau_c, u_c, v_c, w_c, E_c)   E = energie totale MASSIQUE
+  !   e_int    = E - |u|^2/2
+  !   p        = (g-1)/tau * (E - |u|^2/2)      [fonction pressure]
+  !   lambda_c = sqrt(g p tau)/tau              [impedance rho a]
+  ! Les faces z sont exclues en boundary_2d comme dans la passe de pression de
+  ! 'vp_pp' (test strict |n_z| > 1 - 1e-8).
+  ! ===========================================================================
+  function nodal_energy(mesh, i_vert, nsfn, sol, gamma_arr, u_p, b2d, &
+      n_bc, bc_type, bc_val, dt, second_order, grad_v, grad_p, div_v) result(e_p)
+    implicit none
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: i_vert, nsfn, n_bc
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
+    real(kind=DOUBLE), dimension(3), intent(in) :: u_p
+    logical, intent(in) :: b2d
+    character(len=255), dimension(n_bc) :: bc_type
+    real(kind=DOUBLE), dimension(5, n_bc) :: bc_val
+    real(kind=DOUBLE), intent(in) :: dt
+    logical, intent(in) :: second_order
+    real(kind=DOUBLE), dimension(3, 3, mesh%n_elems), intent(in) :: grad_v
+    real(kind=DOUBLE), dimension(3, mesh%n_elems), intent(in) :: grad_p
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: div_v
+    real(kind=DOUBLE) :: e_p
+
+    integer(kind=ENTIER) :: j, id_sub_face, id_face, idl, idr
+    real(kind=DOUBLE) :: area, gl, gr, taul, taur, pl, pr, lam_l, lam_r
+    real(kind=DOUBLE) :: e_bar, num, den, v_target, vl, vr
+    real(kind=DOUBLE), dimension(5) :: solr
+
+    num = 0.0_DOUBLE
+    den = 0.0_DOUBLE
+    do j = 1, nsfn
+      id_sub_face = mesh%vert(i_vert)%sub_face_neigh(j)
+      id_face = mesh%sub_face(id_sub_face)%mesh_face
+      idl = mesh%face(id_face)%left_neigh
+      idr = mesh%face(id_face)%right_neigh
+      area = mesh%sub_face(id_sub_face)%area
+      if (b2d .and. abs(mesh%face(id_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE) cycle
+
+      gl = gamma_arr(idl)
+      taul = sol(1, idl)
+      pl = pressure(sol(:, idl), gl)
+      if (idr > 0) then
+        solr = sol(:, idr)
+        gr = gamma_arr(idr)
+      else
+        v_target = 0.0_DOUBLE
+        if (idr < 0) then
+          if (-idr <= n_bc) then
+            if (trim(bc_type(-idr)) == 'piston') &
+              v_target = dot_product(bc_val(2:4, -idr), mesh%face(id_face)%norm)
+          end if
+        end if
+        solr = mirror_state(sol(:, idl), mesh%face(id_face)%norm, v_target)
+        gr = gl
+      end if
+      taur = solr(1)
+      pr = pressure(solr, gr)
+      vl = dot_product(sol(2:4, idl), mesh%face(id_face)%norm)
+      vr = dot_product(solr(2:4), mesh%face(id_face)%norm)
+      ! ordre 2 : meme extrapolation GRP que dans la passe de vitesse. Seuls p et
+      ! v.n sont reconstruits (ce sont les seuls gradients disponibles) ; e_l et
+      ! e_r restent les moyennes de maille, comme dans 'classic' dont la
+      ! fermeture ne fait jamais intervenir l'energie de maille.
+      if (second_order) then
+        call grp_half_step(mesh, idl, i_vert, mesh%face(id_face)%norm, &
+          dt, taul, gl, grad_v, grad_p, div_v, pl, vl)
+        if (idr > 0) call grp_half_step(mesh, idr, i_vert, mesh%face(id_face)%norm, &
+          dt, taur, gr, grad_v, grad_p, div_v, pr, vr)
+      end if
+
+      if (lambda_acoustic_only) then
+        lam_l = sqrt(max(0.0_DOUBLE, gl*pl*taul))/taul
+        lam_r = sqrt(max(0.0_DOUBLE, gr*pr*taur))/taur
+      else
+        lam_l = max(sqrt(max(0.0_DOUBLE, gl*pl*taul))/taul, &
+          sqrt(max(0.0_DOUBLE, pr-pl)/taul), -(vr-vl)/taul)
+        lam_r = max(sqrt(max(0.0_DOUBLE, gr*pr*taur))/taur, &
+          sqrt(max(0.0_DOUBLE, pl-pr)/taur), -(vr-vl)/taur)
+      end if
+      if (lam_l + lam_r <= 0.0_DOUBLE) cycle
+
+      ! Energie nodale, duale de la vitesse nodale : ponderation en LAMBDA (et
+      ! non en 1/lambda comme la pression), et terme de saut porte par le FLUX
+      ! d'energie p*v_n.
+      !     v_bar = (lam_l v_l + lam_r v_r - (p_r - p_l))       / (lam_l+lam_r)
+      !     e_bar = (lam_l e_l + lam_r e_r - (p_r v_r - p_l v_l))/ (lam_l+lam_r)
+      ! Les deux contraintes qui avaient elimine les formes naives sont ici
+      ! satisfaites : lam*e est en rho v^3 comme Delta(p v) (homogeneite), et e
+      ! comme Delta(p v) sont INVARIANTS par retournement de la face, comme doit
+      ! l'etre e_bar (parite).
+      e_bar = (lam_l*sol(5, idl) + lam_r*solr(5) - (pr*vr - pl*vl)) &
+        / (lam_l + lam_r)
+
+      num = num + area*(lam_l + lam_r)*e_bar
+      den = den + area*(lam_l + lam_r)
+    end do
+
+    if (den > 0.0_DOUBLE) then
+      e_p = num/den
+    else
+      e_p = 0.0_DOUBLE
+    end if
+  end function nodal_energy
+
+  ! ===========================================================================
+  ! << A DEFINIR >>  Solveur de Riemann 1D du schema 'vp_ep'.
+  !
+  ! Entrees : les deux etats de maille sol_w_l, sol_w_r et leurs gamma, la
+  ! normale de la face, PLUS les deux quantites nodales deja calculees --
+  ! vn_nodal = u_p.n  et  e_nodal = e_p.
+  !
+  ! Sorties : les deux flux unilateraux, avec la convention du module
+  !     rhs(:, idl) -= A/mass(idl) * flux_l
+  !     rhs(:, idr) += A/mass(idr) * flux_r
+  ! donc flux = (-u_p.n, Pi*n, Pi*u_p.n) pour une fermeture en pression Pi.
+  !
+  ! Le PLACEHOLDER ci-dessous est la fermeture UNILATERALE de 'classic',
+  !     Pi_l = p_l - lam_l (u_p.n - v_l),   Pi_r = p_r + lam_r (u_p.n - v_r)
+  ! qui rend le schema conservatif (l'equilibre nodal est deja satisfait par la
+  ! vitesse de la passe 1) et a production d'entropie positive. e_nodal N'EST
+  ! PAS ENCORE UTILISE : c'est la ligne a ecrire. Tel quel, 'vp_ep' reproduit
+  ! donc 'classic' -- c'est voulu, ca donne une reference qui tourne.
+  ! ===========================================================================
+  subroutine rs_vp_ep(sol_w_l, sol_w_r, g_l, g_r, n, vn_nodal, e_nodal, &
+      flux_l, flux_r, pl_rec, vl_rec, pr_rec, vr_rec)
+    implicit none
+    real(kind=DOUBLE), dimension(5), intent(in) :: sol_w_l, sol_w_r
+    real(kind=DOUBLE), intent(in) :: g_l, g_r, vn_nodal, e_nodal
+    real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), dimension(5), intent(out) :: flux_l, flux_r
+    ! ordre 2 : p et v.n deja extrapoles au noeud par l'appelant. Absents = ordre 1.
+    real(kind=DOUBLE), intent(in), optional :: pl_rec, vl_rec, pr_rec, vr_rec
+
+    real(kind=DOUBLE) :: pl, pr, taul, taur, vl, vr, lam_l, lam_r, pi_l, pi_r
+    real(kind=DOUBLE) :: pvl, pvr, el, er
+
+    taul = sol_w_l(1)
+    taur = sol_w_r(1)
+    pl = pressure(sol_w_l, g_l)
+    pr = pressure(sol_w_r, g_r)
+    vl = dot_product(sol_w_l(2:4), n)
+    vr = dot_product(sol_w_r(2:4), n)
+    if (present(pl_rec)) pl = pl_rec
+    if (present(vl_rec)) vl = vl_rec
+    if (present(pr_rec)) pr = pr_rec
+    if (present(vr_rec)) vr = vr_rec
+    ! meme definition de lambda que 'classic' (et meme bascule
+    ! lambda_acoustic_only), pour que le placeholder soit une vraie reference
+    if (lambda_acoustic_only) then
+      lam_l = sqrt(max(0.0_DOUBLE, g_l*pl*taul))/taul
+      lam_r = sqrt(max(0.0_DOUBLE, g_r*pr*taur))/taur
+    else
+      lam_l = max(sqrt(max(0.0_DOUBLE, g_l*pl*taul))/taul, &
+        sqrt(max(0.0_DOUBLE, pr-pl)/taul), -(vr-vl)/taul)
+      lam_r = max(sqrt(max(0.0_DOUBLE, g_r*pr*taur))/taur, &
+        sqrt(max(0.0_DOUBLE, pl-pr)/taur), -(vr-vl)/taur)
+    end if
+
+    pi_l = pl - lam_l*(vn_nodal - vl)
+    pi_r = pr + lam_r*(vn_nodal - vr)
+
+    el = sol_w_l(5)
+    er = sol_w_r(5)
+
+    pvl = pl*vl - lam_l*(e_nodal - el)
+    pvr = pr*vr + lam_r*(e_nodal - er)
+
+    flux_l(1)   = -vn_nodal
+    flux_l(2:4) = pi_l*n
+    flux_l(5)   = pvl
+
+    flux_r(1)   = -vn_nodal
+    flux_r(2:4) = pi_r*n
+    flux_r(5)   = pvr
+  end subroutine rs_vp_ep
+
+  ! Etat miroir d'une paroi : meme tau, meme energie interne, composante normale
+  ! de la vitesse reflechie autour de v_target (0 pour une paroi fixe).
+  function mirror_state(sol_c, n, v_target) result(solm)
+    implicit none
+    real(kind=DOUBLE), dimension(5), intent(in) :: sol_c
+    real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), intent(in) :: v_target
+    real(kind=DOUBLE), dimension(5) :: solm
+    real(kind=DOUBLE) :: vn
+
+    vn = dot_product(sol_c(2:4), n)
+    solm = sol_c
+    solm(2:4) = sol_c(2:4) + 2.0_DOUBLE*(v_target - vn)*n
+    ! E est inchange en norme de vitesse (reflexion), donc sol(5) reste valable
+  end function mirror_state
+
   function tensor_product(a,b) result(c)
     implicit none
 
@@ -883,7 +1862,7 @@ contains
     integer(kind=ENTIER) :: i, j, k, mpi_ierr
     integer(kind=ENTIER) :: id_sub_face, id_face
     integer(kind=ENTIER) :: id_vert, id_sub_elem
-    real(kind=DOUBLE) :: dx, c, avg_sub_vol
+    real(kind=DOUBLE) :: dx, c, rho, lambda, mass_c, sum_al, sum_av
     real(kind=DOUBLE), dimension(5) :: w
     real(kind=DOUBLE), dimension(3) :: norm
 
@@ -891,9 +1870,18 @@ contains
     do i=1, mesh%n_elems
       c = sqrt(max(0.0_DOUBLE, gamma_arr(i)*pressure(sol(:, i), gamma_arr(i))*sol(1, i)))
       c = max(c, 1.0e-10_DOUBLE)
-      ! Use average sub-element volume: this prevents dt→0 when individual sub-elems
-      ! shrink due to cell distortion, while matching the reference scheme's dt scale.
-      avg_sub_vol = abs(mesh%elem(i)%volume) / real(mesh%elem(i)%n_sub_elems, DOUBLE)
+      ! Lagrangian wave speed (acoustic impedance), homogeneous to rho*a.
+      rho = 1.0_DOUBLE/max(sol(1, i), 1.0e-30_DOUBLE)
+      lambda = rho*c
+      mass_c = rho*abs(mesh%elem(i)%volume)
+      ! Accumulate over ALL sub-faces of the cell. The previous version took a min
+      ! of avg_sub_vol/(A_pcf*c) over sub-faces, i.e. omega_c/MAX_f(A_pcf*c) with the
+      ! sub-element volume replaced by its cell average. Both are non-conservative on
+      ! an irregular mesh (they coincide with the sum only when every sub-face has the
+      ! same area), and let a node be ejected on Voronoi cells while the run still
+      ! ends with EXIT_CODE 0.
+      sum_al = 0.0_DOUBLE
+      sum_av = 0.0_DOUBLE
       do j=1, mesh%elem(i)%n_sub_elems
         id_sub_elem = mesh%elem(i)%sub_elem(j)
         do k=1, mesh%sub_elem(id_sub_elem)%n_sub_faces
@@ -905,12 +1893,15 @@ contains
           else
             norm = -mesh%face(id_face)%norm
           end if
-          dt = min(dt, avg_sub_vol/(mesh%sub_face(id_sub_face)%area*c))
-          dt = min(dt, CV*avg_sub_vol &
-            /(1e-8_DOUBLE + abs(dot_product(vp(:, id_vert), norm))&
-            *mesh%face(id_face)%area))
+          sum_al = sum_al + mesh%sub_face(id_sub_face)%area*lambda
+          sum_av = sum_av + mesh%sub_face(id_sub_face)%area &
+            *abs(dot_product(vp(:, id_vert), norm))
         end do
       end do
+      ! dt <= omega_c / sum_f (a_pcf * lambda_pcf), written with the mass so that the
+      ! impedance form is explicit: m_c/sum(A*rho*a) == omega_c/sum(A*a).
+      dt = min(dt, mass_c/max(sum_al, 1.0e-30_DOUBLE))
+      dt = min(dt, CV*abs(mesh%elem(i)%volume)/(1.0e-8_DOUBLE + sum_av))
     end do
     dt = cfl * dt
 
@@ -925,6 +1916,8 @@ contains
 
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(inout) :: sol
+    real(kind=DOUBLE) :: r_gre, p_gre, p0_gre
+    real(kind=DOUBLE), dimension(2) :: v_gre
     real(kind=DOUBLE), dimension(5), intent(in) :: sol_uniform
     integer(kind=ENTIER), intent(in) :: init
     integer(kind=ENTIER), intent(in) :: me, num_procs
@@ -932,7 +1925,9 @@ contains
     logical, intent(in) :: boundary_2d
 
     integer(kind=ENTIER) :: i, imin, mpi_ierr
-    real(kind=DOUBLE) :: tot_vol, r, rmin, rmin_share
+    real(kind=DOUBLE) :: tot_vol, r, rmin, rmin_share, e_dep, vol_dep, rv, rvt, rv_share
+    integer(kind=ENTIER) :: iv0, j, k
+    logical :: node_at_origin
     !real(kind=DOUBLE), parameter :: r_sedov = 2.4_DOUBLE/20.0_DOUBLE
     real(kind=DOUBLE), parameter :: r_sedov = 0.011_DOUBLE
     real(kind=DOUBLE), parameter :: r_sedov_3d = 0.12_DOUBLE
@@ -973,10 +1968,13 @@ contains
       end do
 
 
+      ! Rayon minimal GLOBAL. Une seule reduction, et en MPI_DOUBLE_PRECISION : la
+      ! version precedente passait MPI_DOUBLE, qui est la constante du binding C et
+      ! n'est pas le type Fortran attendu ici.
+      rmin_share = rmin
       if (num_procs > 1) then
-        rmin_share = rmin
-        call MPI_ALLREDUCE(MPI_IN_PLACE, rmin_share, 1, MPI_DOUBLE, &
-          MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
+        call MPI_ALLREDUCE(MPI_IN_PLACE, rmin_share, 1, MPI_DOUBLE_PRECISION, MPI_MIN, &
+          MPI_COMM_WORLD, mpi_ierr)
         if (abs(rmin - rmin_share) > 1e-14_DOUBLE) imin = -1
       end if
 
@@ -986,11 +1984,105 @@ contains
         sol(5, i) = 1e-12_DOUBLE/(gamma_arr(i) - 1.0_DOUBLE)
       end do
 
-      if (imin > 0) then
-        if (boundary_2d) then
-          sol(5, imin) = 0.984042_DOUBLE/mesh%elem(imin)%volume
-        else
-          sol(5, imin) = 0.851072_DOUBLE/mesh%elem(imin)%volume
+      ! energie totale a deposer
+      e_dep = sedov_energy
+      if (e_dep <= 0.0_DOUBLE) then
+        e_dep = merge(0.984042_DOUBLE, 0.851072_DOUBLE, boundary_2d)
+      end if
+
+      ! Depot nodal : si un sommet du maillage tombe sur l'origine, l'energie va dans
+      ! TOUTES les cellules qui le touchent, au prorata du volume.
+      iv0 = -1
+      node_at_origin = .false.
+      if (sedov_nodal_deposit) then
+        ! variable dediee : ne PAS reutiliser rmin_share ici, il porte le rayon
+        ! minimal des CENTROIDES et sert au test d'egalite plus bas.
+        rv = huge(1.0_DOUBLE)
+        do i = 1, mesh%n_vert
+          if (boundary_2d) then
+            rvt = norm2(mesh%vert(i)%coord(:2))
+          else
+            rvt = norm2(mesh%vert(i)%coord)
+          end if
+          if (rvt < rv) then
+            rv = rvt
+            iv0 = i
+          end if
+        end do
+        ! Le test "un sommet est-il sur l'origine ?" doit etre GLOBAL. En local il
+        ! est faux sur tous les rangs qui ne possedent pas l'origine : ceux-la
+        ! tombaient alors dans la branche centroide et redeposaient de l'energie
+        ! sur leur propre minimum local, tout en contribuant a un ALLREDUCE que
+        ! le rang de l'origine faisait sur une autre quantite.
+        rv_share = rv
+        if (num_procs > 1) then
+          call MPI_ALLREDUCE(MPI_IN_PLACE, rv_share, 1, MPI_DOUBLE_PRECISION, MPI_MIN, &
+            MPI_COMM_WORLD, mpi_ierr)
+        end if
+        node_at_origin = (rv_share <= 1.0e-10_DOUBLE)
+        ! iv0 ne reste positif que sur les rangs qui touchent reellement l'origine
+        ! (un sommet d'interface est duplique : chacun sommera ses mailles non-ghost).
+        if (.not. node_at_origin .or. rv > 1.0e-10_DOUBLE) iv0 = -1
+      end if
+
+      if (node_at_origin) then
+        vol_dep = 0.0_DOUBLE
+        if (iv0 > 0) then
+          do j = 1, mesh%vert(iv0)%n_elems_neigh
+            k = mesh%vert(iv0)%elem_neigh(j)
+            if (k > 0) then
+              if (.not. mesh%elem(k)%is_ghost) vol_dep = vol_dep + mesh%elem(k)%volume
+            end if
+          end do
+        end if
+        ! collective prise par TOUS les rangs : node_at_origin est global.
+        if (num_procs > 1) then
+          call MPI_ALLREDUCE(MPI_IN_PLACE, vol_dep, 1, MPI_DOUBLE_PRECISION, MPI_SUM, &
+            MPI_COMM_WORLD, mpi_ierr)
+        end if
+        if (iv0 > 0 .and. vol_dep > 0.0_DOUBLE) then
+          do j = 1, mesh%vert(iv0)%n_elems_neigh
+            k = mesh%vert(iv0)%elem_neigh(j)
+            if (k > 0) then
+              if (.not. mesh%elem(k)%is_ghost) sol(5, k) = e_dep/vol_dep
+            end if
+          end do
+        end if
+      else
+        ! Pas de sommet a l'origine : deposer dans TOUTES les cellules a egale distance
+        ! minimale, pas dans une seule. Le cas se produit des que l'origine tombe sur une
+        ! arete ou une face -- sur le nid d'abeilles par exemple, deux centroides sont a
+        ! 0.02143 exactement, et l'ancien code tranchait l'egalite par l'ordre de boucle,
+        ! ce qui deposait toute l'energie d'un seul cote et brisait la symetrie des le
+        ! premier pas. La tolerance est relative au rayon minimal lui-meme.
+        vol_dep = 0.0_DOUBLE
+        if (sedov_nodal_deposit) then
+          do i = 1, mesh%n_elems
+            if (mesh%elem(i)%is_ghost) cycle
+            if (boundary_2d) then
+              r = norm2(mesh%elem(i)%coord(:2))
+            else
+              r = norm2(mesh%elem(i)%coord)
+            end if
+            if (r <= rmin_share*(1.0_DOUBLE + 1.0e-8_DOUBLE) + 1.0e-14_DOUBLE) &
+              vol_dep = vol_dep + mesh%elem(i)%volume
+          end do
+          call MPI_ALLREDUCE(MPI_IN_PLACE, vol_dep, 1, MPI_DOUBLE_PRECISION, MPI_SUM, &
+            MPI_COMM_WORLD, mpi_ierr)
+        end if
+        if (vol_dep > 0.0_DOUBLE) then
+          do i = 1, mesh%n_elems
+            if (mesh%elem(i)%is_ghost) cycle
+            if (boundary_2d) then
+              r = norm2(mesh%elem(i)%coord(:2))
+            else
+              r = norm2(mesh%elem(i)%coord)
+            end if
+            if (r <= rmin_share*(1.0_DOUBLE + 1.0e-8_DOUBLE) + 1.0e-14_DOUBLE) &
+              sol(5, i) = e_dep/vol_dep
+          end do
+        else if (imin > 0) then
+          sol(5, imin) = e_dep/mesh%elem(imin)%volume
         end if
       end if
     else if( init == 13) then
@@ -1045,6 +2137,38 @@ contains
       ! against. rho is uniform here, so the mass average is the volume average.
       do i=1, mesh%n_elems
         call taylor_green_cell_average(mesh, i, sol(:, i))
+      end do
+    else if( init == 11 ) then
+      ! Gresho vortex, same profile as the Euler solver's sol_gresho_mach:
+      ! rho = 1, purely azimuthal velocity v_theta = 5r (r<0.2), 2-5r
+      ! (0.2<r<0.4), 0 beyond, and the pressure that balances it. It is a
+      ! STEADY solution, so any departure from the initial state is scheme
+      ! error -- which is what makes it the low-Mach test.
+      ! gresho_mach sets the pressure level p0 = 1/(gamma*Ma^2); the smaller
+      ! it is, the harder the low-Mach regime.
+      do i=1, mesh%n_elems
+        r_gre = norm2(mesh%elem(i)%coord(:2))
+        p0_gre = 1.0_DOUBLE/(gamma_arr(i)*gresho_mach**2)
+        if (r_gre < 0.2_DOUBLE) then
+          v_gre(1) = -5.0_DOUBLE*mesh%elem(i)%coord(2)
+          v_gre(2) =  5.0_DOUBLE*mesh%elem(i)%coord(1)
+          p_gre = p0_gre + 12.5_DOUBLE*r_gre**2
+        else if (r_gre < 0.4_DOUBLE) then
+          v_gre(1) = (5.0_DOUBLE - 2.0_DOUBLE/r_gre)*mesh%elem(i)%coord(2)
+          v_gre(2) = (-5.0_DOUBLE + 2.0_DOUBLE/r_gre)*mesh%elem(i)%coord(1)
+          p_gre = p0_gre + 12.5_DOUBLE*r_gre**2 &
+            + 4.0_DOUBLE - 20.0_DOUBLE*r_gre + 4.0_DOUBLE*log(5.0_DOUBLE*r_gre)
+        else
+          v_gre(1) = 0.0_DOUBLE
+          v_gre(2) = 0.0_DOUBLE
+          p_gre = p0_gre - 2.0_DOUBLE + 4.0_DOUBLE*log(2.0_DOUBLE)
+        end if
+        sol(1, i) = 1.0_DOUBLE            ! specific volume, rho = 1
+        sol(2, i) = v_gre(1)
+        sol(3, i) = v_gre(2)
+        sol(4, i) = 0.0_DOUBLE
+        sol(5, i) = p_gre/(gamma_arr(i) - 1.0_DOUBLE) &
+          + 0.5_DOUBLE*(v_gre(1)**2 + v_gre(2)**2)
       end do
     else if( init == 42 ) then
       do i=1, mesh%n_elems
