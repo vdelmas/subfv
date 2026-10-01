@@ -553,22 +553,18 @@ contains
         area = mesh%sub_face(id_sub_face)%area
 
         is_zsubface = boundary_2d .and. abs(abs(norm(3)) - 1.0_DOUBLE) < 1.0e-6_DOUBLE
-        if (.not. is_zsubface) then
-          if (order>=2) then
-            ! Quadrature points on subface
-            allocate(face_coords(3, 4)) ! subfaces are always quadrilaterals
-            face_coords(:,1) = mesh%vert(i)%coord
-            face_coords(:,2) = mesh%sub_face(id_sub_face)%edge_vert(1,:) ! edge midpoint cpm
-            face_coords(:,3) = mesh%face(id_face)%coord
-            face_coords(:,4) = mesh%sub_face(id_sub_face)%edge_vert(2,:) ! edge midpoint cpp
-            call face_quad_pts_allocated(4, face_coords, int(order, ENTIER), qpts(:,:,j), qwts(:,j))
-            deallocate(face_coords)
-          else
-            qpts(:,1,j) = mesh%vert(i)%coord
-            qwts(1,j)   = area
-          end if
+        if (order>=2) then
+          ! Quadrature points on subface
+          allocate(face_coords(3, 4)) ! subfaces are always quadrilaterals
+          face_coords(:,1) = mesh%vert(i)%coord
+          face_coords(:,2) = mesh%sub_face(id_sub_face)%edge_vert(1,:) ! edge midpoint cpm
+          face_coords(:,3) = mesh%face(id_face)%coord
+          face_coords(:,4) = mesh%sub_face(id_sub_face)%edge_vert(2,:) ! edge midpoint cpp
+          call face_quad_pts_allocated(4, face_coords, int(order, ENTIER), qpts(:,:,j), qwts(:,j))
+          deallocate(face_coords)
         else
-          cycle
+          qpts(:,1,j) = mesh%vert(i)%coord
+          qwts(1,j)   = area
         end if
 
         ! we use MP scheme only in one quadrature point per subface, for now...
@@ -601,11 +597,6 @@ contains
         ir   = mesh%sub_face(id_sub_face)%right_elem_neigh
         norm = mesh%sub_face(id_sub_face)%norm
         area = mesh%sub_face(id_sub_face)%area
-
-        is_zsubface = boundary_2d .and. abs(abs(norm(3)) - 1.0_DOUBLE) < 1.0e-6_DOUBLE
-        if (is_zsubface) then
-          cycle
-        end if
 
         ! First quadrature point corresponding to MP scheme, attached to vertex
         select case (scheme_id)
@@ -649,19 +640,8 @@ contains
               end if
             end do
           case (4)
-            wL = sol_w_l(:, j)
-            wR = sol_w_r(:, j)
-            flux = rusanov(wL, wR, norm) * qwts(1,j)
-            rhs(:, il)  = rhs(:, il) - flux
-            lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
-                  abs(dot_product(wR(2:4), norm)) + cs(wR)) * qwts(1,j)
-            sum_lambda(il) = sum_lambda(il) + lambda
-            if (ir > 0) then
-              rhs(:, ir)  = rhs(:, ir)  + flux
-              sum_lambda(ir) = sum_lambda(ir) + lambda
-            end if
-            ! Other possible quadrature points to be treated with 2P flux
-            do k = 2,n_qpts
+            ! Same 2P flux is applied to all quadrature points
+            do k = 1,n_qpts
               wL = reconstruct(prim, grad, hess, il, qpts(:,k,j), mesh%elem(il)%coord)
               if (ir > 0) then
                 wR = reconstruct(prim, grad, hess, ir, qpts(:,k,j), mesh%elem(ir)%coord)
@@ -681,19 +661,8 @@ contains
               end if
             end do
           case default
-            wL = sol_w_l(:, j)
-            wR = sol_w_r(:, j)
-            flux = rusanov(wL, wR, norm) * qwts(1,j)
-            rhs(:, il)  = rhs(:, il) - flux
-            lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
-                  abs(dot_product(wR(2:4), norm)) + cs(wR)) * qwts(1,j)
-            sum_lambda(il) = sum_lambda(il) + lambda
-            if (ir > 0) then
-              rhs(:, ir)  = rhs(:, ir)  + flux
-              sum_lambda(ir) = sum_lambda(ir) + lambda
-            end if
-            ! Other possible quadrature points to be treated with 2P flux
-            do k = 2,n_qpts
+            ! Same 2P flux is applied to all quadrature points
+            do k = 1,n_qpts
               wL = reconstruct(prim, grad, hess, il, qpts(:,k,j), mesh%elem(il)%coord)
               if (ir > 0) then
                 wR = reconstruct(prim, grad, hess, ir, qpts(:,k,j), mesh%elem(ir)%coord)
