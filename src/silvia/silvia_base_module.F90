@@ -387,6 +387,57 @@ contains
     end if
   end subroutine sol_gresho_mach
 
+    pure subroutine sol_gresho_mach_C2(x, w, mach)
+    implicit none
+
+    real(kind=DOUBLE), dimension(3), intent(in) :: x
+    real(kind=DOUBLE), dimension(5), intent(inout) :: w
+    real(kind=DOUBLE), intent(in) :: mach
+
+    real(kind=DOUBLE) :: w_gresho_1, w_gresho_2, rho_gresho, p_gresho, r, u_ang, p_add, y
+    real(kind=DOUBLE), dimension(3) :: coord2
+
+    w_gresho_1 = 0.2_DOUBLE
+    w_gresho_2 = 0.4_DOUBLE
+    rho_gresho = 1.0_DOUBLE
+    p_gresho = rho_gresho/(gamma*mach**2)
+
+    coord2(:) = x - (/0._DOUBLE, 0._DOUBLE, 0._DOUBLE/)
+    r = norm2(coord2(:2))
+
+    if ( r<=w_gresho_1 ) then
+      u_ang = r**3 * ( 18750.0_DOUBLE * r**2 - 9375.0_DOUBLE * r + 1250.0_DOUBLE)
+      p_add = 1.0_DOUBLE/168.0_DOUBLE * 390625.0_DOUBLE * r**6 * &
+             (15120.0_DOUBLE * r**4 - 16800.0_DOUBLE * r**3 + 7245.0_DOUBLE * r**2 & 
+            - 1440.0_DOUBLE * r + 112.0_DOUBLE)
+    else if ( r<=w_gresho_2 ) then
+      u_ang = (5.0_DOUBLE * r - 2.0_DOUBLE) * (5.0_DOUBLE * r - 2.0_DOUBLE) &
+            * (5.0_DOUBLE * r - 2.0_DOUBLE) * (-15.0_DOUBLE * r - 6.0_DOUBLE &
+            * (5.0_DOUBLE * r - 1.0_DOUBLE) * (5.0_DOUBLE * r - 1.0_DOUBLE) + 2.0_DOUBLE )
+      p_add = 35156250.0_DOUBLE * r**10 - 117187500.0_DOUBLE * r**9 & 
+            + 1400390625.0_DOUBLE/8.0_DOUBLE * r**8 - 154687500.0_DOUBLE * r**7 &
+            + 269843750.0_DOUBLE/3.0_DOUBLE * r**6 - 36240000.0_DOUBLE * r**5 &
+            + 10387500.0_DOUBLE * r**4 - 6440000.0_DOUBLE/3.0_DOUBLE * r**3 &
+            + 324000.0_DOUBLE * r**2 - 38400.0_DOUBLE * r &
+            + 1024.0_DOUBLE * log(r) + 1024.0_DOUBLE * log(5.0_DOUBLE) + 283739.0_DOUBLE/105.0_DOUBLE
+    else
+      u_ang = 0.0_DOUBLE
+      y = 2.0_DOUBLE/5.0_DOUBLE
+      p_add = 35156250.0_DOUBLE * y**10 - 117187500.0_DOUBLE * y**9 &
+            + 1400390625.0_DOUBLE/8.0_DOUBLE * y**8 - 154687500.0_DOUBLE * y**7 &
+            + 269843750.0_DOUBLE/3.0_DOUBLE * y**6 - 36240000.0_DOUBLE * y**5 &
+            + 10387500.0_DOUBLE * y**4 - 6440000.0_DOUBLE/3.0_DOUBLE * y**3 &
+            + 324000.0_DOUBLE * y**2 - 38400.0_DOUBLE * y &
+            + 1024.0_DOUBLE * log(y) + 1024.0_DOUBLE * log(5.0_DOUBLE) + 283739./105.
+    end if
+
+    w(1) = rho_gresho
+    w(2) = -coord2(2)*u_ang
+    w(3) =  coord2(1)*u_ang
+    w(4) = 0.0_DOUBLE
+    w(5) = p_gresho + p_add
+  end subroutine sol_gresho_mach_C2
+
   pure subroutine sol_isentropic_vortex(coord, w, t)
     implicit none
 
@@ -441,7 +492,7 @@ contains
       end do
     else if (init_gresho) then
       do i = 1, mesh%n_elems
-        call sol_gresho_mach(mesh%elem(i)%coord, w, 1.0_DOUBLE)
+        call sol_gresho_mach_C2(mesh%elem(i)%coord, w, 1.0_DOUBLE)
         sol(:, i) = primit_to_conserv(w)
       end do
     end if
