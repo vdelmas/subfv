@@ -39,7 +39,6 @@ contains
       mesh%sub_face(i)%norm = compute_subface_norm(mesh, i)
       mesh%sub_face(i)%area = norm2(mesh%sub_face(i)%norm)
       mesh%sub_face(i)%norm = mesh%sub_face(i)%norm / mesh%sub_face(i)%area
-      mesh%sub_face(i)%edge_vert = compute_subface_edge_vert(mesh, i)
     end do
 
     do i=1, mesh%n_faces
@@ -178,37 +177,6 @@ contains
       end if
     end do
   end function compute_subelem_volume
-
-  pure function compute_subface_edge_vert(mesh, i) result (coord)
-    implicit none
-
-    type(mesh_type), intent(in) :: mesh
-    integer(kind=ENTIER), intent(in) :: i
-    real(kind=DOUBLE), dimension(2,3) :: coord
-    
-    integer(kind=ENTIER) :: j, k, kp, km, idvp, idv, idvm
-    integer(kind=ENTIER) :: id_sub_face, id_vert, id_face, id_elem
-    real(kind=DOUBLE), dimension(3) :: cp, cpm, cpp
-
-    id_vert = mesh%sub_face(i)%mesh_vert
-    id_face = mesh%sub_face(i)%mesh_face
-    
-    coord=0.0_DOUBLE
-    do k=1, mesh%face(id_face)%n_vert
-      idv = mesh%face(id_face)%vert(k)
-      if( idv == id_vert ) then
-        kp = 1+mod((k-1)+1, mesh%face(id_face)%n_vert)
-        km = 1+mod((k-1)-1+mesh%face(id_face)%n_vert,&
-          mesh%face(id_face)%n_vert)
-        exit
-      end if
-    end do
-    idvp = mesh%face(id_face)%vert(kp)
-    idvm = mesh%face(id_face)%vert(km)
-    cp = mesh%vert(idv)%coord
-    coord(1,:) = 0.5_DOUBLE*(mesh%vert(idvm)%coord+cp) !cpm
-    coord(2,:) = 0.5_DOUBLE*(mesh%vert(idvp)%coord+cp) !cpp
-  end function compute_subface_edge_vert
 
   pure function compute_face_norm(mesh, i) result(norm)
     implicit none

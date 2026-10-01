@@ -1214,7 +1214,7 @@ contains
     v_node = matmul(mat, rhs)
 
     iter = 0
-    do while (iter < 2)
+    do while (iter < 4)
       iter = iter + 1
 
       mat(:, :) = 0.0_DOUBLE

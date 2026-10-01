@@ -47,7 +47,7 @@ module quadrature_module
   implicit none
   private
 
-  public :: n_face_quad_pts, face_quad_pts, face_quad_pts_allocated
+  public :: n_face_quad_pts, face_quad_pts, quad_face_rule
   public :: n_volume_quad_pts, volume_quad_pts
   public :: n_face_gl_quad_pts, face_gl_quad_pts
   public :: n_face_gl_iso_quad_pts, face_gl_iso_quad_pts
@@ -147,24 +147,6 @@ contains
     case (4); call quad_face_rule(coords, order, pts, wts)
     end select
   end subroutine face_quad_pts
-
-  ! ----------------------------------------------------------------
-  ! face_quad_pts: physical quadrature on a face polygon
-  ! ----------------------------------------------------------------
-
-  subroutine face_quad_pts_allocated(n_nodes, coords, order, pts, wts)
-    integer(kind=ENTIER), intent(in) :: n_nodes, order
-    real(kind=DOUBLE), dimension(3, n_nodes), intent(in) :: coords
-    real(kind=DOUBLE), dimension(:,:), intent(inout) :: pts
-    real(kind=DOUBLE), dimension(:),   intent(inout) :: wts
-    integer(kind=ENTIER) :: n
-
-    n = n_face_quad_pts(n_nodes, order)
-    select case (n_nodes)
-    case (3); call tri_face_rule(coords, order, pts, wts)
-    case (4); call quad_face_rule(coords, order, pts, wts)
-    end select
-  end subroutine face_quad_pts_allocated
 
   ! ----------------------------------------------------------------
   ! volume_quad_pts: physical quadrature on a volume element

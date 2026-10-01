@@ -54,7 +54,6 @@ module mesh_module
     integer(kind=ENTIER) :: left_sub_elem_neigh = 0, right_sub_elem_neigh = 0
     real(kind=DOUBLE) :: area
     real(kind=DOUBLE), dimension(3) :: norm
-    real(kind=DOUBLE), dimension(2,3) :: edge_vert
   end type sub_face_type
 
   type :: elem_type

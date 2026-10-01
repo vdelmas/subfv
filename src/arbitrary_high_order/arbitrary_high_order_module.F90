@@ -56,12 +56,12 @@ module arbitrary_high_order_module
   ! eps_weno floors a WENO indicator ratio against literal division by zero.
   real(kind=DOUBLE), parameter :: eps_weno = tiny(1.0_DOUBLE)
   ! Regularizes oi_v in scatter_weno_weighted; eps_weight_num_deep is a looser floor for hess/third; GG has its own decoupled eps_weight_num_gg/_deep_gg.
-  real(kind=DOUBLE), public :: eps_weight_num = 1.0e-2_DOUBLE
+  real(kind=DOUBLE), public :: eps_weight_num = 1.0e-8_DOUBLE
   real(kind=DOUBLE), public :: eps_weight_num_deep = 1.0_DOUBLE
-  real(kind=DOUBLE), public :: eps_weight_num_gg = 1.0e-2_DOUBLE
+  real(kind=DOUBLE), public :: eps_weight_num_gg = 1.0e-8_DOUBLE
   real(kind=DOUBLE), public :: eps_weight_num_deep_gg = 1.0_DOUBLE
   ! Exponent on the oscillation indicator: weight = omega_p/(eps+OI_v^weno_power).
-  integer(kind=ENTIER), public :: weno_power = 1
+  integer(kind=ENTIER), public :: weno_power = 2
   ! Calibration divisor on the gradient-norm term added to oi_v (LS) / oi_v's only term (GG).
   real(kind=DOUBLE), public :: grad_norm_derate = 1.0e4_DOUBLE
   real(kind=DOUBLE), public :: grad_norm_derate_gg = 1.0e4_DOUBLE
