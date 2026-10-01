@@ -510,8 +510,9 @@ contains
     integer(kind=ENTIER) :: iloop
     integer(kind=ENTIER) :: i, j, k, id_sub_face, id_face
     real(kind=DOUBLE), dimension(3) :: norm, xface
-    real(kind=DOUBLE), dimension(:, :), allocatable :: face_coords, qpts
-    real(kind=DOUBLE), dimension(:),    allocatable :: qwts
+    real(kind=DOUBLE), dimension(:, :),  allocatable :: face_coords
+    real(kind=DOUBLE), dimension(:,:,:), allocatable :: qpts
+    real(kind=DOUBLE), dimension(:,:),   allocatable :: qwts
     real(kind=DOUBLE), dimension(5) :: wL, wR, flux, sol_l, sol_r
     real(kind=DOUBLE), dimension(5,2) :: lr_flux
     real(kind=DOUBLE) :: lambda
@@ -534,6 +535,14 @@ contains
       allocate(lambda_r(ng))
       allocate(weight(ng))
       allocate(norm_list(3, ng))
+      if (order>=2) then
+        allocate(qpts(3,4,ng))
+        allocate(qwts(4,ng))
+      else
+        allocate(qpts(3,1,ng))
+        allocate(qwts(1,ng))
+      end if
+      n_qpts = size(qwts(:,1))
 
       do j = 1, mesh%vert(i)%n_sub_faces_neigh
         id_sub_face = mesh%vert(i)%sub_face_neigh(j)
@@ -544,25 +553,28 @@ contains
         area = mesh%sub_face(id_sub_face)%area
 
         is_zsubface = boundary_2d .and. abs(abs(norm(3)) - 1.0_DOUBLE) < 1.0e-6_DOUBLE
-        if (order>=2 .and. .not. is_zsubface) then
-          ! Quadrature points on subface
-          allocate(face_coords(3, 4)) ! subfaces are always quadrilaterals
-          face_coords(:,1) = mesh%vert(i)%coord
-          face_coords(:,2) = mesh%vert(i)%coord ! edge midpoint
-          face_coords(:,3) = mesh%face(id_face)%coord
-          face_coords(:,4) = mesh%vert(i)%coord ! edge midpoint
-          call face_quad_pts(4, face_coords, int(order, ENTIER), qpts, qwts)
-          deallocate(face_coords)
+        if (.not. is_zsubface) then
+          if (order>=2) then
+            ! Quadrature points on subface
+            allocate(face_coords(3, 4)) ! subfaces are always quadrilaterals
+            face_coords(:,1) = mesh%vert(i)%coord
+            face_coords(:,2) = mesh%sub_face(id_sub_face)%edge_vert(1,:) ! edge midpoint cpm
+            face_coords(:,3) = mesh%face(id_face)%coord
+            face_coords(:,4) = mesh%sub_face(id_sub_face)%edge_vert(2,:) ! edge midpoint cpp
+            call face_quad_pts_allocated(4, face_coords, int(order, ENTIER), qpts(:,:,j), qwts(:,j))
+            deallocate(face_coords)
+          else
+            qpts(:,1,j) = mesh%vert(i)%coord
+            qwts(1,j)   = area
+          end if
         else
-          allocate(qpts(3, 1), qwts(1))
-          qpts(:, 1) = mesh%vert(i)%coord
-          qwts(1)    = area
+          cycle
         end if
 
         ! we use MP scheme only in one quadrature point per subface, for now...
-        wL = reconstruct(prim, grad, hess, il, qpts(:,1), mesh%elem(il)%coord)
+        wL = reconstruct(prim, grad, hess, il, qpts(:,1,j), mesh%elem(il)%coord)
         if (ir > 0) then
-          wR = reconstruct(prim, grad, hess, ir, qpts(:,1), mesh%elem(ir)%coord)
+          wR = reconstruct(prim, grad, hess, ir, qpts(:,1,j), mesh%elem(ir)%coord)
         else
           sol_l = primit_to_conserv(wL)
           call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
@@ -573,17 +585,15 @@ contains
         sol_w_r(:, j) = wR
         lambda_l(j) = 0.0_DOUBLE
         lambda_r(j) = 0.0_DOUBLE
-        weight(j) = area
+        weight(j) = qwts(1,j)
         norm_list(:, j) = norm
-
-        deallocate(qpts, qwts)
       end do
 
       !Solve the nodal system 
       call compute_lambdas_and_solve_nodal_velocity_new(ng, weight,&
          norm_list, lambda_l, lambda_r, sol_w_l, sol_w_r, v_node)
 
-      !Compute the multi_point flux
+      !Compute flux integral on subface
       do j = 1, mesh%vert(i)%n_sub_faces_neigh
         id_sub_face = mesh%vert(i)%sub_face_neigh(j)
         id_face = mesh%sub_face(id_sub_face)%mesh_face
@@ -591,6 +601,11 @@ contains
         ir   = mesh%sub_face(id_sub_face)%right_elem_neigh
         norm = mesh%sub_face(id_sub_face)%norm
         area = mesh%sub_face(id_sub_face)%area
+
+        is_zsubface = boundary_2d .and. abs(abs(norm(3)) - 1.0_DOUBLE) < 1.0e-6_DOUBLE
+        if (is_zsubface) then
+          cycle
+        end if
 
         ! First quadrature point corresponding to MP scheme, attached to vertex
         select case (scheme_id)
@@ -607,43 +622,101 @@ contains
               lambda_l(j), lambda_r(j), sl, sr)
             ! lr_flux is per unit area; lr_flux(:, 2) is already the right cell's
             ! outgoing flux (multi_point negates it)
-            lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
-                  abs(dot_product(wR(2:4), norm)) + cs(wR)) * mesh%sub_face(id_sub_face)%area
-            rhs(:, il)  = rhs(:, il)  - area*lr_flux(:, 1)
-            sum_lambda(il) = sum_lambda(il) + max(0.0_DOUBLE, -sl)*area
+            rhs(:, il)  = rhs(:, il)  - qwts(1,j)*lr_flux(:, 1)
+            sum_lambda(il) = sum_lambda(il) + max(0.0_DOUBLE, -sl)*qwts(1,j)
             if (ir > 0) then
-              rhs(:, ir)     = rhs(:, ir)     - area*lr_flux(:, 2)
-              sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*area
+              rhs(:, ir)     = rhs(:, ir)     - qwts(1,j)*lr_flux(:, 2)
+              sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*qwts(1,j)
             end if
+            ! Other possible quadrature points to be treated with 2P flux
+            do k = 2,n_qpts
+              wL = reconstruct(prim, grad, hess, il, qpts(:,k,j), mesh%elem(il)%coord)
+              if (ir > 0) then
+                wR = reconstruct(prim, grad, hess, ir, qpts(:,k,j), mesh%elem(ir)%coord)
+              else
+                sol_l = primit_to_conserv(wL)
+                call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
+                wR = conserv_to_primit(sol_r)
+              end if
+              flux = rusanov(wL, wR, norm) * qwts(k,j)
+              rhs(:, il)  = rhs(:, il) - flux
+              lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
+                    abs(dot_product(wR(2:4), norm)) + cs(wR)) * qwts(k,j)
+              sum_lambda(il) = sum_lambda(il) + lambda
+              if (ir > 0) then
+                rhs(:, ir)  = rhs(:, ir)  + flux
+                sum_lambda(ir) = sum_lambda(ir) + lambda
+              end if
+            end do
           case (4)
             wL = sol_w_l(:, j)
             wR = sol_w_r(:, j)
-            flux = rusanov(wL, wR, norm) * mesh%sub_face(id_sub_face)%area
+            flux = rusanov(wL, wR, norm) * qwts(1,j)
             rhs(:, il)  = rhs(:, il) - flux
             lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
-                  abs(dot_product(wR(2:4), norm)) + cs(wR)) * mesh%sub_face(id_sub_face)%area
+                  abs(dot_product(wR(2:4), norm)) + cs(wR)) * qwts(1,j)
             sum_lambda(il) = sum_lambda(il) + lambda
             if (ir > 0) then
               rhs(:, ir)  = rhs(:, ir)  + flux
               sum_lambda(ir) = sum_lambda(ir) + lambda
             end if
+            ! Other possible quadrature points to be treated with 2P flux
+            do k = 2,n_qpts
+              wL = reconstruct(prim, grad, hess, il, qpts(:,k,j), mesh%elem(il)%coord)
+              if (ir > 0) then
+                wR = reconstruct(prim, grad, hess, ir, qpts(:,k,j), mesh%elem(ir)%coord)
+              else
+                sol_l = primit_to_conserv(wL)
+                call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
+                wR = conserv_to_primit(sol_r)
+              end if
+              flux = rusanov(wL, wR, norm) * qwts(k,j)
+              rhs(:, il)  = rhs(:, il) - flux
+              lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
+                    abs(dot_product(wR(2:4), norm)) + cs(wR)) * qwts(k,j)
+              sum_lambda(il) = sum_lambda(il) + lambda
+              if (ir > 0) then
+                rhs(:, ir)  = rhs(:, ir)  + flux
+                sum_lambda(ir) = sum_lambda(ir) + lambda
+              end if
+            end do
           case default
             wL = sol_w_l(:, j)
             wR = sol_w_r(:, j)
-            flux = rusanov(wL, wR, norm) * mesh%sub_face(id_sub_face)%area
+            flux = rusanov(wL, wR, norm) * qwts(1,j)
             rhs(:, il)  = rhs(:, il) - flux
             lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
-                  abs(dot_product(wR(2:4), norm)) + cs(wR)) * mesh%sub_face(id_sub_face)%area
+                  abs(dot_product(wR(2:4), norm)) + cs(wR)) * qwts(1,j)
             sum_lambda(il) = sum_lambda(il) + lambda
             if (ir > 0) then
               rhs(:, ir)  = rhs(:, ir)  + flux
               sum_lambda(ir) = sum_lambda(ir) + lambda
             end if
+            ! Other possible quadrature points to be treated with 2P flux
+            do k = 2,n_qpts
+              wL = reconstruct(prim, grad, hess, il, qpts(:,k,j), mesh%elem(il)%coord)
+              if (ir > 0) then
+                wR = reconstruct(prim, grad, hess, ir, qpts(:,k,j), mesh%elem(ir)%coord)
+              else
+                sol_l = primit_to_conserv(wL)
+                call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
+                wR = conserv_to_primit(sol_r)
+              end if
+              flux = rusanov(wL, wR, norm) * qwts(k,j)
+              rhs(:, il)  = rhs(:, il) - flux
+              lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
+                    abs(dot_product(wR(2:4), norm)) + cs(wR)) * qwts(k,j)
+              sum_lambda(il) = sum_lambda(il) + lambda
+              if (ir > 0) then
+                rhs(:, ir)  = rhs(:, ir)  + flux
+                sum_lambda(ir) = sum_lambda(ir) + lambda
+              end if
+            end do
         end select
       end do
 
       deallocate(sol_w_l, sol_w_r, lambda_l, lambda_r, weight, norm_list)
-      ! deallocate(qpts, qwts)
+      deallocate(qpts, qwts)
     end do
   end subroutine subface_flux_loop
 
