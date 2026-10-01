@@ -55,13 +55,13 @@ module arbitrary_high_order_module
 
   ! eps_weno floors a WENO indicator ratio against literal division by zero.
   real(kind=DOUBLE), parameter :: eps_weno = tiny(1.0_DOUBLE)
-  ! Regularizes oi_v in scatter_weno_weighted; eps_weight_num_deep is a looser floor for hess/third; GG has its own decoupled eps_weight_num_gg/_deep_gg.
-  real(kind=DOUBLE), public :: eps_weight_num = 1.0e-8_DOUBLE
-  real(kind=DOUBLE), public :: eps_weight_num_deep = 1.0_DOUBLE
-  real(kind=DOUBLE), public :: eps_weight_num_gg = 1.0e-8_DOUBLE
-  real(kind=DOUBLE), public :: eps_weight_num_deep_gg = 1.0_DOUBLE
+  ! Regularizes oi_v in scatter_weno_weighted (weight=1/(eps+OI^p)), the same single floor at every
+  ! recursion level (grad/hess/third) and for both LS and GG: a dedicated, larger floor for
+  ! hess/third was tried and swept (1 to 1e4) with no measurable effect on the order-4 rate, so it
+  ! was dropped rather than kept as an unused knob.
+  real(kind=DOUBLE), public :: eps_weight_num = 1.0e-2_DOUBLE
   ! Exponent on the oscillation indicator: weight = omega_p/(eps+OI_v^weno_power).
-  integer(kind=ENTIER), public :: weno_power = 2
+  integer(kind=ENTIER), public :: weno_power = 1
   ! Calibration divisor on the gradient-norm term added to oi_v (LS) / oi_v's only term (GG).
   real(kind=DOUBLE), public :: grad_norm_derate = 1.0e4_DOUBLE
   real(kind=DOUBLE), public :: grad_norm_derate_gg = 1.0e4_DOUBLE
@@ -269,7 +269,7 @@ contains
     logical, intent(in) :: boundary_2d
     real(kind=DOUBLE), dimension(nc_in, mesh%n_elems), intent(in) :: phi
     real(kind=DOUBLE), dimension(nc_in*d, mesh%n_elems), intent(out) :: dphi
-    ! Recursion level: 1=grad, 2=hess, 3=third -- selects eps_weight_num vs eps_weight_num_deep. Defaults to 1.
+    ! Recursion level: 1=grad, 2=hess, 3=third -- only grad (1) gets the wall-mirror tangent fit. Defaults to 1.
     integer(kind=ENTIER), intent(in), optional :: deriv_order
     ! Optional: exposes the per-vertex nodal estimate, used by apply_grad_bias_correction to avoid a redundant LS solve.
     real(kind=DOUBLE), dimension(:, :), allocatable, intent(out), optional :: dphi_v_out
@@ -305,8 +305,11 @@ contains
     weno_num = 0.0_DOUBLE
     weno_den = 0.0_DOUBLE
 
-    ! A boundary vertex is skipped unless boundary_2d; a wall-mirror vertex gets a tangent-plane
-    ! fit, others get a phantom near-zero-gradient scatter (pulls neighbors toward first order).
+    ! Every boundary vertex contributes something: a wall-mirror vertex gets a tangent-plane fit,
+    ! any other gets a phantom near-zero-gradient scatter at the SAME eps_weight_num as a real
+    ! vertex (not an artificially tiny eps -- that used to give the phantom ~1e14x the weight of
+    ! a real neighbor, silently zeroing the gradient of any cell touching one boundary vertex,
+    ! not just cells entirely surrounded by them).
     do id_vert = 1, mesh%n_vert
       if (mesh%vert(id_vert)%is_bound) then
         if (deriv_order_eff == 1 .and. is_wall_mirror_vertex(id_vert, mesh%n_vert)) then
@@ -327,8 +330,7 @@ contains
           dphi_v_cache(:, id_vert) = dphi_v_zero
           valid_cache(id_vert) = .true.
           oi_cache(id_vert) = 0.0_DOUBLE
-          call scatter_weno_weighted(mesh, id_vert, dphi_v_zero, 0.0_DOUBLE, weno_num, weno_den, &
-            eps_in=1.0e-16_DOUBLE)
+          call scatter_weno_weighted(mesh, id_vert, dphi_v_zero, 0.0_DOUBLE, weno_num, weno_den)
         end block
         cycle
       end if
@@ -474,9 +476,9 @@ contains
     if (use_weno_blend) then
       if (use_green_gauss) then
         if (use_alt_gg_weight) then
-          vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num_gg + (1.0_DOUBLE + oi_v)**weno_power)
+          vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + (1.0_DOUBLE + oi_v)**weno_power)
         else
-          vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num_gg + oi_v**weno_power)
+          vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + oi_v**weno_power)
         end if
       else
         vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + oi_v**weno_power)
@@ -534,9 +536,9 @@ contains
       if (use_weno_blend) then
         if (use_green_gauss) then
           if (use_alt_gg_weight) then
-            vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num_gg + (1.0_DOUBLE + oi_v)**weno_power)
+            vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + (1.0_DOUBLE + oi_v)**weno_power)
           else
-            vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num_gg + oi_v**weno_power)
+            vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + oi_v**weno_power)
           end if
         else
           vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + oi_v**weno_power)
@@ -933,8 +935,7 @@ contains
 
     real(kind=DOUBLE), dimension(nc_in*d) :: dphi_v
     logical :: valid
-    real(kind=DOUBLE) :: oi_v, eps_here
-    integer(kind=ENTIER) :: deriv_order_eff
+    real(kind=DOUBLE) :: oi_v
 
     if (use_green_gauss) then
       call compute_nodal_derivative_at_vertex_green_gauss(mesh, d, nc_in, boundary_2d, &
@@ -951,15 +952,9 @@ contains
     oi_cache(id_vert) = oi_v
     if (.not. valid) return
 
-    deriv_order_eff = 1
-    if (present(deriv_order)) deriv_order_eff = deriv_order
-    if (use_green_gauss) then
-      eps_here = merge(eps_weight_num_gg, eps_weight_num_deep_gg, deriv_order_eff <= 1)
-    else
-      eps_here = merge(eps_weight_num, eps_weight_num_deep, deriv_order_eff <= 1)
-    end if
-
-    call scatter_weno_weighted(mesh, id_vert, dphi_v, oi_v, weno_num, weno_den, skip_cell, eps_here)
+    ! deriv_order kept for the caller's own bookkeeping; the WENO weight itself uses a single
+    ! eps_weight_num at every recursion level (see its declaration).
+    call scatter_weno_weighted(mesh, id_vert, dphi_v, oi_v, weno_num, weno_den, skip_cell)
   end subroutine accumulate_weno_contribution
 
   ! Same scatter as accumulate_weno_contribution, reusing an already-cached dphi_v (MPI-overlap Step 3) instead of a second LAPACK solve.
@@ -982,8 +977,8 @@ contains
       oi_cache(id_vert), weno_num, weno_den, skip_cell)
   end subroutine accumulate_cached_weno_contribution
 
-  ! Shared scatter: weight=omega_p/(eps+OI^p), omega_p=sub_elem_volume, OI=oi_v (the vertex's own fit residual/gradient-norm indicator, see compute_nodal_derivative_at_vertex).
-  subroutine scatter_weno_weighted(mesh, id_vert, dphi_v, oi_v, weno_num, weno_den, skip_cell, eps_in)
+  ! Shared scatter: weight=omega_p/(eps_weight_num+OI^p), omega_p=sub_elem_volume, OI=oi_v (the vertex's own fit residual/gradient-norm indicator, see compute_nodal_derivative_at_vertex). eps_weight_num is the single WENO floor, used identically here for a real vertex and for the boundary phantom scatter (compute_next_order_derivative) -- no level- or algorithm-specific override.
+  subroutine scatter_weno_weighted(mesh, id_vert, dphi_v, oi_v, weno_num, weno_den, skip_cell)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -993,21 +988,16 @@ contains
     real(kind=DOUBLE), dimension(:, :), intent(inout) :: weno_num
     real(kind=DOUBLE), dimension(:), intent(inout) :: weno_den
     logical, dimension(:), intent(in), optional :: skip_cell
-    ! Overrides eps_weight_num when present (level-dependent eps, grad vs hess/third).
-    real(kind=DOUBLE), intent(in), optional :: eps_in
 
     integer(kind=ENTIER) :: j, id_elem, id_sub_elem
-    real(kind=DOUBLE) :: sub_elem_volume, vertex_weno_weight, eps_use
-
-    eps_use = eps_weight_num
-    if (present(eps_in)) eps_use = eps_in
+    real(kind=DOUBLE) :: sub_elem_volume, vertex_weno_weight
 
     if (use_weno_blend) then
       ! GG-only alternative bounds the smooth-data weight near 1/(eps+1) instead of blowing up to 1/eps as OI->0.
       if (use_green_gauss .and. use_alt_gg_weight) then
-        vertex_weno_weight = 1.0_DOUBLE / (eps_use + (1.0_DOUBLE + oi_v)**weno_power)
+        vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + (1.0_DOUBLE + oi_v)**weno_power)
       else
-        vertex_weno_weight = 1.0_DOUBLE / (eps_use + oi_v**weno_power)
+        vertex_weno_weight = 1.0_DOUBLE / (eps_weight_num + oi_v**weno_power)
       end if
     else
       ! weight=1 cancels out of num/den, leaving a plain sub_elem_volume-weighted average.
