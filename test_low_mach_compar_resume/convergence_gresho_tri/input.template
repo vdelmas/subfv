@@ -1,0 +1,43 @@
+&INPUT_PARAM
+
+  meshfile_path='',
+  meshfile='gresho_tri.msh'
+
+  periodic_mesh = .true.
+  use_cylinder_map = .false.
+  dim_cylinder_map = 2
+
+  n_iter_print=1
+  n_iter_write_sol=100000
+  n_max_iter=10
+  final_res=1e-14
+
+  second_order = .false.
+  activate_diffusion = .false.
+
+  local_time_step=.false.
+  cfl=0.8
+  tmax=1e10
+
+  init_gresho=.true.,
+
+  n_bc=1,
+  bc_name='all_surf',
+  bc_type='outflowsupersonic',
+  bc_val=1., 0., 0., 0., 71.43
+
+  bc_type_V='',
+  bc_val_V=0., 0., 0.
+
+  bc_type_T='',
+  bc_val_T=0.
+
+  bc_style = 2,
+  boundary_2d=.true.
+  error_2d_h=1,
+  exclude_bound_vert=.false.
+
+  scheme='SCHEME_PLACEHOLDER',
+
+  write_residual=.false.
+  /
