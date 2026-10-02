@@ -1,0 +1,22 @@
+&INPUT_PARAM
+  meshfile_path=''
+  meshfile='MESH_PLACEHOLDER'
+
+  boundary_2d = .true.
+
+  sol_uniform=1.0, 0., 0., 0., 1.0,
+
+  ! one full rotation of the inner core is t = 2*pi/5 ~ 1.2566; the vortex is a
+  ! steady solution, so any drift from the initial state is scheme error.
+  t_max = 1.0
+  cfl = 0.2
+
+  scheme = 'SCHEME_PLACEHOLDER'
+  second_order = .false.
+
+  init = 11
+  gresho_mach = MACH_PLACEHOLDER
+
+  n_sol_vtu = 21
+  n_bc=0
+  /
