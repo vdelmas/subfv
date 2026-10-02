@@ -83,3 +83,11 @@ residual.dat
 !*exact*.dat
 !ref_*.dat
 !*_ref.dat
+
+# LaTeX report directories are not tracked, sources included. This is the
+# repository's established convention, not a new decision: tex_ale,
+# tex_arbitrary_high_order, tex_comparison_classic_iso, tex_lagrange_o2,
+# tex_lagrange_ph and tex_vilar have never had a single tracked file. The rule is
+# written down here because tex_all_mach_number_scheme was briefly added in
+# 077ab25 and removed again -- the convention was invisible until someone broke it.
+tex_*/
