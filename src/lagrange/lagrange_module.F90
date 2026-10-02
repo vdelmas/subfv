@@ -47,6 +47,43 @@ module lagrange_module
   ! compute_rhs_lagrange_vp_ep). Publique pour pouvoir etre relue/ecrite.
   real(kind=DOUBLE), allocatable, public :: ep_node(:)
 
+  ! --- variantes 'vp_ep_wip' -------------------------------------------------
+  ! vp_ep dissipe au CONTACT parce que son terme correctif lam_c (e_p - e_c) est
+  ! indexe sur le saut d'ENERGIE, maximal la-bas, alors que celui de 'classic',
+  ! lam_c (u_p.n - v_c), est indexe sur le saut de VITESSE, nul la-bas. Mesure sur
+  ! le Sod cylindrique : de/e = 0.048 contre dv/v = 0.007 et dp/p = 0.002 de part
+  ! et d'autre du contact ; largeur du contact 0.025 contre 0.010 pour classic.
+  !
+  ! On remplace donc lam_c par mu_c = lam_c * phi_c, avec phi_c -> 0 au contact.
+  ! CRUCIAL : mu_c doit remplacer lam_c A LA FOIS dans le flux ET dans la
+  ! definition de e_p, sinon la telescopie qui assure la conservation exacte est
+  ! rompue. Avec la meme substitution des deux cotes,
+  !   e_p = somme A[(mu_l e_l + mu_r e_r) + (p_l v_l - p_r v_r)] / somme A(mu_l+mu_r)
+  ! et somme A (pv_l - pv_r) = 0 se refait a l'identique, quel que soit mu.
+  !
+  !   'dv'   phi = |u_p.n - v_c| / (|u_p.n - v_c| + a_c)      saut de vitesse
+  !   'dp'   phi = |p_r - p_l|   / (|p_r - p_l|   + p_c)      saut de pression
+  !   'none' phi = 1                                           = vp_ep d'origine
+  ! Defaut 'dp' : mesure sur le Sod cylindrique, largeur du contact 0.0049 contre
+  ! 0.0103 pour classic et 0.0252 pour vp_ep. 'dv' DEGRADE (0.0333) : au contact
+  ! phi_dv tombe au plancher, mu -> 0, et e_p devient une indetermination 0/0
+  ! dominee par le terme de flux.
+  character(len=16), public :: vp_ep_wip_mode = 'dp'
+  ! Plancher sur phi : a phi = 0 partout autour d'un noeud, e_p est indetermine
+  ! (0/0). Le plancher garde le systeme bien pose et fixe la dissipation residuelle.
+  real(kind=DOUBLE), public :: vp_ep_wip_floor = 1.0e-3_DOUBLE
+  logical, public :: vp_ep_wip = .false.
+  ! Plafond de positivite sur la correction d'energie. Mesure sur Noh : le terme
+  ! mu_c (e_p - e_c) vide les mailles du quasi-vide (p0 = 1e-6) jusqu'a
+  ! e_int = -1.07e-6 des le dump 2, AVANT tout NaN, qui n'apparaissent qu'ensuite.
+  ! On borne donc |mu_c (e_p - e_c)| par clip * lam_c * e_c, homogene et local.
+  ! 0 = pas de plafond, ET C'EST LE DEFAUT : teste a 1.0 et 0.2, le plafond ne
+  ! debloque NI Noh NI Saltzman et CASSE sedov_quad, qui passait (189 NaN contre 0).
+  ! Etant unilateral il rompt la telescopie et introduit un desequilibre nouveau.
+  ! Conserve uniquement pour documenter la tentative.
+  real(kind=DOUBLE), public :: vp_ep_wip_clip = 0.0_DOUBLE
+
+
   ! Sedov (init=1) : ou deposer l'energie.
   ! .false. (defaut) = comportement historique, tout dans l'UNIQUE cellule dont le
   !   centroide est le plus proche de l'origine.
@@ -1665,7 +1702,7 @@ contains
 
     integer(kind=ENTIER) :: j, id_sub_face, id_face, idl, idr
     real(kind=DOUBLE) :: area, gl, gr, taul, taur, pl, pr, lam_l, lam_r
-    real(kind=DOUBLE) :: e_bar, num, den, v_target, vl, vr
+    real(kind=DOUBLE) :: e_bar, num, den, v_target, vl, vr, mu_l, mu_r
     real(kind=DOUBLE), dimension(5) :: solr
 
     num = 0.0_DOUBLE
@@ -1730,11 +1767,15 @@ contains
       ! satisfaites : lam*e est en rho v^3 comme Delta(p v) (homogeneite), et e
       ! comme Delta(p v) sont INVARIANTS par retournement de la face, comme doit
       ! l'etre e_bar (parite).
-      e_bar = (lam_l*sol(5, idl) + lam_r*solr(5) - (pr*vr - pl*vl)) &
-        / (lam_l + lam_r)
+      ! mu = lam * phi (phi = 1 hors mode wip). La MEME substitution est faite
+      ! dans rs_vp_ep, ce qui preserve la telescopie donc la conservation exacte.
+      mu_l = lam_l*wip_phi(dot_product(u_p, mesh%face(id_face)%norm), vl, taul, pl, gl, pr - pl)
+      mu_r = lam_r*wip_phi(dot_product(u_p, mesh%face(id_face)%norm), vr, taur, pr, gr, pr - pl)
+      if (mu_l + mu_r <= 0.0_DOUBLE) cycle
+      e_bar = (mu_l*sol(5, idl) + mu_r*solr(5) - (pr*vr - pl*vl)) / (mu_l + mu_r)
 
-      num = num + area*(lam_l + lam_r)*e_bar
-      den = den + area*(lam_l + lam_r)
+      num = num + area*(mu_l + mu_r)*e_bar
+      den = den + area*(mu_l + mu_r)
     end do
 
     if (den > 0.0_DOUBLE) then
@@ -1774,7 +1815,7 @@ contains
     real(kind=DOUBLE), intent(in), optional :: pl_rec, vl_rec, pr_rec, vr_rec
 
     real(kind=DOUBLE) :: pl, pr, taul, taur, vl, vr, lam_l, lam_r, pi_l, pi_r
-    real(kind=DOUBLE) :: pvl, pvr, el, er
+    real(kind=DOUBLE) :: pvl, pvr, el, er, mu_l, mu_r, cl, cr, cap
 
     taul = sol_w_l(1)
     taur = sol_w_r(1)
@@ -1804,8 +1845,18 @@ contains
     el = sol_w_l(5)
     er = sol_w_r(5)
 
-    pvl = pl*vl - lam_l*(e_nodal - el)
-    pvr = pr*vr + lam_r*(e_nodal - er)
+    mu_l = lam_l*wip_phi(vn_nodal, vl, taul, pl, g_l, pr - pl)
+    mu_r = lam_r*wip_phi(vn_nodal, vr, taur, pr, g_r, pr - pl)
+    cl = mu_l*(e_nodal - el)
+    cr = mu_r*(e_nodal - er)
+    if (vp_ep_wip .and. vp_ep_wip_clip > 0.0_DOUBLE) then
+      cap = vp_ep_wip_clip*lam_l*max(el - 0.5_DOUBLE*dot_product(sol_w_l(2:4), sol_w_l(2:4)), 0.0_DOUBLE)
+      cl = sign(min(abs(cl), cap), cl)
+      cap = vp_ep_wip_clip*lam_r*max(er - 0.5_DOUBLE*dot_product(sol_w_r(2:4), sol_w_r(2:4)), 0.0_DOUBLE)
+      cr = sign(min(abs(cr), cap), cr)
+    end if
+    pvl = pl*vl - cl
+    pvr = pr*vr + cr
 
     flux_l(1)   = -vn_nodal
     flux_l(2:4) = pi_l*n
@@ -1831,6 +1882,33 @@ contains
     solm(2:4) = sol_c(2:4) + 2.0_DOUBLE*(v_target - vn)*n
     ! E est inchange en norme de vitesse (reflexion), donc sol(5) reste valable
   end function mirror_state
+
+  ! Facteur phi_c du schema 'vp_ep_wip' : il doit s'annuler au CONTACT, ou la
+  ! vitesse et la pression sont continues et seule l'energie saute. Utilise a
+  ! l'identique dans nodal_energy et dans rs_vp_ep, faute de quoi la conservation
+  ! exacte est perdue.
+  function wip_phi(vn_nodal, v_c, tau_c, p_c, g_c, dp) result(phi)
+    implicit none
+    real(kind=DOUBLE), intent(in) :: vn_nodal, v_c, tau_c, p_c, g_c, dp
+    real(kind=DOUBLE) :: phi, a_c, num
+
+    if (.not. vp_ep_wip) then
+      phi = 1.0_DOUBLE
+      return
+    end if
+    a_c = sqrt(max(0.0_DOUBLE, g_c*p_c*tau_c))
+    select case (trim(vp_ep_wip_mode))
+    case ('dv')
+      num = abs(vn_nodal - v_c)
+      phi = num/(num + max(a_c, 1.0e-30_DOUBLE))
+    case ('dp')
+      num = abs(dp)
+      phi = num/(num + max(abs(p_c), 1.0e-30_DOUBLE))
+    case default
+      phi = 1.0_DOUBLE
+    end select
+    phi = max(phi, vp_ep_wip_floor)
+  end function wip_phi
 
   function tensor_product(a,b) result(c)
     implicit none
@@ -1858,7 +1936,19 @@ contains
     integer(kind=ENTIER) :: me, num_procs
     real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
 
-    real(kind=DOUBLE), parameter :: CV = 0.8_DOUBLE
+    ! Coefficient de la borne en VITESSE dt <= CV*omega_c/somme_f(a_pcf |u_p.n|),
+    ! celle qui limite le changement relatif de volume d'une maille par pas.
+    ! Passe de 0.8 a 0.2 : la reecriture de cette borne (volume complet et SOMME
+    ! sur les sous-faces, au lieu du volume moyen de sous-element et de l'aire
+    ! d'UNE face) l'a rendue ~1.9x plus permissive a CV egal. Sur Saltzman cette
+    ! marge suffisait a faire TRAVERSER les parois y=0 et y=0.1 au maillage
+    ! (y de -0.031 a 0.108 au lieu de rester dans [0, 0.1]) -- sans aucun NaN ni
+    ! code d'erreur, donc invisible au depouillement habituel. Des 0.4 la geometrie
+    ! est retablie et les autres cas sont inchanges a 0.1 % pres (Sedov, Noh, Sod
+    ! bi-materiau, Sod cylindrique) ; 0.2 prend une marge supplementaire, le pic de
+    ! Saltzman n'etant pas encore convergie en temps a 0.4 (21.3 a CV=0.4, 18.9
+    ! en divisant encore le pas).
+    real(kind=DOUBLE), parameter :: CV = 0.2_DOUBLE
     integer(kind=ENTIER) :: i, j, k, mpi_ierr
     integer(kind=ENTIER) :: id_sub_face, id_face
     integer(kind=ENTIER) :: id_vert, id_sub_elem

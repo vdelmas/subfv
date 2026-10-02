@@ -67,7 +67,7 @@ program main
     t_max, cfl, &
     init, &
     grad_bound_skip, &
-    lambda_acoustic_only, ppvp_jump_mode, ppvp_nodal_average, diag_entropy, &
+    lambda_acoustic_only, ppvp_jump_mode, ppvp_nodal_average, diag_entropy, vp_ep_wip_mode, vp_ep_wip_floor, vp_ep_wip_clip, &
     sedov_nodal_deposit, sedov_energy, &
     scheme, method_length, b2d_h, &
     n_bc, bc_name, bc_type, bc_val, &
@@ -89,6 +89,7 @@ program main
   ! scheme name rather than by the lambda_acoustic_only namelist flag alone
   ! keeps the two variants distinguishable in a campaign's inputs and logs.
   if (scheme == "classic_rhoa") lambda_acoustic_only = .true.
+  if (scheme == "vp_ep_wip") vp_ep_wip = .true.
   if (me == 0) then
     if (lambda_acoustic_only) then
       print*, "lambda = rho*a (EUCCLHYD original)"
@@ -251,7 +252,7 @@ program main
       call compute_rhs_lagrange_sidil(mesh, sol, vp, &
         dt, rhs, n_bc, bc_type, bc_val, boundary_2d, mass, method_length, h_extrude, &
         gamma_arr, vp_is_imposed, h_p_arr)
-    else if( scheme == "vp_ep" ) then
+    else if( scheme == "vp_ep" .or. scheme == "vp_ep_wip" ) then
       ! vitesse nodale + energie nodale, puis solveur 1D par sous-face.
       call compute_rhs_lagrange_vp_ep(mesh, sol, vp, &
         dt, rhs, n_bc, bc_type, bc_val, boundary_2d, mass, gamma_arr, vp_is_imposed, &
