@@ -1,0 +1,156 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{float}
+\usepackage{booktabs}
+\usepackage[margin=1.5cm,top=2cm]{geometry}
+\usepackage{hyperref}
+
+\graphicspath{{../test_low_mach_compar_resume/}}
+\newcommand{\amndir}{../test_low_mach_compar_resume/}
+\newcommand{\sch}{WIP2\_NOLM}
+\newcommand{\schpath}{WIP2_NOLM}
+
+\title{Schéma \texttt{\sch} --- suite bas Mach / hypersonique}
+\author{Vincent Delmas}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\noindent
+Résultats de \texttt{subfvns} pour le schéma \texttt{\sch}, sur la suite complète
+allant du tourbillon de Gresho au flux de chaleur pariétal à Mach~27.
+
+\medskip
+\noindent\textbf{Provenance des résultats.} Tous les cas de tous les schémas comparés
+(\texttt{multi\_point}, \texttt{three\_wave}, \texttt{multi\_point\_pressure},
+\texttt{WIP}, \texttt{WIP2\_NOLM}) proviennent d'une \emph{seule} campagne lancée avec
+un \emph{seul} binaire, dans \texttt{test\_low\_mach\_compar\_resume/}. Les chiffres des
+cinq rapports sont donc directement comparables entre eux, ce qui n'était pas le cas
+des campagnes précédentes, étalées sur plusieurs reconstructions du code.
+
+\medskip
+\noindent\textbf{Critères évalués.}
+\begin{enumerate}\itemsep2pt
+  \item préservation du champ de vitesse sur le tourbillon de Gresho (quad et tri) ;
+  \item convergence de la fluctuation de densité en fonction du Mach --- au moins
+        $\mathrm{Ma}^1$, idéalement $\mathrm{Ma}^2$ ;
+  \item robustesse sur Sedov, maillages triangulaire \emph{et} hexaédrique ;
+  \item flux de chaleur pariétal sur le demi-cylindre à Mach~27, quad et tri.
+\end{enumerate}
+
+\medskip
+\noindent\textbf{Deux réserves de lecture.} L'échelle absolue du nombre de Stanton
+provient de la formule déjà présente dans \texttt{plot\_st.gnu} et n'a pas été
+re-dérivée ici : les classements entre schémas sont fiables, la valeur absolue
+mériterait une vérification. Par ailleurs les maillages triangulaires sont produits
+par la version de \texttt{gmsh} présente sur le cluster ; ils diffèrent de ceux
+obtenus localement, de sorte que seules les comparaisons \emph{à maillage identique}
+ont un sens --- ce qui est le cas ici, tous les schémas partageant les mêmes maillages.
+
+\clearpage
+\section*{Résultats}
+
+\newcommand{\minifig}[2]{%
+  \begin{minipage}[t]{0.48\linewidth}\centering
+    \IfFileExists{\amndir#1}%
+      {\includegraphics[width=\linewidth]{#1}}%
+      {\fbox{\parbox[c][0.3\linewidth]{0.8\linewidth}{\centering\small non disponible}}}%
+    \\[2pt]{\small #2}
+  \end{minipage}\hfill}
+
+\subsection*{Gresho -- quad}
+\begin{figure}[H]\centering
+  \minifig{gresho_quad/outputs/\schpath/images/gresho_quad_velocity.png}{champ de vitesse}
+  \minifig{gresho_quad/outputs/\schpath/images/velocity_profile.pdf}{profil radial}
+\end{figure}
+
+\subsection*{Gresho -- tri}
+\begin{figure}[H]\centering
+  \minifig{gresho_tri/outputs/\schpath/images/gresho_tri_velocity.png}{champ de vitesse}
+  \minifig{gresho_tri/outputs/\schpath/images/velocity_profile.pdf}{profil radial}
+\end{figure}
+
+\subsection*{Gresho -- Voronoï}
+Maillage polygonal irrégulier de 2500 cellules (même nombre que le quad
+$50\times50$, donc à résolution égale), 4 à 8 côtés, engendré par
+\texttt{tools/voronoi/voronoi\_box.py}. Les germes étant construits par
+réflexion à travers les deux axes médians pour que la périodicité soit exacte au
+niveau machine, ce maillage est \emph{miroir-symétrique} par rapport à $x=0$ et
+$y=0$ : ce n'est pas un Voronoï générique, et la couture peut transparaître dans
+les champs très dissipés.
+\begin{figure}[H]\centering
+  \minifig{gresho_voro/outputs/\schpath/images/gresho_voro_velocity.png}{champ de vitesse}
+  \minifig{gresho_voro/outputs/\schpath/images/velocity_profile.pdf}{profil radial}
+\end{figure}
+\noindent\footnotesize\emph{Attention à la lecture :} l'échelle de couleur est
+ajustée automatiquement sur chaque image. Pour un schéma qui a détruit le
+tourbillon, elle amplifie un bruit résiduel d'énergie quasi nulle, qui ne doit
+pas être confondu avec un champ de vitesse de même amplitude que celui d'un
+schéma qui l'a préservé.\normalsize
+
+\subsection*{Convergence bas Mach de la fluctuation de densité}
+\begin{figure}[H]\centering
+  \minifig{convergence_gresho_quad/outputs/\schpath/images/convergence.pdf}{quad}
+  \minifig{convergence_gresho_tri/outputs/\schpath/images/convergence.pdf}{tri}
+\end{figure}
+\begin{figure}[H]\centering
+  \minifig{convergence_gresho_voro/outputs/\schpath/images/convergence.pdf}{Voronoï}
+\end{figure}
+
+\clearpage
+\subsection*{Sedov -- maillage triangulaire}
+\begin{figure}[H]\centering
+  \minifig{sedov_tri/outputs/\schpath/images/sedov_tri_density.png}{densité}
+  \minifig{sedov_tri/outputs/\schpath/density_profile.png}{profil radial}
+\end{figure}
+
+\subsection*{Sedov -- maillage hexaédrique}
+\begin{figure}[H]\centering
+  \minifig{sedov_hex/outputs/\schpath/images/sedov_hex_density.png}{densité}
+  \minifig{sedov_hex/outputs/\schpath/density_profile.png}{profil radial}
+\end{figure}
+
+\clearpage
+\subsection*{Demi-cylindre Navier-Stokes -- quad}
+\begin{figure}[H]\centering
+  \minifig{half_cylinder_quad_ns/outputs/\schpath/images/output_-1_Pressure.png}{pression}
+  \minifig{half_cylinder_quad_ns/outputs/\schpath/images/output_-1_Temperature.png}{température}
+\end{figure}
+\begin{figure}[H]\centering
+  \minifig{half_cylinder_quad_ns/outputs/\schpath/plot_cp.pdf}{$C_p$}
+  \minifig{half_cylinder_quad_ns/outputs/\schpath/plot_st.pdf}{flux de chaleur (Stanton)}
+\end{figure}
+
+\subsection*{Demi-cylindre Navier-Stokes -- maillage hybride quad + Voronoï}
+Couche limite structurée en quadrangles sur $r\in[1;1{,}04]$ puis lointain en
+Voronoï, conformes à l'interface, 9103 mailles --- la transposition directe du
+maillage \texttt{tri}, qui est lui-même un hybride quad + triangles de 8326
+mailles. C'est ce maillage qui \emph{discrimine} : sur quad, presque tous les
+schémas se superposent à la référence LAURA et on ne les distingue pas.
+\begin{figure}[H]\centering
+  \minifig{half_cylinder_voro_ns/outputs/\schpath/images/output_-1_Pressure.png}{pression}
+  \minifig{half_cylinder_voro_ns/outputs/\schpath/images/output_-1_Temperature.png}{température}
+\end{figure}
+\begin{figure}[H]\centering
+  \minifig{half_cylinder_voro_ns/outputs/\schpath/plot_cp.pdf}{$C_p$}
+  \minifig{half_cylinder_voro_ns/outputs/\schpath/plot_st.pdf}{flux de chaleur (Stanton)}
+\end{figure}
+
+\subsection*{Demi-cylindre Navier-Stokes -- tri}
+\begin{figure}[H]\centering
+  \minifig{half_cylinder_tri_ns/outputs/\schpath/images/output_-1_Pressure.png}{pression}
+  \minifig{half_cylinder_tri_ns/outputs/\schpath/images/output_-1_Temperature.png}{température}
+\end{figure}
+\begin{figure}[H]\centering
+  \minifig{half_cylinder_tri_ns/outputs/\schpath/plot_cp.pdf}{$C_p$}
+  \minifig{half_cylinder_tri_ns/outputs/\schpath/plot_st.pdf}{flux de chaleur (Stanton)}
+\end{figure}
+
+\end{document}

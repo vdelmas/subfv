@@ -1,0 +1,482 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage{amsmath,amssymb}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{booktabs}
+\usepackage[margin=2cm]{geometry}
+\usepackage{hyperref}
+
+\title{Synthèse des schémas testés\\\large bas Mach et hypersonique --- flux de chaleur pariétal}
+\author{Vincent Delmas}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section*{Méthode}
+
+Quatre critères d'acceptation : (1) préservation du champ de vitesse sur le tourbillon
+de Gresho ; (2) convergence de la fluctuation de densité en fonction du Mach, au moins
+$\mathrm{Ma}^1$ ; (3) robustesse sur Sedov triangulaire \emph{et} hexaédrique ;
+(4) flux de chaleur pariétal sur le demi-cylindre à Mach~27, quad \emph{et} tri.
+
+Tous les résultats ci-dessous proviennent de \texttt{test\_low\_mach\_compar\_resume/},
+une campagne unique lancée avec un binaire unique, pour que les chiffres soient
+comparables entre eux.
+
+\section*{1. Un piège de lecture : le critère 2 ne se lit jamais seul}
+
+C'est le résultat méthodologique le plus important de cette campagne.
+
+\begin{table}[h]\centering
+\begin{tabular}{lcc}
+\toprule
+schéma & pente Mach (quad) & vortex Gresho (quad) \\
+\midrule
+\texttt{two\_wave}            & $3{,}53$ & $4{,}12\cdot10^{-1}$ \\
+\texttt{multi\_point}         & $1{,}70$ & $4{,}12\cdot10^{-1}$ \\
+\texttt{modified\_three\_wave}& $1{,}70$ & $4{,}12\cdot10^{-1}$ \\
+\texttt{three\_wave}          & $1{,}87$ & $2{,}72\cdot10^{-1}$ \\
+\texttt{WIP}                  & $1{,}41$ & $1{,}54\cdot10^{-2}$ \\
+\texttt{WIP2\_NOLM}           & $1{,}12$ & $\mathbf{1{,}26\cdot10^{-3}}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Les quatre schémas qui « gagnent » le critère~2 ont en réalité \textbf{détruit le
+tourbillon} : $40\,\%$ d'erreur sur la vitesse, contre $0{,}13\,\%$ pour
+\texttt{WIP2\_NOLM}. Pour \texttt{two\_wave}, $L_2(\rho)$ tombe à
+$1{,}28\cdot10^{-15}$ --- le zéro machine d'un écoulement au repos, pas une
+convergence. Un schéma assez dissipatif rend ce critère arbitrairement bon.
+
+\subsection*{1.1 La version Voronoï : une anticorrélation parfaite}
+
+L'étude a été refaite sur un maillage de Voronoï polygonal (2500 cellules, même
+nombre que le quad $50\times50$), avec cette fois l'\textbf{énergie cinétique
+intégrée} comme mesure de la préservation du tourbillon, et non la RMSE d'un
+profil relevé le long d'une ligne :
+
+\begin{table}[h]\centering
+\begin{tabular}{lccc}
+\toprule
+schéma & $E_{kin}$ retenue (Voronoï) & $E_{kin}$ (quad) & pente Mach (Voronoï) \\
+\midrule
+\texttt{multi\_point\_pressure}& $\mathbf{98{,}69\,\%}$ & $99{,}94\,\%$ & $0{,}96$ \\
+\texttt{WIP2\_NOLM}            & $\mathbf{98{,}69\,\%}$ & $99{,}94\,\%$ & $0{,}97$ \\
+\texttt{WIP}                   & $89{,}20\,\%$ & $99{,}60\,\%$ & $1{,}15$ \\
+\texttt{three\_wave}           & $37{,}10\,\%$ & $51{,}71\,\%$ & $1{,}75$ \\
+\texttt{modified\_three\_wave} & \textcolor{BrickRed}{$0{,}000\,\%$} & $0{,}000\,\%$ & $1{,}71$ \\
+\texttt{multi\_point}          & \textcolor{BrickRed}{$0{,}000\,\%$} & $0{,}000\,\%$ & $1{,}75$ \\
+\texttt{two\_wave}             & \textcolor{BrickRed}{$0{,}000\,\%$} & $0{,}000\,\%$ & $\mathbf{3{,}26}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Les deux classements sont \textbf{exactement inverses} l'un de l'autre : rangés
+par pente croissante on obtient \texttt{multi\_point\_pressure},
+\texttt{WIP2\_NOLM}, \texttt{WIP}, puis le groupe
+\texttt{modified\_three\_wave} / \texttt{three\_wave} / \texttt{multi\_point},
+et enfin \texttt{two\_wave} --- c'est-à-dire l'ordre décroissant de l'énergie
+cinétique retenue. \texttt{two\_wave} réalise la meilleure pente de toute la
+campagne ($3{,}26$) en ayant conservé exactement \emph{zéro} énergie. Le
+classement sur Voronoï est par ailleurs identique à celui sur quad : le maillage
+polygonal ne réordonne rien, il confirme.
+
+\emph{Convention} : toutes les pentes de ce document sont obtenues par moindres
+carrés sur les quatre nombres de Mach (\texttt{analyze.py}), et non entre les
+deux derniers points seulement --- les deux définitions diffèrent sensiblement
+dès que la courbe n'est pas une droite parfaite.
+
+\paragraph{Un avertissement sur la métrique elle-même.} La colonne « vortex
+Gresho » du tableau précédent est une RMSE relevée par sonde le long d'une
+ligne. Sur un maillage irrégulier, cette sonde \textbf{surestime l'erreur d'un
+facteur $\sim20$} : elle affichait une dégradation $\times27$ de
+\texttt{WIP2\_NOLM} entre quad et Voronoï ($1{,}26\cdot10^{-3}$ vers
+$3{,}42\cdot10^{-2}$) qui n'existe pas --- l'énergie cinétique intégrée montre
+$99{,}94\,\%$ vers $98{,}69\,\%$, soit une perte qui passe de $0{,}065\,\%$ à
+$1{,}31\,\%$, réelle mais modeste. Pour comparer des topologies de maillage
+différentes, il faut une grandeur intégrale, pas une sonde.
+
+Le même mécanisme a été mesuré indépendamment côté lagrangien : \texttt{classic},
+de la même famille à vitesse nodale que \texttt{multi\_point}, dissipe $99{,}996\,\%$
+de l'énergie cinétique du vortex de Gresho en $t=0{,}2$. La cohérence entre les deux
+solveurs confirme qu'il s'agit bien d'un défaut de schéma et non d'un artefact.
+
+\section*{2. Les sept schémas de référence}
+
+\begin{table}[h]\centering
+\begin{tabular}{lcccc}
+\toprule
+& vortex (q/t) & Sedov tri/hex & flux chaleur quad & flux chaleur tri \\
+\midrule
+\texttt{multi\_point}          & 4{,}12e-1 / 3{,}99e-1 & ok / ok & 6{,}99e-4 & 1{,}67e-3 \\
+\texttt{three\_wave}           & 2{,}72e-1 / 1{,}30e-2 & ok / ok & 4{,}91e-4 & 1{,}52e-3 \\
+\texttt{two\_wave}             & 4{,}12e-1 / 3{,}99e-1 & ok / --- & 3{,}23e-2 & 5{,}30e-2 \\
+\texttt{modified\_three\_wave} & 4{,}12e-1 / 3{,}99e-1 & ok / --- & 2{,}93e-3 & 6{,}49e-3 \\
+\texttt{multi\_point\_pressure}& 1{,}27e-3 / 1{,}79e-3 & \textcolor{BrickRed}{crash} & \textbf{4{,}45e-4} & \textcolor{BrickRed}{crash} \\
+\texttt{WIP}                   & 1{,}54e-2 / 1{,}22e-2 & ok / ok & 6{,}99e-4 & 3{,}50e-4 \\
+\texttt{WIP2\_NOLM}            & \textbf{1{,}26e-3 / 1{,}80e-3} & ok / ok & 6{,}98e-4 & \textbf{3{,}46e-4} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\texttt{WIP2\_NOLM} est le seul à passer les quatre critères. \texttt{multi\_point\_pressure}
+(Del Grosso, Barsukow, Loubère \& Maire 2026) est le meilleur sur le flux quad et
+excellent en bas Mach --- il est \emph{asymptotic-preserving} par construction --- mais
+il s'arrête sur \texttt{sedov\_tri}, \texttt{sedov\_hex} et le demi-cylindre tri.
+Comme \texttt{sedov\_hex} est hexaédrique, ce n'est pas une affaire de type de maille
+mais de choc fort, ce qui correspond au positionnement que les auteurs donnent
+eux-mêmes à leur solveur : le multi-point à \emph{vitesse} nodale est celui qu'ils
+décrivent comme \emph{carbuncle-free} en hypersonique.
+
+\section*{3. Le terme de diffusion additionnel $\epsilon$}
+
+\subsection*{3.1 Cinq formulations}
+
+Les quatre candidats de \texttt{tex/wip.tex} plus deux tentatives sans capteur.
+Constat préalable : \textbf{le critère~2 ne discrimine pas ce terme} --- les quatre
+capteurs donnent $6{,}00$ à $6{,}03\cdot10^{-8}$ à $\mathrm{Ma}=10^{-4}$. C'est donc
+un degré de liberté disponible pour le flux de chaleur.
+
+\begin{table}[h]\centering
+\begin{tabular}{llcc}
+\toprule
+variante & $\epsilon$ & flux quad & flux tri \\
+\midrule
+\texttt{WIP2\_NOLM} & Ducros nodal, $4a_p$ & 6{,}98e-4 & \textbf{3{,}46e-4} \\
+\texttt{WIP2\_EJUMP}& saut de pression nodal & 4{,}63e-4 & 1{,}56e-3 \\
+\texttt{WIP2\_EDIV} & $-\nabla\!\cdot\!v$ nodal & \textbf{4{,}23e-4} & 2{,}43e-3 \\
+\texttt{WIP2\_EMAX} & $\max$, porte $\mathrm{Ma}^2$ & 4{,}11e-3 & 5{,}55e-3 \\
+\texttt{WIP2\_EPOS} & $\max(0,-\Delta v_n,\sqrt{|\Delta p|/\bar\rho})$, par face & 1{,}07e-3 & 4{,}08e-3 \\
+\texttt{WIP2\_EPOS2}& $\max(0,-\Delta v_n,|\Delta p|/(\bar\rho\bar a))$, par face & 2{,}36e-3 & 3{,}14e-3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Deux enseignements. D'abord, \textbf{le capteur de Ducros déjà en place est le meilleur
+des six sur tri}, d'un facteur $4{,}5$ sur son suivant --- ce n'était pas un choix par
+défaut. Ensuite, \textbf{les deux formulations par face sont battues sur les deux
+maillages} par les quatre capteurs nodaux, ce qui confirme la robustesse supérieure des
+capteurs nodaux.
+
+À noter que \texttt{EPOS2} égale pourtant la référence en bas Mach ($5{,}94\cdot10^{-8}$
+contre $6{,}03\cdot10^{-8}$) sans aucun paramètre : l'échec ne se voit que sur le flux
+pariétal. Sa première version \texttt{EPOS} plafonnait à $1{,}06\cdot10^{-7}$, parce que
+$\sqrt{|\Delta p|/\bar\rho}$ a la bonne dimension mais la mauvaise échelle en Mach
+($\Delta p = O(h)$ indépendamment du Mach dans ce régime) ; la conversion par impédance
+$|\Delta p|/(\bar\rho\bar a) = O(h\,\mathrm{Ma})$ corrige cela.
+
+\subsection*{3.2 L'amplitude gouverne le compromis quad/tri}
+
+Le capteur de Ducros \emph{inchangé}, à trois amplitudes :
+
+\begin{table}[h]\centering
+\begin{tabular}{lccc}
+\toprule
+amplitude & flux quad & flux tri & Sedov tri (RMSE $\rho$) \\
+\midrule
+$4a_p$ (\texttt{WIP2\_NOLM}) & 6{,}98e-4 & \textbf{3{,}46e-4} & 6{,}37e-1 \\
+$2a_p$ (\texttt{WIP2\_ED2})  & 5{,}48e-4 & 7{,}23e-4 & 5{,}63e-1 \\
+$1a_p$ (\texttt{WIP2\_ED1})  & \textbf{4{,}63e-4} & 7{,}35e-4 & \textbf{4{,}99e-1} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Les tendances sont monotones et \textbf{opposées entre quad et tri}. Baisser
+l'amplitude améliore simultanément le flux quad et la précision Sedov, et dégrade le
+flux tri. Il n'existe donc pas de réglage satisfaisant les deux maillages : c'est un
+compromis structurel, pas un défaut de formulation. À amplitude égale ($1a_p$), la
+\emph{forme} compte aussi : Ducros donne $7{,}35\cdot10^{-4}$ sur tri contre
+$2{,}43\cdot10^{-3}$ pour $-\nabla\!\cdot\!v$.
+
+\section*{3bis. Le maillage hybride quad + Voronoï, ou comment discriminer}
+
+Le critère 4 posait un problème de lisibilité : \textbf{sur le maillage quad,
+presque tous les schémas se superposent à la référence LAURA} et rien ne les
+sépare. Un maillage hybride --- couche limite structurée en quadrangles sur
+$r\in[1;1{,}04]$, lointain en Voronoï, conformes à l'interface, 9103 mailles ---
+les sépare nettement. Il transpose directement le maillage \texttt{tri}, qui est
+lui-même un hybride quad + triangles de 8326 mailles.
+
+\begin{table}[h]\centering
+\begin{tabular}{lccc}
+\toprule
+RMSE du flux de chaleur vs LAURA & quad & tri & \textbf{hybride} \\
+\midrule
+\texttt{WIP2\_NOLM}            & $6{,}98\cdot10^{-4}$ & $3{,}46\cdot10^{-4}$ & $\mathbf{3{,}90\cdot10^{-4}}$ \\
+\texttt{WIP}                   & $6{,}99\cdot10^{-4}$ & $3{,}50\cdot10^{-4}$ & $4{,}11\cdot10^{-4}$ \\
+\texttt{three\_wave}           & $4{,}91\cdot10^{-4}$ & $1{,}52\cdot10^{-3}$ & $7{,}06\cdot10^{-4}$ \\
+\texttt{multi\_point}          & $6{,}99\cdot10^{-4}$ & $1{,}67\cdot10^{-3}$ & $1{,}23\cdot10^{-3}$ \\
+\texttt{multi\_point\_pressure}& $4{,}45\cdot10^{-4}$ & \textcolor{BrickRed}{plante} & $2{,}06\cdot10^{-3}$ \\
+\texttt{modified\_three\_wave} & $2{,}93\cdot10^{-3}$ & $6{,}49\cdot10^{-3}$ & $5{,}79\cdot10^{-3}$ \\
+\texttt{two\_wave}             & $3{,}23\cdot10^{-2}$ & $5{,}30\cdot10^{-2}$ & $5{,}10\cdot10^{-2}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+\textbf{\texttt{WIP2\_NOLM} est le meilleur schéma du maillage hybride}, et il y
+est meilleur que sur quad. Le classement hybride suit celui du \texttt{tri} et
+non celui du quad, ce qui est cohérent puisque l'hybride en est la transposition.
+
+Deux faits méritent d'être relevés. \texttt{multi\_point\_pressure}, impeccable
+sur quad, développe sur l'hybride un \textbf{pic au point d'arrêt à $0{,}0155$,
+près du double de LAURA} --- un défaut de type carbuncle, exactement le point
+faible attendu d'une pression nodale face à un choc fort, et c'est lui qui
+explique son RMSE. Et il \emph{tourne jusqu'au bout} sur l'hybride alors qu'il
+\emph{plante} sur \texttt{tri} : les polygones sont plus cléments que les
+triangles, comme du côté lagrangien.
+
+\paragraph{Une précaution d'interprétation.} L'interface est placée à
+$r_{bl}=1{,}04$, reprise du maillage \texttt{tri}. Le choc de culot (décollement
+de l'ordre de $0{,}15\,R$ à Mach~27, donc $r\approx1{,}15$) tombe donc dans la
+région de \emph{Voronoï}, exactement comme il tombe dans la région triangulaire
+du maillage \texttt{tri}. Le bloc structuré ne sert qu'à la couche limite et au
+flux pariétal. Une dégradation éventuelle du flux ne pourrait donc pas être
+attribuée à la paroi sans vérifier d'abord le traitement du choc par les
+polygones, ce que trancherait un calcul à $r_{bl}=1{,}2$.
+
+\section*{4. Changer d'advection pour se passer de $\epsilon$}
+
+\subsection*{4.1 Les variantes ZB existantes}
+
+\texttt{ZB\_ARMD\_LPP}, \texttt{ARMDU}, \texttt{ARMDMAT}, \texttt{ARMDUMAT} :
+toutes crashent sur \texttt{sedov\_tri} et donnent $5{,}1\cdot10^{-3}$ à
+$3{,}3\cdot10^{-1}$ sur le flux de chaleur, soit un à trois ordres de grandeur
+au-dessus de la famille WIP. Elles hybrident le flux multi-D nodal et le flux 1D de
+face avec $w = 0{,}5$ codé en dur, alors qu'\texttt{AMISO} --- la seule advection
+robuste de cette famille --- utilise $w = (\min_f A_f/A_f)/3$, au plus un tiers et
+pondéré par la géométrie.
+
+\subsection*{4.2 Advection multi-D ré-hybridée}
+
+Reprise du flux multi-D
+$w\big[(U_p\otimes v_p - \tfrac{h_p}{2}\nabla_p U\cdot S_{\max})\cdot n\big] + (1-w)F_{1D}$
+avec $S_{\max}=\mathrm{diag}(|v_{p,k}|)$ et $h_p = V_p/\sum_f A_f$, dans une routine
+propre, la partie Lagrange (pression nodale) restant inchangée.
+
+\begin{table}[h]\centering
+\begin{tabular}{llcc}
+\toprule
+& hybridation & $L_2(\rho)$ à $\mathrm{Ma}=10^{-4}$ & flux quad \\
+\midrule
+\texttt{WIP2\_NOLM} & --- (advection 1D) & $\mathbf{6{,}03\cdot10^{-8}}$ & 6{,}98e-4 \\
+\texttt{WIP2\_MD}   & $w=(\min A/A)/3$, façon AMISO & $1{,}26\cdot10^{-6}$ & 5{,}05e-4 \\
+\texttt{WIP2\_MD5}  & $w=0{,}5$, façon ARMD & $1{,}12\cdot10^{-4}$ & --- \\
+\texttt{WIP2\_MDH}  & idem MD, gradient enthalpique & $1{,}26\cdot10^{-6}$ & 4{,}92e-4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+L'hybridation vaut \textbf{deux ordres de grandeur} ($1{,}26\cdot10^{-6}$ contre
+$1{,}12\cdot10^{-4}$) : les \texttt{ARMD*} n'étaient pas mauvaises en soi, elles
+étaient hybridées deux fois trop fort. Mais même bien dosée, l'advection multi-D
+conserve un plancher bas Mach $20\times$ pire que l'advection 1D.
+
+La correction enthalpique du gradient (\texttt{MDH}, $\nabla(\rho E)\to\bar h\nabla\rho$,
+condition de Häenel appliquée au gradient nodal) est \textbf{numériquement sans effet}
+($1{,}25636\cdot10^{-6}$ contre $1{,}25617\cdot10^{-6}$). Le plancher ne vient donc pas
+de la ligne énergie mais des lignes densité et quantité de mouvement : dans ce
+formalisme, tout terme dissipatif bâti sur $h_p\nabla U$ plutôt que sur un saut porte
+ce risque, quelle que soit la variable dissipée.
+
+\section*{5. Côté lagrangien}
+
+Vortex de Gresho à $\mathrm{Ma}=10^{-2}$, ordre 1, énergie cinétique restante à $t=0{,}2$ :
+
+\begin{table}[h]\centering
+\begin{tabular}{lcc}
+\toprule
+& quad & tri \\
+\midrule
+\texttt{classic} (vitesse nodale) & $4\cdot10^{-5}$ & $0$ \\
+\texttt{vp\_pp} (v et p par systèmes nodaux) & $\mathbf{1{,}012}$ & $1{,}151$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\texttt{classic} dissipe $99{,}996\,\%$ de l'énergie cinétique ; la dissipation y opère
+à l'échelle \emph{acoustique} et non convective, donc $100\times$ trop vite à
+$\mathrm{Ma}=10^{-2}$ (vérifié : à $\mathrm{Ma}=1$ il n'en perd que $31\,\%$).
+
+\paragraph{Convergence en Mach, mesurée aussi côté lagrangien.} Même protocole qu'en
+Euler ($t_{final}=10^{-2}$, $L_2(\rho)=\sqrt{\sum_i V_i(\rho_i-1)^2}$) :
+
+\begin{table}[h]\centering
+\begin{tabular}{lcccc}
+\toprule
+& \multicolumn{2}{c}{\texttt{classic}} & \multicolumn{2}{c}{\texttt{vp\_pp}} \\
+$L_2(\rho)$ & quad & tri & quad & tri \\
+\midrule
+$\mathrm{Ma}=10^{-2}$ & 1{,}75e-6 & 3{,}23e-6 & 4{,}07e-7 & 1{,}53e-5 \\
+$\mathrm{Ma}=10^{-4}$ & \textbf{2{,}31e-10} & \textbf{2{,}17e-10} & 3{,}89e-9 & 1{,}94e-6 \\
+\midrule
+$E_{kin}$ restante à $\mathrm{Ma}=10^{-4}$ & \textcolor{BrickRed}{$0{,}000$} & \textcolor{BrickRed}{$0{,}000$} & $1{,}0000$ & $1{,}0009$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+C'est la \textbf{seconde démonstration indépendante} du piège de la section~1, et la plus
+propre : \texttt{classic} atteint $\mathrm{Ma}^2$ alors qu'il a intégralement détruit le
+tourbillon \emph{avant} l'instant de mesure. Ici il n'y a aucun terme d'advection à
+incriminer --- seul le couplage nodal agit.
+
+\paragraph{L'énergie cinétique totale ne suffit pas non plus.} Elle est globale et
+manque un défaut localisé. Bornes des champs à $t_{max}$, sur les mêmes runs :
+
+\begin{table}[h]\centering
+\begin{tabular}{lcc}
+\toprule
+ & $\rho$ & $|v|_{max}$ (physique : $1{,}0$) \\
+\midrule
+\texttt{classic} quad & $1{,}0000$--$1{,}0001$ & \textcolor{BrickRed}{$0{,}001$} \\
+\texttt{classic} tri  & $1{,}0000$--$1{,}0000$ & \textcolor{BrickRed}{$0{,}000$} \\
+\texttt{classic} Voronoï & $1{,}0000$--$1{,}0001$ & \textcolor{BrickRed}{$0{,}012$} \\
+\midrule
+\texttt{vp\_pp} quad & $0{,}9996$--$1{,}0004$ & $1{,}032$ \\
+\texttt{vp\_pp} Voronoï & $0{,}9984$--$1{,}0018$ & $1{,}263$ \\
+\texttt{vp\_pp} tri  & \textcolor{BrickRed}{$0{,}9045$--$1{,}1312$} & \textcolor{BrickRed}{$3{,}145$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+Deux lectures s'imposent. D'abord, la plage de densité \emph{impeccable} de
+\texttt{classic} est la signature d'un \textbf{champ mort} et non d'une qualité :
+$|v|_{max}$ y vaut $10^{-3}$ pour un maximum physique de $1$. Ensuite,
+\texttt{vp\_pp} sur \texttt{tri} dépasse de \textbf{trois fois} ce maximum physique et
+sa densité s'écarte de $13\,\%$, sans produire un seul NaN --- ce résultat passe donc
+tous les contrôles habituels, et l'énergie cinétique totale ($1{,}0009$, soit
+$+0{,}09\,\%$) ne le voit pas, le défaut étant confiné à quelques mailles.
+\texttt{tri} est ainsi le cas dur pour le \emph{pas de temps} chez \texttt{classic}
+(facteur $66$, section~5.1) et pour la \emph{qualité de la solution} chez
+\texttt{vp\_pp}.
+
+\medskip
+\noindent
+\texttt{vp\_pp} est la variante ajoutée ici : vitesse et pression nodales issues
+\emph{toutes deux de systèmes nodaux}, donc sans aucune longueur $h_p$ ad hoc. Elle
+s'interprète exactement comme \texttt{sidil} --- en développant, $p_p \approx \langle p\rangle
+- \tfrac{h_p}{2}\rho_p a_p \nabla\!\cdot\!v$ et $u_p \approx \langle v\rangle -
+\tfrac{h_p}{2\rho_p a_p}\nabla p$ --- à ceci près que $h_p$ y \emph{émerge} comme
+$V_p/\sum_f A_f$ pondéré par les impédances réelles au lieu d'être choisi.
+L'énergie totale est conservée à 6 chiffres ; la dérive de l'énergie cinétique
+($+1{,}2\,\%$ quad, $+15\,\%$ tri) est un transfert depuis l'énergie interne de
+$7\cdot10^{-7}$ en relatif, amplifié par le rapport $E_{int}/E_{kin}=2{,}1\cdot10^5$.
+
+\subsection*{5.1 Les trois modes d'échec de \texttt{vp\_pp} au choc fort}
+
+Sur le Sedov, \texttt{vp\_pp} échoue de \textbf{trois façons distinctes} selon le
+maillage et l'ordre. Les confondre conduirait à chercher une cause unique là où il y
+en a au moins deux.
+
+\begin{table}[h]\centering
+\begin{tabular}{llll}
+\toprule
+cas & symptôme & \texttt{EXIT\_CODE} & diagnostic fiable \\
+\midrule
+quad, tri (o1 et o2) & NaN par perte de positivité & \textcolor{BrickRed}{$0$} & comptage de NaN \\
+Voronoï, ordre 2 & effondrement de $dt$, \emph{aucun} NaN & --- & suivi de $dt$ \\
+Voronoï, ordre 1 & enchevêtrement de mailles, non fatal & $0$ & inspection du maillage \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{NaN par perte de positivité (quad, tri).} Dans le quasi-vide, l'énergie
+ambiante ($10^{-12}/(\gamma-1)$) est négligeable devant le travail reçu
+($\sim\!10^{-8}$) : une maille fournit plus de travail qu'elle n'a d'énergie,
+$\mathrm{sol}(5)$ devient négatif, et $\lambda=\max(\sqrt{\gamma p\tau}/\tau,\dots)$
+prend la racine d'un argument négatif. Le terme acoustique est le seul du $\max$ à ne
+pas être protégé. Le calcul diverge en moins de $100$ itérations et \textbf{sort avec
+\texttt{EXIT\_CODE: 0}}, $t$ étant devenu NaN et \texttt{do while (t < t\_max)} étant
+alors faux.
+
+\paragraph{Effondrement du pas de temps (Voronoï, ordre 2).} Aucun NaN, aucune
+grandeur non physique : $dt$ chute de cinq ordres entre $t=0{,}79$ et $t=0{,}898$
+($2{,}98\cdot10^{-4} \to 3{,}10\cdot10^{-9}$) puis stagne, ce qui demanderait
+$\sim\!3\cdot10^{7}$ itérations supplémentaires. Le champ à $t=0{,}80$ est sain. C'est
+la signature d'une maille qui dégénère, rayon inscrit tendant vers zéro.
+
+\paragraph{Ce que le fichier de sortie ne dit pas.} Il est écrit \emph{après} la
+divergence et ne reflète pas l'état au moment de l'échec. Sur \texttt{tri} il ne
+montre aucune pression négative alors qu'il en existe une, transitoire, dans une
+maille qui finit NaN. Sur ces calculs, \textbf{ni les bornes du maillage ni les champs
+finaux ne sont un diagnostic fiable}.
+
+\subsection*{5.2 \texttt{vp\_pp} est meilleur que \texttt{classic} là où il tient}
+
+Le défaut de positivité ne doit pas masquer l'inverse. Sur un maillage de Voronoï
+\emph{radial} (disque $R=1{,}2$, anneaux concentriques, 5017 mailles, Sedov
+$\varepsilon_0=0{,}984042$, CFL $0{,}1$, $t_{max}=1$, ordre 1, séquentiel) :
+
+\begin{table}[h]\centering
+\begin{tabular}{lccc}
+\toprule
+ & rayon du choc & dispersion & $\rho_{max}$ (exact $6{,}00$) \\
+\midrule
+\texttt{classic} & $0{,}982$ & $\pm1{,}3\,\%$ & $5{,}34$ \\
+\texttt{vp\_pp}  & $0{,}991$ & $\mathbf{\pm0{,}2\,\%}$ & $6{,}65$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+\texttt{vp\_pp} est donc \textbf{six fois plus régulier sur le front}, et supprime
+complètement les quatre encoches sur les axes que présente \texttt{classic}. Il
+dépasse en contrepartie le pic exact.
+
+\paragraph{Ce que cette dispersion ne mesure pas.} Elle vaut
+$(\max-\min)/(2\,\mathrm{moy})$ du rayon du centroïde de densité maximale sur $36$
+secteurs, c'est-à-dire du \textbf{bord externe} du choc. Or l'artefact en lobes vit
+sur le \textbf{bord de la cavité}, et ces deux interfaces ne portent pas la même
+information. Mesuré sur le nid d'abeilles, le mode azimutal du front a une amplitude
+de $0{,}003$ --- indiscernable du bruit --- contre $0{,}10$ sur le bord de la cavité,
+soit un facteur trente. \textbf{Une métrique bâtie sur le front ne quantifie donc pas
+les lobes}, et peut annoncer une dispersion de quelques pour-cent sur un champ
+visiblement lobé. Les chiffres ci-dessus restent valides pour ce qu'ils disent --- la
+régularité du front, où l'écart entre les deux schémas est réel --- mais ils ne
+mesurent pas l'amplitude de l'artefact.
+
+\emph{Mise en garde sur ce maillage} : l'artefact à quatre lobes sur les axes est un
+effet d'\textbf{ordre 1}, et non de la symétrisation employée pour construire le
+disque --- un quart de disque seul présente le même défaut, et l'ordre 2 le supprime
+dans les deux géométries.
+
+\medskip
+\noindent
+Ces trois modes d'échec et ces mesures radiales proviennent du travail de la session
+en charge du module lagrangien. Aucun correctif n'a été appliqué : le limiteur de
+positivité et la protection du terme acoustique sont des modifications de schéma, en
+attente d'arbitrage.
+
+\section*{Conclusions}
+
+\begin{enumerate}\itemsep3pt
+  \item \textbf{Le critère~2 ne se lit jamais seul} : quatre schémas le « gagnent » en
+        ayant détruit le vortex. Toujours l'accompagner du critère~1.
+  \item \textbf{\texttt{WIP2\_NOLM} est le seul des sept schémas de référence à passer
+        les quatre critères}, et son ingrédient décisif est la vitesse d'énergie
+        symétrique (conservative) associée à la pression nodale : à pression nodale
+        identique, la forme unilatérale de \texttt{LPP} plafonne à
+        $3{,}2\cdot10^{-4}$ contre $6{,}0\cdot10^{-8}$.
+  \item \textbf{Le terme $\epsilon$ ne peut pas être supprimé}, ni en le reformulant
+        sans capteur, ni en changeant d'advection. Le capteur de Ducros en place est
+        le meilleur mesuré.
+  \item \textbf{La tension quad/tri est un effet d'amplitude}, monotone et de signe
+        opposé sur les deux maillages. C'est, à mon sens, la question centrale
+        restante : elle est apparue quatre fois dans cette campagne par des mécanismes
+        indépendants.
+\end{enumerate}
+
+\paragraph{Réserves.} L'échelle absolue du nombre de Stanton provient de la formule déjà
+présente dans \texttt{plot\_st.gnu} et n'a pas été re-dérivée : les classements sont
+fiables, la valeur absolue mériterait vérification. Les maillages triangulaires
+dépendent de la version de \texttt{gmsh} ; seules les comparaisons à maillage identique
+ont un sens, ce qui est le cas ici. Enfin \texttt{ZB\_ARMDWIP\_*} reste sélectionnable
+alors que \texttt{mat\_h\_p} est nul depuis le retrait de \texttt{compute\_ellip} : il
+produirait des résultats silencieusement faux et devrait être désenregistré ou réparé.
+
+\end{document}
