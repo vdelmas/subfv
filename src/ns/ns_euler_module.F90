@@ -176,7 +176,9 @@ contains
       SCHEME_ZB, SCHEME_WIP, SCHEME_WIP2, SCHEME_WIP2_NOLM, SCHEME_WIP2_AADV, SCHEME_WIP2_HYB, &
       SCHEME_WIP2_EJUMP, SCHEME_WIP2_EDIV, SCHEME_WIP2_EMAX, &
       SCHEME_WIP2_ENTH, SCHEME_WIP2_ENTH_EJUMP, &
-      SCHEME_WIP2_TP, SCHEME_WIP2_TP_ENTH, SCHEME_USI3D, &
+      SCHEME_WIP2_TP, SCHEME_WIP2_TP_ENTH, SCHEME_WIP2_EPOS, SCHEME_WIP2_EPOS2, &
+      SCHEME_WIP2_ED1, SCHEME_WIP2_ED2, &
+      SCHEME_WIP2_MD, SCHEME_WIP2_MD5, SCHEME_WIP2_MDH, SCHEME_USI3D, &
       SCHEME_ADV_AR1D, SCHEME_ADV_AM, SCHEME_ADV_AMISO, &
       SCHEME_ADV_ARMD, SCHEME_ADV_ARMDU, &
       SCHEME_ADV_ARMDMAT, SCHEME_ADV_ARMDUMAT, &
@@ -317,7 +319,10 @@ contains
         .or. scheme_id == SCHEME_WIP2_EJUMP .or. scheme_id == SCHEME_WIP2_EDIV &
         .or. scheme_id == SCHEME_WIP2_EMAX .or. scheme_id == SCHEME_WIP2_ENTH &
         .or. scheme_id == SCHEME_WIP2_ENTH_EJUMP .or. scheme_id == SCHEME_WIP2_TP &
-        .or. scheme_id == SCHEME_WIP2_TP_ENTH) then
+        .or. scheme_id == SCHEME_WIP2_TP_ENTH .or. scheme_id == SCHEME_WIP2_EPOS .or. scheme_id == SCHEME_WIP2_EPOS2 &
+        .or. scheme_id == SCHEME_WIP2_ED1 .or. scheme_id == SCHEME_WIP2_ED2 &
+        .or. scheme_id == SCHEME_WIP2_MD .or. scheme_id == SCHEME_WIP2_MD5 &
+        .or. scheme_id == SCHEME_WIP2_MDH) then
       do id_vert = 1, mesh%n_vert
         nsfn = mesh%vert(id_vert)%n_sub_faces_neigh
         nsen = mesh%vert(id_vert)%n_sub_elems_neigh
@@ -327,6 +332,12 @@ contains
           adv_mode = 1
         else if (scheme_id == SCHEME_WIP2_HYB) then
           adv_mode = 2
+        else if (scheme_id == SCHEME_WIP2_MD) then
+          adv_mode = 3
+        else if (scheme_id == SCHEME_WIP2_MD5) then
+          adv_mode = 4
+        else if (scheme_id == SCHEME_WIP2_MDH) then
+          adv_mode = 5
         else
           adv_mode = 0
         end if
@@ -336,6 +347,14 @@ contains
           eps_mode = 2
         else if (scheme_id == SCHEME_WIP2_EMAX) then
           eps_mode = 3
+        else if (scheme_id == SCHEME_WIP2_EPOS) then
+          eps_mode = 4
+        else if (scheme_id == SCHEME_WIP2_EPOS2) then
+          eps_mode = 5
+        else if (scheme_id == SCHEME_WIP2_ED1) then
+          eps_mode = 6
+        else if (scheme_id == SCHEME_WIP2_ED2) then
+          eps_mode = 7
         else
           eps_mode = 0
         end if

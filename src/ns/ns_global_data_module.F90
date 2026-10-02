@@ -86,6 +86,13 @@ module ns_global_data_module
   integer, parameter :: SCHEME_WIP2_ENTH_EJUMP          = 19 ! "WIP2_ENTH_EJUMP" enthalpy fix + (d) sensor
   integer, parameter :: SCHEME_WIP2_TP                  = 20 ! "WIP2_TP" Tallois multi-D low-Mach correction
   integer, parameter :: SCHEME_WIP2_TP_ENTH             = 21 ! "WIP2_TP_ENTH" + Haenel enthalpy fix
+  integer, parameter :: SCHEME_WIP2_EPOS                = 22 ! "WIP2_EPOS" per-face positivity-driven eps, no sensor
+  integer, parameter :: SCHEME_WIP2_EPOS2               = 23 ! "WIP2_EPOS2" same, impedance-scaled pressure term
+  integer, parameter :: SCHEME_WIP2_ED1                 = 24 ! "WIP2_ED1" Ducros sensor at amplitude 1*a_p
+  integer, parameter :: SCHEME_WIP2_ED2                 = 25 ! "WIP2_ED2" Ducros sensor at amplitude 2*a_p
+  integer, parameter :: SCHEME_WIP2_MD                  = 26 ! "WIP2_MD" multi-d nodal advection, AMISO hybridisation
+  integer, parameter :: SCHEME_WIP2_MD5                 = 27 ! "WIP2_MD5" same, ARMD hybridisation w=0.5
+  integer, parameter :: SCHEME_WIP2_MDH                 = 28 ! "WIP2_MDH" multi-d advection, enthalpy-consistent gradient
   ! 60-62: kept clear of the 1-21 block, which the WIP2 family keeps growing into. These three
   ! were 15/16/17 and silently collided with SCHEME_WIP2_EJUMP/EDIV/EMAX: the WIP2 if-chain in
   ! ns_euler_module fires before the flux select case, so the enthalpy schemes ran a WIP2
@@ -342,6 +349,20 @@ contains
       scheme_id = SCHEME_WIP2_TP
     else if (t == "WIP2_TP_ENTH") then
       scheme_id = SCHEME_WIP2_TP_ENTH
+    else if (t == "WIP2_EPOS") then
+      scheme_id = SCHEME_WIP2_EPOS
+    else if (t == "WIP2_EPOS2") then
+      scheme_id = SCHEME_WIP2_EPOS2
+    else if (t == "WIP2_ED1") then
+      scheme_id = SCHEME_WIP2_ED1
+    else if (t == "WIP2_ED2") then
+      scheme_id = SCHEME_WIP2_ED2
+    else if (t == "WIP2_MD") then
+      scheme_id = SCHEME_WIP2_MD
+    else if (t == "WIP2_MD5") then
+      scheme_id = SCHEME_WIP2_MD5
+    else if (t == "WIP2_MDH") then
+      scheme_id = SCHEME_WIP2_MDH
     else if (t == "USI3D") then
       scheme_id = SCHEME_USI3D
     else if (t(1:2) == "ZB") then

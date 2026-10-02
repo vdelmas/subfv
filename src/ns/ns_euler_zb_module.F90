@@ -2926,6 +2926,7 @@ contains
   subroutine compute_rhs_around_vert_WIP2(mesh, sol, grad, &
       nsen, flux_sum_vert, sum_lambda_vert, &
       id_vert, second_order, low_mach, adv_mode, eps_mode, enth_fix, tp_fix)
+    use linear_solver_module
     use ns_global_data_module, only: boundary_2d
     implicit none
 
@@ -2944,6 +2945,25 @@ contains
     !      central flux (best on Sedov, slope drops below 1)
     ! 2 -> shock-sensor blend of the two: AMISO where the Ducros indicator says
     !      "shock", Rusanov-at-vstar where the flow is smooth/vortical
+    ! 3 -> ARMD-style MULTI-D nodal advection hybridised with the 1D face flux:
+    !        F = w * (sol_p (x) v_p - h_p/2 * grad_p(U).SMAX).n + (1-w) * F_1D
+    !      with SMAX = diag(|v_p,k|). The ZB ARMD* schemes hardwire w = 0.5 and
+    !      are catastrophic here (1e-2 to 3e-1 on the wall heat flux, plus Sedov
+    !      crashes); AMISO, the one robust member of that family, instead uses
+    !      w = (min_f A_f / A_f)/3, i.e. at most a third and weighted by the
+    !      local sub-face area ratio. Mode 3 takes the multi-d flux with AMISO's
+    !      hybridisation. h_p is taken as V_p / sum_f A_f, the volume-to-surface
+    !      length, so no external h_p array is needed.
+    ! 4 -> same, but w = 0.5 as in ARMD, to separate "multi-d is wrong" from
+    !      "multi-d was hybridised too strongly".
+    ! 5 -> mode 3 with an enthalpy-consistent gradient. Measured: mode 3 still
+    !      floors at low Mach (1.26e-6 at Ma=1e-4 against 6.03e-8 without it).
+    !      The reason is the energy row of grad_p(U): rho*E ~ p/(gamma-1) is
+    !      O(1/Ma^2), so dissipating its gradient injects an error that dwarfs
+    !      the O(Ma^2) density fluctuation being measured. Since rho*E = rho*h - p,
+    !      replacing d(rho*E) by h_bar*d(rho) in the dissipated gradient is the
+    !      same Haenel condition already used by enth_fix on the 1D jump, and it
+    !      removes exactly that term.
     integer(kind=ENTIER), intent(in) :: adv_mode
     ! Which eps_p carbuncle sensor feeds the advection viscosity. These are the
     ! four candidates of tex/wip.tex; Vincent's note there is that they give very
@@ -2953,6 +2973,16 @@ contains
     ! 1 -> compute_corr_pressure     (d) normalised p jump      [2*a_p]
     ! 2 -> compute_corr2             (a) -div(v) only           [1*a_p]
     ! 3 -> compute_corr_pressure_div (b) max(p jump, -div v)    [4*a_p]
+    ! 4 -> no sensor at all: a PER-FACE, positivity-driven eps built the same way
+    !      the Lagrange slopes already are, lambda = max(rho*a, sqrt(rho*dp),
+    !      -rho*dv). Transposed to a velocity scale that gives
+    !          eps_f = max(0, -(v_r-v_l).n, sqrt(|p_r-p_l| / rho_m))
+    !      which needs no threshold, no Mach gate and no shock detector, and
+    !      vanishes in a boundary layer by construction: dp/dn ~ 0 across a
+    !      boundary layer and the velocity variation there is tangential, so both
+    !      terms are ~0, while a shock has strong compression and a large dp.
+    !      Note this eps is per-face, unlike modes 0-3 whose sensor is nodal and
+    !      is applied identically to every sub-face around the node.
     integer(kind=ENTIER), intent(in) :: eps_mode
     ! Haenel / MGallice enthalpy preservation (Tallois, papers/talois.pdf, eq 22-23):
     ! the energy dissipation of the flux must equal the total enthalpy times the
@@ -2966,7 +2996,7 @@ contains
     ! correction. p_l^theta = theta_n*[p_l - lambda_l*(u_n - u_l).n] + (1-theta_n)*q_n
     ! with theta_n = min(1, |u_n|/a). Here q_n (eq 6.3.3.1) is exactly this code's
     ! nodal pressure pp, so the low-Mach end (theta_n->0) reproduces WIP2_NOLM
-    ! bit-for-bit, and the shock end (theta_n->1) becomes the one-sided GLACE
+    ! bit-for-bit, and the shock end (theta_n->1) becomes the one-sided EUCCLHYD
     ! nodal pressure flux built on the nodal velocity. Crucially BOTH ends are
     ! nodal, so unlike a convex blend with the 1D flux the multidimensional
     ! character is never lost -- that is the thesis's stated reason for this form.
@@ -2989,7 +3019,12 @@ contains
     real(kind=DOUBLE), dimension(5) :: sol_p, u_bar, ff_a, fadv_minus, fadv_plus
     ! shock-sensor blend workspace
     logical :: need_amiso, need_ducros
-    real(kind=DOUBLE) :: corr_a, w_shock
+    real(kind=DOUBLE) :: corr_a, w_shock, eps_face
+    real(kind=DOUBLE) :: min_apf_md, sum_area_md, h_node, w_md
+    real(kind=DOUBLE), dimension(3) :: v_md
+    real(kind=DOUBLE), dimension(5) :: sol_p_md
+    real(kind=DOUBLE), dimension(5,3) :: grad_md, fp_md
+    real(kind=DOUBLE), dimension(3,3) :: smax_md
     real(kind=DOUBLE) :: h_l, h_r, h_bar
     real(kind=DOUBLE) :: theta_n, pflux_l, pflux_r, vn_node
     real(kind=DOUBLE), dimension(3) :: u_node
@@ -3027,11 +3062,11 @@ contains
 
     ! carbuncle / shock sensor: each advection variant keeps its own, so that
     ! switching adv_mode reproduces that family's behaviour exactly
-    need_ducros = (adv_mode == 0 .or. adv_mode == 2)
+    need_ducros = (adv_mode == 0 .or. adv_mode == 2 .or. adv_mode == 3 .or. adv_mode == 4 .or. adv_mode == 5)
 
     corr = 0.0_DOUBLE
     corr_a = 0.0_DOUBLE
-    if (need_ducros) then
+    if (need_ducros .and. eps_mode /= 4 .and. eps_mode /= 5) then
       select case (eps_mode)
       case (1)
         call compute_corr_pressure(mesh, id_vert, sol, grad, corr, second_order)
@@ -3042,6 +3077,15 @@ contains
       case default
         call compute_corr_ducros(mesh, id_vert, sol, grad, corr, second_order)
       end select
+      ! Modes 6/7 keep the Ducros sensor EXACTLY as is and only rescale it.
+      ! Purpose: the heat-flux campaign left an ambiguity -- the nodal -div(v)
+      ! sensor (amplitude 1*a_p) is the best on quad while Ducros (amplitude
+      ! 4*a_p) is the best on tri by a factor 4.5. That gap can come from the
+      ! sensor's SHAPE (the div^2/(div^2+curl^2) filter suppressing shear) or
+      ! merely from its AMPLITUDE. compute_corr_ducros returns w*4*a_p, so
+      ! multiplying by 1/4 and 1/2 isolates the amplitude at fixed shape.
+      if (eps_mode == 6) corr = 0.25_DOUBLE*corr
+      if (eps_mode == 7) corr = 0.5_DOUBLE*corr
     end if
 
     ! Blend weight: compute_corr_ducros returns corr = w * 4 * a_p, where w is
@@ -3136,6 +3180,52 @@ contains
     end do
     pp = pp / denomsum
 
+    ! --- multi-d nodal advection flux (modes 3/4) ---
+    if (adv_mode == 3 .or. adv_mode == 4 .or. adv_mode == 5) then
+      call compute_nodal_velocity_LVP(mesh, id_vert, sol, grad, v_md, second_order)
+
+      sol_p_md = 0.0_DOUBLE
+      do j = 1, mesh%vert(id_vert)%n_sub_elems_neigh
+        id_sub_elem = mesh%vert(id_vert)%sub_elem_neigh(j)
+        id_elem = mesh%sub_elem(id_sub_elem)%mesh_elem
+        sol_p_md = sol_p_md + mesh%sub_elem(id_sub_elem)%volume*sol(:, id_elem)
+      end do
+      sol_p_md = sol_p_md / mesh%vert(id_vert)%volume
+
+      grad_md = 0.0_DOUBLE
+      sum_area_md = 0.0_DOUBLE
+      min_apf_md = huge(1.0_DOUBLE)
+      do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+        id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+        le = mesh%sub_face(id_sub_face)%left_elem_neigh
+        re = mesh%sub_face(id_sub_face)%right_elem_neigh
+        norm = mesh%sub_face(id_sub_face)%norm
+        call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
+          second_order, sol_w_l, sol_w_r)
+        grad_md = grad_md + tensor_product( &
+          primit_to_conserv(sol_w_r) - primit_to_conserv(sol_w_l), &
+          mesh%sub_face(id_sub_face)%area*norm)
+        sum_area_md = sum_area_md + mesh%sub_face(id_sub_face)%area
+        if (re > 0) min_apf_md = min(min_apf_md, mesh%sub_face(id_sub_face)%area)
+      end do
+      grad_md = grad_md / mesh%vert(id_vert)%volume
+      h_node = mesh%vert(id_vert)%volume / sum_area_md
+
+      if (adv_mode == 5) then
+        ! Haenel-consistent energy row: grad(rho*E) -> h_p * grad(rho)
+        sol_w = conserv_to_primit(sol_p_md)
+        h_bar = (sol_p_md(5) + sol_w(5))/sol_p_md(1)
+        grad_md(5, :) = h_bar*grad_md(1, :)
+      end if
+
+      smax_md = 0.0_DOUBLE
+      smax_md(1, 1) = abs(v_md(1))
+      smax_md(2, 2) = abs(v_md(2))
+      smax_md(3, 3) = abs(v_md(3))
+      fp_md = tensor_product(sol_p_md, v_md) &
+        - 0.5_DOUBLE*h_node*matmul(grad_md, smax_md)
+    end if
+
     ! --- flux assembly ---
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
@@ -3174,7 +3264,7 @@ contains
 
       ff_lag(1) = 0.0_DOUBLE
       if (tp_fix) then
-        ! one-sided GLACE pressure at the shock end, nodal pressure at the
+        ! one-sided EUCCLHYD pressure at the shock end, nodal pressure at the
         ! low-Mach end; energy velocity blends the same way so theta_n=0 is
         ! exactly the WIP2_NOLM flux.
         vn_node = dot_product(u_node, norm)
@@ -3197,7 +3287,25 @@ contains
 
       ! Rusanov-at-vstar advection (WIP form)
       if (need_ducros) then
-        ff_adv = vstar*sol_m - 0.5_DOUBLE*(abs(vstar) + corr)*djump
+        if (eps_mode == 4 .or. eps_mode == 5) then
+          if (eps_mode == 5) then
+            ! Mode 5 fixes mode 4's scaling. sqrt(|dp|/rho) has the dimension of
+            ! a velocity but the WRONG Mach scaling: at low Mach dp across a face
+            ! is O(rho v^2) = O(h), independent of Ma, so sqrt(dp/rho) ~ sqrt(h)
+            ! never vanishes and puts a floor on L2(rho) (measured: 1.06e-7 at
+            ! Ma=1e-4 against 6.0e-8 without it). The impedance conversion
+            ! |dp|/(rho*a) is O(h*Ma) instead, and is the same conversion already
+            ! used everywhere else here, e.g. in vstar's -(p_r-p_l)/(lam_l+lam_r).
+            eps_face = max(0.0_DOUBLE, -(vnr - vnl), &
+              abs(pr - pl)/(0.5_DOUBLE*(rhol + rhor)*0.5_DOUBLE*(al + ar)))
+          else
+            eps_face = max(0.0_DOUBLE, -(vnr - vnl), &
+              sqrt(abs(pr - pl)/(0.5_DOUBLE*(rhol + rhor))))
+          end if
+          ff_adv = vstar*sol_m - 0.5_DOUBLE*(abs(vstar) + eps_face)*djump
+        else
+          ff_adv = vstar*sol_m - 0.5_DOUBLE*(abs(vstar) + corr)*djump
+        end if
       end if
 
       ! AMISO advection (asymmetric by construction: the nodal upwind state
@@ -3222,7 +3330,7 @@ contains
       end if
 
       if (tp_fix) then
-        ! per-side Lagrange flux (the GLACE part is one-sided by construction)
+        ! per-side Lagrange flux (the EUCCLHYD part is one-sided by construction)
         ff_lag_l(1) = 0.0_DOUBLE
         ff_lag_l(2:4) = pflux_l * norm
         ff_lag_l(5) = pflux_l * (theta_n*vn_node + (1.0_DOUBLE - theta_n)*vstar)
@@ -3232,6 +3340,17 @@ contains
       else
         ff_lag_l = ff_lag
         ff_lag_r = ff_lag
+      end if
+
+      if (adv_mode == 3 .or. adv_mode == 4 .or. adv_mode == 5) then
+        if ((adv_mode == 3 .or. adv_mode == 5) .and. re > 0) then
+          w_md = min_apf_md/mesh%sub_face(id_sub_face)%area*(1.0_DOUBLE/3.0_DOUBLE)
+        else if (adv_mode == 4) then
+          w_md = 0.5_DOUBLE
+        else
+          w_md = 0.0_DOUBLE
+        end if
+        ff_adv = w_md*matmul(fp_md, norm) + (1.0_DOUBLE - w_md)*ff_adv
       end if
 
       select case (adv_mode)
