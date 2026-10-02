@@ -6,6 +6,7 @@ module lagrange_module
   use mesh_reading_module
   use mesh_geometry_module
   use mesh_connectivity_module
+  use linear_solver_module, only : pseudo_inverse_inplace_lapack
 
   implicit none
 
@@ -3264,4 +3265,171 @@ contains
     linferr = errinf
   end subroutine compute_error_taylor_green
 
+  subroutine solve_all_nodal_systems(nsfn, sol_lr, gammas, norms, areas, vp, pp, pvp)
+    implicit none
+
+    integer(kind=ENTIER), intent(in) :: nsfn
+    real(kind=DOUBLE), dimension(5, 2, nsfn), intent(in) :: sol_lr
+    real(kind=DOUBLE), dimension(3, nsfn), intent(in) :: norms
+    real(kind=DOUBLE), dimension(nsfn), intent(in) :: areas
+    real(kind=DOUBLE), dimension(2, nsfn), intent(in) :: gammas
+    real(kind=DOUBLE), dimension(3), intent(inout) :: vp, pvp
+    real(kind=DOUBLE), intent(inout) :: pp
+
+    integer(kind=ENTIER) :: i
+    real(kind=DOUBLE) :: vnl, vnr, lambda_l, lambda_r, taul, taur, pl, pr, el, er
+    real(kind=DOUBLE) :: pgod, vgod, pvgod, ppdenom
+
+    real(kind=DOUBLE), dimension(3, 3) :: mat_vp, mat_pvp
+    real(kind=DOUBLE), dimension(3) :: rhs_vp, rhs_pvp
+
+    vp = 0.0_DOUBLE
+    mat_vp = 0.0_DOUBLE
+    rhs_vp = 0.0_DOUBLE
+    pp = 0.0_DOUBLE
+    ppdenom = 0.0_DOUBLE
+    pvp = 0.0_DOUBLE
+    mat_pvp = 0.0_DOUBLE
+    rhs_pvp = 0.0_DOUBLE
+    do i=1, nsfn
+      taul = sol_lr(1, 1, i)
+      vnl = dot_product(sol_lr(2:4, 1, i), norms(:, i))
+      el = sol_lr(5, 1, i)
+      pl = pressure(sol_lr(:, 1, i), gammas(1, i))
+
+      taur = sol_lr(1, 2, i)
+      vnr = dot_product(sol_lr(2:4, 2, i), norms(:, i))
+      er = sol_lr(5, 2, i)
+      pr = pressure(sol_lr(:, 2, i), gammas(2, i))
+
+      lambda_l = max(sqrt(max(0.0_DOUBLE, gammas(1, i)*pl*taul))/taul, &
+        sqrt(max(0.0_DOUBLE, pr-pl)/taul), -(vnr-vnl)/taul)
+      lambda_r = max(sqrt(max(0.0_DOUBLE, gammas(2, i)*pr*taur))/taur, &
+        sqrt(max(0.0_DOUBLE, pl-pr)/taur), -(vnr-vnl)/taur)
+
+      pgod = (pl/lambda_l + pr/lambda_r - (vnr-vnl))&
+        /(1.0_DOUBLE/lambda_l+1.0_DOUBLE/lambda_r)
+      
+      vgod = (lambda_l*vnl + lambda_r*vnr - (pr - pl))&
+        /(lambda_l + lambda_r)
+
+      pvgod = (pl*vnl/lambda_l + pr*vnr/lambda_r - (er - el))&
+        /(1.0_DOUBLE/lambda_l+1.0_DOUBLE/lambda_r)
+
+      mat_vp = mat_vp &
+        + areas(i)*tensor_product(norms(:, i), norms(:, i))&
+        *(lambda_l + lambda_r)
+      rhs_vp = rhs_vp &
+        + areas(i)*(lambda_l+lambda_r)*vgod*norms(:, i)
+
+      pp = pp &
+        + areas(i)*(1.0_DOUBLE/lambda_l+1.0_DOUBLE/lambda_r)*pgod
+      ppdenom = ppdenom &
+        + areas(i)*(1.0_DOUBLE/lambda_l+1.0_DOUBLE/lambda_r)
+
+      mat_pvp = mat_pvp &
+        + areas(i)*(1.0_DOUBLE/lambda_l+1.0_DOUBLE/lambda_r)&
+        *tensor_product(norms(:, i), norms(:, i))
+      rhs_pvp = rhs_pvp &
+        + areas(i)*(1.0_DOUBLE/lambda_l+1.0_DOUBLE/lambda_r)*pvgod*norms(:, i)
+    end do
+
+    pp = pp / ppdenom
+    call pseudo_inverse_inplace_lapack(3, mat_vp)
+    vp = matmul(mat_vp, rhs_vp)
+    call pseudo_inverse_inplace_lapack(3, mat_pvp)
+    pvp = matmul(mat_pvp, rhs_pvp)
+  end subroutine solve_all_nodal_systems
+
+  subroutine compute_rhs_lagrange_all_nodal(mesh, sol, vp, rhs, &
+      n_bc, bc_type, bc_val, b2d, mass, gamma_arr, vp_is_imposed)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(inout) :: vp
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(inout) :: rhs
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: mass
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: gamma_arr
+    logical, dimension(mesh%n_vert), intent(in) :: vp_is_imposed
+    integer(kind=ENTIER), intent(in) :: n_bc
+    character(len=255), dimension(n_bc) :: bc_type
+    real(kind=DOUBLE), dimension(5, n_bc) :: bc_val
+    logical, intent(in) :: b2d
+
+    integer(kind=ENTIER) :: i, j, k, nsfn, id_sub_face, id_face, idl, idr, var
+    real(kind=DOUBLE), dimension(:, :, :), allocatable :: sol_lr
+    real(kind=DOUBLE), dimension(:, :), allocatable :: norms, gammas
+    real(kind=DOUBLE), dimension(:), allocatable :: areas
+    real(kind=DOUBLE), dimension(5) :: flux
+    real(kind=DOUBLE), dimension(3) :: vp_loc, pvp
+    real(kind=DOUBLE) :: pp, v_target, area
+
+    rhs = 0.0_DOUBLE
+
+    do i = 1, mesh%n_vert
+      nsfn = mesh%vert(i)%n_sub_faces_neigh
+      if (nsfn <= 0) cycle
+
+      allocate(sol_lr(5, 2, nsfn), norms(3, nsfn), areas(nsfn), gammas(2, nsfn))
+      k = 0
+      do j = 1, nsfn
+        id_sub_face = mesh%vert(i)%sub_face_neigh(j)
+        id_face = mesh%sub_face(id_sub_face)%mesh_face
+        if (b2d .and. abs(mesh%face(id_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE) cycle
+        idl = mesh%face(id_face)%left_neigh
+        idr = mesh%face(id_face)%right_neigh
+        k = k + 1
+        norms(:, k) = mesh%face(id_face)%norm
+        areas(k) = mesh%sub_face(id_sub_face)%area
+        sol_lr(:, 1, k) = sol(:, idl)
+        gammas(1, k) = gamma_arr(idl)
+        if (idr > 0) then
+          sol_lr(:, 2, k) = sol(:, idr)
+          gammas(2, k) = gamma_arr(idr)
+        else
+          v_target = 0.0_DOUBLE
+          if (idr < 0) then
+            if (-idr <= n_bc) then
+              if (trim(bc_type(-idr)) == 'piston') &
+                v_target = dot_product(bc_val(2:4, -idr), mesh%face(id_face)%norm)
+            end if
+          end if
+          sol_lr(:, 2, k) = mirror_state(sol(:, idl), mesh%face(id_face)%norm, v_target)
+          gammas(2, k) = gamma_arr(idl)
+        end if
+      end do
+
+      if (k > 0) then
+        vp_loc = vp(:, i)
+        call solve_all_nodal_systems(k, sol_lr(:, :, 1:k), gammas(:, 1:k), &
+          norms(:, 1:k), areas(1:k), vp_loc, pp, pvp)
+        if (.not. vp_is_imposed(i)) vp(:, i) = vp_loc
+
+        do j = 1, nsfn
+          id_sub_face = mesh%vert(i)%sub_face_neigh(j)
+          id_face = mesh%sub_face(id_sub_face)%mesh_face
+          if (b2d .and. abs(mesh%face(id_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE) cycle
+          idl = mesh%face(id_face)%left_neigh
+          idr = mesh%face(id_face)%right_neigh
+          area = mesh%sub_face(id_sub_face)%area
+
+          flux(1) = -dot_product(vp(:, i), mesh%face(id_face)%norm)
+          flux(2:4) = pp*mesh%face(id_face)%norm
+          flux(5) = dot_product(pvp, mesh%face(id_face)%norm)
+
+          do var = 1, 5
+            rhs(var, idl) = rhs(var, idl) - area/mass(idl)*flux(var)
+          end do
+          if (idr > 0) then
+            do var = 1, 5
+              rhs(var, idr) = rhs(var, idr) + area/mass(idr)*flux(var)
+            end do
+          end if
+        end do
+      end if
+
+      deallocate(sol_lr, norms, areas, gammas)
+    end do
+  end subroutine compute_rhs_lagrange_all_nodal
 end module lagrange_module

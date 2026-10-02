@@ -252,6 +252,9 @@ program main
       call compute_rhs_lagrange_sidil(mesh, sol, vp, &
         dt, rhs, n_bc, bc_type, bc_val, boundary_2d, mass, method_length, h_extrude, &
         gamma_arr, vp_is_imposed, h_p_arr)
+    else if( scheme == "all_nodal" ) then
+      call compute_rhs_lagrange_all_nodal(mesh, sol, vp, &
+        rhs, n_bc, bc_type, bc_val, boundary_2d, mass, gamma_arr, vp_is_imposed)
     else if( scheme == "vp_ep" .or. scheme == "vp_ep_wip" ) then
       ! vitesse nodale + energie nodale, puis solveur 1D par sous-face.
       call compute_rhs_lagrange_vp_ep(mesh, sol, vp, &
