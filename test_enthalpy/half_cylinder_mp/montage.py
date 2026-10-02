@@ -17,8 +17,17 @@ FIELD_W, BAR_W, H = 500, 460, 1000
 # reused from ../half_cylinder, which marches in time through euler_ho instead.
 SCHEMES = ["three_wave", "three_wave_enthalpy", "multi_point", "multi_point_enthalpy"]
 COLS = [("%s_%s" % (m, s), "%s - %s" % (m, s)) for m in ("quad", "tri") for s in SCHEMES]
-ROWS = [("schlieren", "schlieren  log(|grad rho|+1)"),
-        ("enthalpy", "total enthalpy H   (h_inf = 283.5)")]
+ALL_ROWS = {
+    "schlieren": "schlieren  log(|grad rho|+1)",
+    "enthalpy": "total enthalpy H   (h_inf = 283.5)",
+    "density": "density rho",
+    "pressure": "pressure p",
+}
+# Which rows to stack, and the output name: `montage.py schlieren enthalpy out.png`
+import sys
+_args = sys.argv[1:]
+OUTNAME = _args.pop() if _args and _args[-1].endswith(".png") else "comparison.png"
+ROWS = [(k, ALL_ROWS[k]) for k in (_args or ["schlieren", "enthalpy"])]
 TITLE_H, ROWLAB_W, PAD = 54, 46, 8
 
 
@@ -52,5 +61,5 @@ for r, (field, rowlabel) in enumerate(ROWS):
                              font=f_row, anchor="mm")
     out.paste(lab.rotate(90, expand=True), (0, y))
 
-out.save("figures/comparison.png")
-print("saved figures/comparison.png  (%dx%d)" % out.size)
+out.save("figures/" + OUTNAME)
+print("saved figures/%s  (%dx%d)" % (OUTNAME, out.size[0], out.size[1]))

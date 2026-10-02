@@ -10,11 +10,12 @@ unset DISPLAY
 FILES=$(ls outputs/*/output_-1.pvtu 2>/dev/null)
 [ -z "$FILES" ] && { echo "no finished run in outputs/"; exit 1; }
 
-read SCHL HMIN HMAX <<< "$(pvbatch ranges.py $FILES 2>/dev/null | tail -1)"
-echo "shared ranges: schlieren 0..$SCHL   H $HMIN..$HMAX"
+read SCHL HMIN HMAX RMIN RMAX PMIN PMAX <<< "$(pvbatch ranges.py $FILES 2>/dev/null | tail -1)"
+echo "shared ranges: schlieren 0..$SCHL   H $HMIN..$HMAX   rho $RMIN..$RMAX   p $PMIN..$PMAX"
 
 mkdir -p figures
 for f in $FILES; do
   tag=$(basename "$(dirname "$f")")
-  pvbatch render.py "$f" "figures/$tag" "$SCHL" "$HMIN" "$HMAX" 2>/dev/null | grep '^saved'
+  pvbatch render.py "$f" "figures/$tag" "$SCHL" "$HMIN" "$HMAX" \
+          "$RMIN" "$RMAX" "$PMIN" "$PMAX" 2>/dev/null | grep '^saved'
 done

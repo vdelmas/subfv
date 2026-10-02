@@ -14,7 +14,7 @@ from paraview.simple import *
 from paraview import servermanager as sm
 from paraview.numpy_support import vtk_to_numpy
 
-H, S = [], []
+H, S, R, P = [], [], [], []
 for f in sys.argv[1:]:
     r = XMLPartitionedUnstructuredGridReader(FileName=[f]); r.UpdatePipeline()
     blocks = []
@@ -36,7 +36,13 @@ for f in sys.argv[1:]:
         g = np.concatenate([vtk_to_numpy(b.GetPointData().GetArray('Nodal_Grad_Density'))
                             for b in blocks])
     S.append(np.log(np.linalg.norm(g, axis=1) + 1))
+    rho_name = 'rho' if blocks[0].GetCellData().GetArray('rho') is not None else 'Density'
+    p_name = 'p' if blocks[0].GetCellData().GetArray('p') is not None else 'Pressure'
+    R.append(np.concatenate([vtk_to_numpy(b.GetCellData().GetArray(rho_name)) for b in blocks]))
+    P.append(np.concatenate([vtk_to_numpy(b.GetCellData().GetArray(p_name)) for b in blocks]))
     Delete(r)
 
 H = np.concatenate(H); S = np.concatenate(S)
-print("%.4f %.4f %.4f" % (np.quantile(S, 0.999), H.min(), H.max()))
+R = np.concatenate(R); P = np.concatenate(P)
+print("%.4f %.4f %.4f %.4f %.4f %.4f %.4f" % (
+    np.quantile(S, 0.999), H.min(), H.max(), R.min(), R.max(), P.min(), P.max()))
