@@ -564,7 +564,7 @@ contains
     integer(kind=ENTIER) :: i, j, k, id_sub_face, id_face
     real(kind=DOUBLE), dimension(3) :: norm, xface
     real(kind=DOUBLE), dimension(:, :),  allocatable :: face_coords
-    real(kind=DOUBLE), dimension(5) :: wL, wR, flux, sol_l, sol_r
+    real(kind=DOUBLE), dimension(5) :: wL, wR, sol_l, sol_r
     real(kind=DOUBLE), dimension(5,2) :: lr_flux
     real(kind=DOUBLE) :: lambda
     logical :: is_zsubface
@@ -651,67 +651,97 @@ contains
               sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*qpw(4,1,id_sub_face)
             end if
             ! Other possible quadrature points to be treated with 2P flux
-            do k = 2,4
-              wL = reconstruct(prim, grad, hess, il, qpw(1:3,k,id_sub_face), mesh%elem(il)%coord)
-              if (ir > 0) then
-                wR = reconstruct(prim, grad, hess, ir, qpw(1:3,k,id_sub_face), mesh%elem(ir)%coord)
-              else
-                sol_l = primit_to_conserv(wL)
-                call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
-                wR = conserv_to_primit(sol_r)
-              end if
-              flux = rusanov(wL, wR, norm) * qpw(4,k,id_sub_face)
-              rhs(:, il)  = rhs(:, il) - flux
-              lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
-                    abs(dot_product(wR(2:4), norm)) + cs(wR)) * qpw(4,k,id_sub_face)
-              sum_lambda(il) = sum_lambda(il) + lambda
-              if (ir > 0) then
-                rhs(:, ir)  = rhs(:, ir)  + flux
-                sum_lambda(ir) = sum_lambda(ir) + lambda
-              end if
-            end do
+            if (order>=3) then
+              do k = 2,4
+                wL = reconstruct(prim, grad, hess, il, qpw(1:3,k,id_sub_face), mesh%elem(il)%coord)
+                if (ir > 0) then
+                  wR = reconstruct(prim, grad, hess, ir, qpw(1:3,k,id_sub_face), mesh%elem(ir)%coord)
+                else
+                  sol_l = primit_to_conserv(wL)
+                  call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
+                  wR = conserv_to_primit(sol_r)
+                end if
+                call three_wave(wL, wR, norm, lr_flux, sl, sr)
+                rhs(:, il)  = rhs(:, il)  - qpw(4,k,id_sub_face)*lr_flux(:, 1)
+                sum_lambda(il) = sum_lambda(il) + max(0.0_DOUBLE, -sl)*qpw(4,k,id_sub_face)
+                if (ir > 0) then
+                  rhs(:, ir)     = rhs(:, ir)     - qpw(4,k,id_sub_face)*lr_flux(:, 2)
+                  sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*qpw(4,k,id_sub_face)
+                end if
+              end do
+            end if
           case (4)
             ! Same 2P flux is applied to all quadrature points
-            do k = 1,4
-              wL = reconstruct(prim, grad, hess, il, qpw(1:3,k,id_sub_face), mesh%elem(il)%coord)
-              if (ir > 0) then
-                wR = reconstruct(prim, grad, hess, ir, qpw(1:3,k,id_sub_face), mesh%elem(ir)%coord)
-              else
-                sol_l = primit_to_conserv(wL)
-                call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
-                wR = conserv_to_primit(sol_r)
-              end if
-              flux = rusanov(wL, wR, norm) * qpw(4,k,id_sub_face)
-              rhs(:, il)  = rhs(:, il) - flux
-              lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
-                    abs(dot_product(wR(2:4), norm)) + cs(wR)) * qpw(4,k,id_sub_face)
-              sum_lambda(il) = sum_lambda(il) + lambda
-              if (ir > 0) then
-                rhs(:, ir)  = rhs(:, ir)  + flux
-                sum_lambda(ir) = sum_lambda(ir) + lambda
-              end if
-            end do
+            wL = reconstruct(prim, grad, hess, il, qpw(1:3,1,id_sub_face), mesh%elem(il)%coord)
+            if (ir > 0) then
+              wR = reconstruct(prim, grad, hess, ir, qpw(1:3,1,id_sub_face), mesh%elem(ir)%coord)
+            else
+              sol_l = primit_to_conserv(wL)
+              call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
+              wR = conserv_to_primit(sol_r)
+            end if
+            call three_wave(wL, wR, norm, lr_flux, sl, sr)
+            rhs(:, il)  = rhs(:, il)  - qpw(4,1,id_sub_face)*lr_flux(:, 1)
+            sum_lambda(il) = sum_lambda(il) + max(0.0_DOUBLE, -sl)*qpw(4,1,id_sub_face)
+            if (ir > 0) then
+              rhs(:, ir)     = rhs(:, ir)     - qpw(4,1,id_sub_face)*lr_flux(:, 2)
+              sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*qpw(4,1,id_sub_face)
+            end if
+            if (order>=3) then
+              do k = 2,4
+                wL = reconstruct(prim, grad, hess, il, qpw(1:3,k,id_sub_face), mesh%elem(il)%coord)
+                if (ir > 0) then
+                  wR = reconstruct(prim, grad, hess, ir, qpw(1:3,k,id_sub_face), mesh%elem(ir)%coord)
+                else
+                  sol_l = primit_to_conserv(wL)
+                  call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
+                  wR = conserv_to_primit(sol_r)
+                end if
+                call three_wave(wL, wR, norm, lr_flux, sl, sr)
+                rhs(:, il)  = rhs(:, il)  - qpw(4,k,id_sub_face)*lr_flux(:, 1)
+                sum_lambda(il) = sum_lambda(il) + max(0.0_DOUBLE, -sl)*qpw(4,k,id_sub_face)
+                if (ir > 0) then
+                  rhs(:, ir)     = rhs(:, ir)     - qpw(4,k,id_sub_face)*lr_flux(:, 2)
+                  sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*qpw(4,k,id_sub_face)
+                end if
+              end do
+            end if
           case default
             ! Same 2P flux is applied to all quadrature points
-            do k = 1,4
-              wL = reconstruct(prim, grad, hess, il, qpw(1:3,k,id_sub_face), mesh%elem(il)%coord)
-              if (ir > 0) then
-                wR = reconstruct(prim, grad, hess, ir, qpw(1:3,k,id_sub_face), mesh%elem(ir)%coord)
-              else
-                sol_l = primit_to_conserv(wL)
-                call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
-                wR = conserv_to_primit(sol_r)
-              end if
-              flux = rusanov(wL, wR, norm) * qpw(4,k,id_sub_face)
-              rhs(:, il)  = rhs(:, il) - flux
-              lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
-                    abs(dot_product(wR(2:4), norm)) + cs(wR)) * qpw(4,k,id_sub_face)
-              sum_lambda(il) = sum_lambda(il) + lambda
-              if (ir > 0) then
-                rhs(:, ir)  = rhs(:, ir)  + flux
-                sum_lambda(ir) = sum_lambda(ir) + lambda
-              end if
-            end do
+            wL = reconstruct(prim, grad, hess, il, qpw(1:3,1,id_sub_face), mesh%elem(il)%coord)
+            if (ir > 0) then
+              wR = reconstruct(prim, grad, hess, ir, qpw(1:3,1,id_sub_face), mesh%elem(ir)%coord)
+            else
+              sol_l = primit_to_conserv(wL)
+              call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
+              wR = conserv_to_primit(sol_r)
+            end if
+            call three_wave(wL, wR, norm, lr_flux, sl, sr)
+            rhs(:, il)  = rhs(:, il)  - qpw(4,1,id_sub_face)*lr_flux(:, 1)
+            sum_lambda(il) = sum_lambda(il) + max(0.0_DOUBLE, -sl)*qpw(4,1,id_sub_face)
+            if (ir > 0) then
+              rhs(:, ir)     = rhs(:, ir)     - qpw(4,1,id_sub_face)*lr_flux(:, 2)
+              sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*qpw(4,1,id_sub_face)
+            end if
+            if (order>=3) then
+              do k = 2,4
+                wL = reconstruct(prim, grad, hess, il, qpw(1:3,k,id_sub_face), mesh%elem(il)%coord)
+                if (ir > 0) then
+                  wR = reconstruct(prim, grad, hess, ir, qpw(1:3,k,id_sub_face), mesh%elem(ir)%coord)
+                else
+                  sol_l = primit_to_conserv(wL)
+                  call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
+                  wR = conserv_to_primit(sol_r)
+                end if
+                call three_wave(wL, wR, norm, lr_flux, sl, sr)
+                rhs(:, il)  = rhs(:, il)  - qpw(4,k,id_sub_face)*lr_flux(:, 1)
+                sum_lambda(il) = sum_lambda(il) + max(0.0_DOUBLE, -sl)*qpw(4,k,id_sub_face)
+                if (ir > 0) then
+                  rhs(:, ir)     = rhs(:, ir)     - qpw(4,k,id_sub_face)*lr_flux(:, 2)
+                  sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*qpw(4,k,id_sub_face)
+                end if
+              end do
+            end if
         end select
       end do
 
@@ -797,8 +827,9 @@ contains
     real(kind=DOUBLE), dimension(3) :: norm, xface
     real(kind=DOUBLE), dimension(:, :), allocatable :: face_coords, qpts
     real(kind=DOUBLE), dimension(:),    allocatable :: qwts
-    real(kind=DOUBLE), dimension(5) :: wL, wR, flux, sol_l, sol_r
-    real(kind=DOUBLE) :: lambda
+    real(kind=DOUBLE), dimension(5) :: wL, wR, sol_l, sol_r
+    real(kind=DOUBLE), dimension(5,2) :: lr_flux
+    real(kind=DOUBLE) :: sl, sr
     logical :: is_zface
 
     do iface = 1, mesh%n_faces
@@ -858,28 +889,12 @@ contains
           call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
           wR = conserv_to_primit(sol_r)
         end if
-
-        ! Numerical flux (physical: per-area * area_weight_at_qpt).
-        ! flux_scheme_id resolved once in read_params -- see its
-        ! declaration for why this is an integer compare, not a string one.
-        ! select case (flux_scheme_id)
-        ! case (FLUX_THREE_WAVE)
-        !   flux = three_wave_flux(wL, wR, norm) * qwts(q)
-        ! case (FLUX_TWO_WAVE)
-        ! flux = two_wave_flux(wL, wR, norm) * qwts(q)
-        flux = rusanov(wL, wR, norm) * qwts(q)
-        
-        lambda = max(abs(dot_product(wL(2:4), norm)) + cs(wL), &
-                     abs(dot_product(wR(2:4), norm)) + cs(wR)) * qwts(q)
-
-        ! print*, 'q=', q, 'qwts(q)=', qwts(q), 'lam=', lambda
-        ! print*, 'rho=', wL(1), 'u=', wL(2:4), 'p=', wL(5), 'cs=', cs(wL)
-
-        rhs(:, il)  = rhs(:, il)  - flux
-        sum_lambda(il) = sum_lambda(il) + lambda
+        call three_wave(wL, wR, norm, lr_flux, sl, sr)
+        rhs(:, il)  = rhs(:, il)  - lr_flux(:, 1) * qwts(q)
+        sum_lambda(il) = sum_lambda(il) + max(0.0_DOUBLE, -sl)*qwts(q)
         if (ir > 0) then
-          rhs(:, ir)     = rhs(:, ir)     + flux
-          sum_lambda(ir) = sum_lambda(ir) + lambda
+          rhs(:, ir)     = rhs(:, ir)     - lr_flux(:, 2)*qwts(q)
+          sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*qwts(q)
         end if
       end do
 
@@ -977,7 +992,7 @@ contains
       - 0.5_DOUBLE * lam * (primit_to_conserv(wR) - primit_to_conserv(wL))
   end function rusanov
 
-  pure function two_wave_flux(wL, wR, n) result(F)
+  pure function two_wave(wL, wR, n) result(F)
     real(kind=DOUBLE), dimension(5), intent(in) :: wL, wR
     real(kind=DOUBLE), dimension(3), intent(in) :: n
     real(kind=DOUBLE), dimension(5) :: F
@@ -1010,7 +1025,75 @@ contains
 
     F = 0.5_DOUBLE*(fL + fR) - 0.5_DOUBLE*( &
       abs(sL_wave)*(u_star - uL) + abs(sR_wave)*(uR - u_star))
-  end function two_wave_flux
+  end function two_wave
+
+  subroutine three_wave(sol_w_l, sol_w_r, n, lr_flux, sl, sr)
+    implicit none
+
+    real(kind=DOUBLE), dimension(5), intent(in) :: sol_w_l, sol_w_r
+    real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), dimension(5) :: sol_l, sol_r
+    real(kind=DOUBLE), dimension(5, 2), intent(inout) :: lr_flux
+    real(kind=DOUBLE), intent(inout) :: sl, sr
+
+    real(kind=DOUBLE) :: rhol, rhor, vn_l, vn_r
+    real(kind=DOUBLE) :: pl, pr, rhol_et, rhor_et
+    real(kind=DOUBLE) :: v_et, el, er, al, ar
+    real(kind=DOUBLE) :: v_bar, pl_bar, pr_bar
+    real(kind=DOUBLE) :: lambda_l, lambda_r
+    real(kind=DOUBLE), dimension(5) :: fl, fr, sol_l_et, sol_r_et
+
+    rhol = sol_w_l(1)
+    vn_l = dot_product(sol_w_l(2:4), n)
+    pl = sol_w_l(5)
+    sol_l = primit_to_conserv(sol_w_l)
+    el = sol_l(5)/rhol
+    al = sound_speed_w(sol_w_l)
+
+    rhor = sol_w_r(1)
+    vn_r = dot_product(sol_w_r(2:4), n)
+    pr = sol_w_r(5)
+    sol_r = primit_to_conserv(sol_w_r)
+    er = sol_r(5)/rhor
+    ar = sound_speed_w(sol_w_r)
+
+    fl(1)   = vn_l*sol_l(1)
+    fl(2:4) = vn_l*sol_l(2:4) + pl*n
+    fl(5)   = (sol_l(5) + pl)*vn_l
+
+    fr(1)   = vn_r*sol_r(1)
+    fr(2:4) = vn_r*sol_r(2:4) + pr*n
+    fr(5)   = (sol_r(5) + pr)*vn_r
+
+    lambda_l = max(al*rhol, sqrt(rhol*max(0.0_DOUBLE, pr - pl)), -rhol*(vn_r - vn_l))
+    lambda_r = max(ar*rhor, sqrt(rhor*max(0.0_DOUBLE, pl - pr)), -rhor*(vn_r - vn_l))
+    v_bar = (lambda_l*vn_l + lambda_r*vn_r - (pr - pl))/(lambda_r + lambda_l)
+    v_et = v_bar
+
+    rhol_et = 1.0_DOUBLE/(1.0_DOUBLE/rhol + (v_et - vn_l)/lambda_l)
+    pl_bar = pl - lambda_l*(v_et - vn_l)
+
+    sol_l_et(1)   = rhol_et
+    sol_l_et(2:4) = rhol_et*(sol_w_l(2:4) + (v_et - vn_l)*n)
+    sol_l_et(5)   = rhol_et*(el + (pl*vn_l - pl_bar*v_et)/lambda_l)
+
+    rhor_et = 1.0_DOUBLE/(1.0_DOUBLE/rhor + (vn_r - v_et)/lambda_r)
+    pr_bar = pr + lambda_r*(v_et - vn_r)
+
+    sol_r_et(1)   = rhor_et
+    sol_r_et(2:4) = rhor_et*(sol_w_r(2:4) + (v_et - vn_r)*n)
+    sol_r_et(5)   = rhor_et*(er + (pr_bar*v_et - pr*vn_r)/lambda_r)
+
+    sl = vn_l - lambda_l/rhol
+    sr = vn_r + lambda_r/rhor
+
+    lr_flux(:, 1) = 0.5_DOUBLE*(fl + fr) - 0.5_DOUBLE* &
+      (abs(sl)*(sol_l_et - sol_l) + &
+      abs(v_et)*(sol_r_et - sol_l_et) + &
+      abs(sr)*(sol_r - sol_r_et))
+
+    lr_flux(:, 2) = -lr_flux(:, 1)
+end subroutine three_wave
 
   ! Sound speed from primitive state
   pure function cs(w) result(c)
@@ -1271,11 +1354,18 @@ contains
 
     do i=1,mesh%n_sub_faces
       coord = compute_subface_vert(mesh, i)
-      call quad_face_rule(coord, 2, pts, wts)
-      do j=1, 4
-        qpw(1:3,j,i)=pts(:,j)
-        qpw(4,j,i)=wts(j)
-      end do
+      if (order>=3) then
+        call quad_face_rule(coord, 2, pts, wts)
+        do j=1, 4
+          qpw(1:3,j,i)=pts(:,j)
+          qpw(4,j,i)=wts(j)
+        end do
+      else
+        do j=1, 4
+          qpw(1:3,j,i)=coord(1:3,1)
+          qpw(4,j,i)=mesh%sub_face(i)%area/4.0_DOUBLE
+        end do
+      end if
     end do
   end subroutine compute_sub_face_qpw
 end module silvia_base_module
