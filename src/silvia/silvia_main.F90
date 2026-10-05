@@ -22,10 +22,10 @@ program main
     integer(kind=ENTIER) :: iter, iter_write_sol
     integer(kind=ENTIER) :: n_elems_loc, n_elems_ghost, n_elems_tot
     
-    real(kind=DOUBLE) :: area, h_err
+    real(kind=DOUBLE) :: area, volume_err, diam
     real(kind=DOUBLE), dimension(3) :: n
     real(kind=DOUBLE), dimension(:,:), allocatable :: sol, sol_w, sol1, sol2
-    real(kind=DOUBLE), dimension(5) :: l2err
+    real(kind=DOUBLE), dimension(5) :: err
     real(kind=DOUBLE), dimension(:,:), allocatable :: rhs
     real(kind=DOUBLE), allocatable :: sum_lambda(:)
 
@@ -156,11 +156,15 @@ program main
           call write_vtu(mesh, sol, me, iter_write_sol)
           if (me==0) print*, 'output save at iter=', iter, ' dt=', dt, ' time=', t
           if (compute_error) then
-            call compute_error_test(mesh, sol, t, 1.0_DOUBLE, h_err, l2err)
-            call MPI_ALLREDUCE(MPI_IN_PLACE, h_err, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
-            call MPI_ALLREDUCE(MPI_IN_PLACE, l2err, 5, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
-            l2err = sqrt(l2err)
-            if (me == 0) print *, "t=", t, "h=", h_err, "L2(rho)=", l2err
+            volume_err = 0.0_DOUBLE
+            diam = 1.0e5
+            err = 0.0_DOUBLE
+            call compute_error_test(mesh, sol, t, 1.0_DOUBLE, volume_err, diam, err)
+            call MPI_ALLREDUCE(MPI_IN_PLACE, volume_err, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+            call MPI_ALLREDUCE(MPI_IN_PLACE, diam, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
+            call MPI_ALLREDUCE(MPI_IN_PLACE, err, 5, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+            if (me == 0) print *, "t=", t, "h=", diam, "volume=", volume_err
+            if (me == 0) print *, "err(rho,u,v,w,p)=", err
           end if
           iter_write_sol = iter_write_sol + 1
         end if
@@ -173,11 +177,15 @@ program main
     call write_vtu(mesh, sol, me, -1)
     if (me==0) print*, 'output save at iter=', iter, ' dt=', dt, ' time=', t
     if (compute_error) then
-      call compute_error_test(mesh, sol, t, 1.0_DOUBLE, h_err, l2err)
-      call MPI_ALLREDUCE(MPI_IN_PLACE, h_err, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
-      call MPI_ALLREDUCE(MPI_IN_PLACE, l2err, 5, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
-      ! l2err = sqrt(l2err)
-      if (me == 0) print *, "L1(rho,u,v,w,p)=", l2err
+      volume_err = 0.0_DOUBLE
+      diam = 1.0e5
+      err = 0.0_DOUBLE
+      call compute_error_test(mesh, sol, t, 1.0_DOUBLE, volume_err, diam, err)
+      call MPI_ALLREDUCE(MPI_IN_PLACE, volume_err, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE, diam, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE, err, 5, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+      if (me == 0) print *, "t=", t, "h=", diam, "volume=", volume_err
+      if (me == 0) print *, "err(rho,u,v,w,p)=", err
     end if
 
     call MPI_FINALIZE(mpi_ierr)
