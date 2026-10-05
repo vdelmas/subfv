@@ -85,6 +85,20 @@ module lagrange_module
   real(kind=DOUBLE), public :: vp_ep_wip_clip = 0.0_DOUBLE
 
 
+  ! --- limiteur convexe du schema 'vp_pp_pvp' ---------------------------------
+  ! Melange par noeud entre le flux nodal (pp, pvp) et le flux 'classic'
+  ! (Pi_l, Pi_r, Pi (u_p.n)), dont la production d'entropie vaut somme A lam d^2
+  ! et est donc positive par construction :
+  !   flux = theta * flux_nodal + (1 - theta) * flux_classic
+  ! theta = 1 redonne vp_pp_pvp, theta = 0 redonne classic.
+  logical, public :: pvp_limit = .false.
+  ! Plancher relatif sur l'energie interne predite : une maille est declaree
+  ! inadmissible si e_new < eps * e_old.
+  real(kind=DOUBLE), public :: pvp_eps = 1.0e-3_DOUBLE
+  integer(kind=ENTIER), public :: pvp_lim_iter = 8
+  real(kind=DOUBLE), public :: pvp_theta_min = 1.0_DOUBLE
+  integer(kind=ENTIER), public :: pvp_n_limited = 0
+
   ! Sedov (init=1) : ou deposer l'energie.
   ! .false. (defaut) = comportement historique, tout dans l'UNIQUE cellule dont le
   !   centroide est le plus proche de l'origine.
@@ -3265,7 +3279,7 @@ contains
     linferr = errinf
   end subroutine compute_error_taylor_green
 
-  subroutine solve_all_nodal_systems(nsfn, sol_lr, gammas, norms, areas, vp, pp, pvp)
+  subroutine solve_vp_pp_pvp_systems(nsfn, sol_lr, gammas, norms, areas, vp, pp, pvp)
     implicit none
 
     integer(kind=ENTIER), intent(in) :: nsfn
@@ -3339,13 +3353,97 @@ contains
     vp = matmul(mat_vp, rhs_vp)
     call pseudo_inverse_inplace_lapack(3, mat_pvp)
     pvp = matmul(mat_pvp, rhs_pvp)
-  end subroutine solve_all_nodal_systems
+  end subroutine solve_vp_pp_pvp_systems
 
-  subroutine compute_rhs_lagrange_all_nodal(mesh, sol, vp, rhs, &
+  subroutine assemble_vp_pp_pvp_rhs(mesh, sol, vp, rhs, n_bc, bc_type, bc_val, &
+      b2d, mass, gamma_arr, pp_node, pvp_node, theta)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(in) :: vp
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(out) :: rhs
+    real(kind=DOUBLE), dimension(mesh%n_elems), intent(in) :: mass, gamma_arr
+    real(kind=DOUBLE), dimension(mesh%n_vert), intent(in) :: pp_node, theta
+    real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(in) :: pvp_node
+    integer(kind=ENTIER), intent(in) :: n_bc
+    character(len=255), dimension(n_bc) :: bc_type
+    real(kind=DOUBLE), dimension(5, n_bc) :: bc_val
+    logical, intent(in) :: b2d
+
+    integer(kind=ENTIER) :: i, j, id_sub_face, id_face, idl, idr, var
+    real(kind=DOUBLE), dimension(5) :: flux_l, flux_r, solr
+    real(kind=DOUBLE), dimension(3) :: nrm
+    real(kind=DOUBLE) :: taul, taur, pl, pr, vl, vr, gl, gr, lam_l, lam_r
+    real(kind=DOUBLE) :: vn, pi_l, pi_r, th, v_target, area
+
+    rhs = 0.0_DOUBLE
+    do i = 1, mesh%n_vert
+      th = theta(i)
+      do j = 1, mesh%vert(i)%n_sub_faces_neigh
+        id_sub_face = mesh%vert(i)%sub_face_neigh(j)
+        id_face = mesh%sub_face(id_sub_face)%mesh_face
+        nrm = mesh%face(id_face)%norm
+        if (b2d .and. abs(nrm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE) cycle
+        idl = mesh%face(id_face)%left_neigh
+        idr = mesh%face(id_face)%right_neigh
+        area = mesh%sub_face(id_sub_face)%area
+        vn = dot_product(vp(:, i), nrm)
+
+        gl = gamma_arr(idl)
+        taul = sol(1, idl)
+        pl = pressure(sol(:, idl), gl)
+        vl = dot_product(sol(2:4, idl), nrm)
+        if (idr > 0) then
+          solr = sol(:, idr)
+          gr = gamma_arr(idr)
+        else
+          v_target = 0.0_DOUBLE
+          if (idr < 0) then
+            if (-idr <= n_bc) then
+              if (trim(bc_type(-idr)) == 'piston') &
+                v_target = dot_product(bc_val(2:4, -idr), nrm)
+            end if
+          end if
+          solr = mirror_state(sol(:, idl), nrm, v_target)
+          gr = gl
+        end if
+        taur = solr(1)
+        pr = pressure(solr, gr)
+        vr = dot_product(solr(2:4), nrm)
+
+        lam_l = max(sqrt(max(0.0_DOUBLE, gl*pl*taul))/taul, &
+          sqrt(max(0.0_DOUBLE, pr-pl)/taul), -(vr-vl)/taul)
+        lam_r = max(sqrt(max(0.0_DOUBLE, gr*pr*taur))/taur, &
+          sqrt(max(0.0_DOUBLE, pl-pr)/taur), -(vr-vl)/taur)
+        pi_l = pl - lam_l*(vn - vl)
+        pi_r = pr + lam_r*(vn - vr)
+
+        flux_l(1)   = -vn
+        flux_l(2:4) = (th*pp_node(i) + (1.0_DOUBLE-th)*pi_l)*nrm
+        flux_l(5)   = th*dot_product(pvp_node(:, i), nrm) + (1.0_DOUBLE-th)*pi_l*vn
+        flux_r(1)   = -vn
+        flux_r(2:4) = (th*pp_node(i) + (1.0_DOUBLE-th)*pi_r)*nrm
+        flux_r(5)   = th*dot_product(pvp_node(:, i), nrm) + (1.0_DOUBLE-th)*pi_r*vn
+
+        do var = 1, 5
+          rhs(var, idl) = rhs(var, idl) - area/mass(idl)*flux_l(var)
+        end do
+        if (idr > 0) then
+          do var = 1, 5
+            rhs(var, idr) = rhs(var, idr) + area/mass(idr)*flux_r(var)
+          end do
+        end if
+      end do
+    end do
+  end subroutine assemble_vp_pp_pvp_rhs
+
+  subroutine compute_rhs_lagrange_vp_pp_pvp(mesh, sol, vp, dt, rhs, &
       n_bc, bc_type, bc_val, b2d, mass, gamma_arr, vp_is_imposed)
     implicit none
 
     type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), intent(in) :: dt
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
     real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(inout) :: vp
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(inout) :: rhs
@@ -3357,20 +3455,26 @@ contains
     real(kind=DOUBLE), dimension(5, n_bc) :: bc_val
     logical, intent(in) :: b2d
 
-    integer(kind=ENTIER) :: i, j, k, nsfn, id_sub_face, id_face, idl, idr, var
+    integer(kind=ENTIER) :: i, j, k, it, nsfn, id_sub_face, id_face, idl, idr
+    integer(kind=ENTIER) :: n_bad
     real(kind=DOUBLE), dimension(:, :, :), allocatable :: sol_lr
     real(kind=DOUBLE), dimension(:, :), allocatable :: norms, gammas
     real(kind=DOUBLE), dimension(:), allocatable :: areas
-    real(kind=DOUBLE), dimension(5) :: flux
-    real(kind=DOUBLE), dimension(3) :: vp_loc, pvp
-    real(kind=DOUBLE) :: pp, v_target, area
+    real(kind=DOUBLE), dimension(:), allocatable :: pp_node, theta
+    real(kind=DOUBLE), dimension(:, :), allocatable :: pvp_node
+    logical, dimension(:), allocatable :: bad
+    real(kind=DOUBLE), dimension(3) :: vp_loc, pvp_loc, u_new
+    real(kind=DOUBLE) :: pp_loc, v_target, e_old, e_new
 
-    rhs = 0.0_DOUBLE
+    allocate(pp_node(mesh%n_vert), pvp_node(3, mesh%n_vert), theta(mesh%n_vert))
+    allocate(bad(mesh%n_elems))
+    pp_node = 0.0_DOUBLE
+    pvp_node = 0.0_DOUBLE
+    theta = 1.0_DOUBLE
 
     do i = 1, mesh%n_vert
       nsfn = mesh%vert(i)%n_sub_faces_neigh
       if (nsfn <= 0) cycle
-
       allocate(sol_lr(5, 2, nsfn), norms(3, nsfn), areas(nsfn), gammas(2, nsfn))
       k = 0
       do j = 1, nsfn
@@ -3399,37 +3503,71 @@ contains
           gammas(2, k) = gamma_arr(idl)
         end if
       end do
-
       if (k > 0) then
         vp_loc = vp(:, i)
-        call solve_all_nodal_systems(k, sol_lr(:, :, 1:k), gammas(:, 1:k), &
-          norms(:, 1:k), areas(1:k), vp_loc, pp, pvp)
+        call solve_vp_pp_pvp_systems(k, sol_lr(:, :, 1:k), gammas(:, 1:k), &
+          norms(:, 1:k), areas(1:k), vp_loc, pp_loc, pvp_loc)
         if (.not. vp_is_imposed(i)) vp(:, i) = vp_loc
-
-        do j = 1, nsfn
-          id_sub_face = mesh%vert(i)%sub_face_neigh(j)
-          id_face = mesh%sub_face(id_sub_face)%mesh_face
-          if (b2d .and. abs(mesh%face(id_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE) cycle
-          idl = mesh%face(id_face)%left_neigh
-          idr = mesh%face(id_face)%right_neigh
-          area = mesh%sub_face(id_sub_face)%area
-
-          flux(1) = -dot_product(vp(:, i), mesh%face(id_face)%norm)
-          flux(2:4) = pp*mesh%face(id_face)%norm
-          flux(5) = dot_product(pvp, mesh%face(id_face)%norm)
-
-          do var = 1, 5
-            rhs(var, idl) = rhs(var, idl) - area/mass(idl)*flux(var)
-          end do
-          if (idr > 0) then
-            do var = 1, 5
-              rhs(var, idr) = rhs(var, idr) + area/mass(idr)*flux(var)
-            end do
-          end if
-        end do
+        pp_node(i) = pp_loc
+        pvp_node(:, i) = pvp_loc
       end if
-
       deallocate(sol_lr, norms, areas, gammas)
     end do
-  end subroutine compute_rhs_lagrange_all_nodal
+
+    call assemble_vp_pp_pvp_rhs(mesh, sol, vp, rhs, n_bc, bc_type, bc_val, &
+      b2d, mass, gamma_arr, pp_node, pvp_node, theta)
+
+    if (pvp_limit) then
+      ! theta est attache au NOEUD, jamais a la sous-face : la conservation de la
+      ! part 'classic' du melange repose sur l'equilibre nodal
+      !   somme_f A (Pi_r - Pi_l) n = 0,
+      ! qui est l'equation meme definissant vp. Avec un theta par sous-face la
+      ! somme devient somme_f A (1-theta_f)(Pi_r - Pi_l) n et ne s'annule plus.
+      ! Avec un theta par noeud il sort de la somme et la conservation est exacte.
+      do it = 1, pvp_lim_iter
+        bad = .false.
+        n_bad = 0
+        do i = 1, mesh%n_elems
+          if (mesh%elem(i)%is_ghost) cycle
+          e_old = sol(5, i) - 0.5_DOUBLE*dot_product(sol(2:4, i), sol(2:4, i))
+          u_new = sol(2:4, i) + dt*rhs(2:4, i)
+          e_new = (sol(5, i) + dt*rhs(5, i)) - 0.5_DOUBLE*dot_product(u_new, u_new)
+          if (e_new /= e_new .or. e_new < pvp_eps*max(e_old, 0.0_DOUBLE)) then
+            bad(i) = .true.
+            n_bad = n_bad + 1
+          end if
+        end do
+        ! n_bad reste LOCAL : theta n'est pas echange entre rangs, donc un noeud
+        ! partage peut recevoir deux theta differents et la conservation tombe a
+        ! l'interface MPI. Le limiteur n'est valide qu'en sequentiel pour l'instant.
+        if (n_bad == 0) exit
+        do i = 1, mesh%n_vert
+          do j = 1, mesh%vert(i)%n_sub_faces_neigh
+            id_sub_face = mesh%vert(i)%sub_face_neigh(j)
+            id_face = mesh%sub_face(id_sub_face)%mesh_face
+            idl = mesh%face(id_face)%left_neigh
+            idr = mesh%face(id_face)%right_neigh
+            if (idl > 0) then
+              if (bad(idl)) theta(i) = 0.0_DOUBLE
+            end if
+            if (idr > 0) then
+              if (bad(idr)) theta(i) = 0.0_DOUBLE
+            end if
+          end do
+        end do
+        if (it < pvp_lim_iter) then
+          do i = 1, mesh%n_vert
+            if (theta(i) == 0.0_DOUBLE) cycle
+            theta(i) = 0.5_DOUBLE*theta(i)
+          end do
+        end if
+        call assemble_vp_pp_pvp_rhs(mesh, sol, vp, rhs, n_bc, bc_type, bc_val, &
+          b2d, mass, gamma_arr, pp_node, pvp_node, theta)
+      end do
+      pvp_theta_min = minval(theta)
+      pvp_n_limited = count(theta < 1.0_DOUBLE)
+    end if
+
+    deallocate(pp_node, pvp_node, theta, bad)
+  end subroutine compute_rhs_lagrange_vp_pp_pvp
 end module lagrange_module

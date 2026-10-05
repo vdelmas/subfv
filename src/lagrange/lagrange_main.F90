@@ -67,7 +67,9 @@ program main
     t_max, cfl, &
     init, &
     grad_bound_skip, &
-    lambda_acoustic_only, ppvp_jump_mode, ppvp_nodal_average, diag_entropy, vp_ep_wip_mode, vp_ep_wip_floor, vp_ep_wip_clip, &
+    lambda_acoustic_only, diag_entropy, &
+    vp_ep_wip_mode, vp_ep_wip_floor, vp_ep_wip_clip, &
+    pvp_eps, pvp_lim_iter, &
     sedov_nodal_deposit, sedov_energy, &
     scheme, method_length, b2d_h, &
     n_bc, bc_name, bc_type, bc_val, &
@@ -90,6 +92,9 @@ program main
   ! keeps the two variants distinguishable in a campaign's inputs and logs.
   if (scheme == "classic_rhoa") lambda_acoustic_only = .true.
   if (scheme == "vp_ep_wip") vp_ep_wip = .true.
+  ! Le limiteur convexe (pvp_limit) existe dans lagrange_module mais n'est PAS
+  ! atteignable par un nom de schema : il n'a pas ete valide sur la campagne
+  ! complete. Pour l'activer il faut reintroduire ici un nom dedie.
   if (me == 0) then
     if (lambda_acoustic_only) then
       print*, "lambda = rho*a (EUCCLHYD original)"
@@ -252,22 +257,22 @@ program main
       call compute_rhs_lagrange_sidil(mesh, sol, vp, &
         dt, rhs, n_bc, bc_type, bc_val, boundary_2d, mass, method_length, h_extrude, &
         gamma_arr, vp_is_imposed, h_p_arr)
-    else if( scheme == "all_nodal" ) then
-      call compute_rhs_lagrange_all_nodal(mesh, sol, vp, &
-        rhs, n_bc, bc_type, bc_val, boundary_2d, mass, gamma_arr, vp_is_imposed)
+    else if( scheme == "vp_pp_pvp" ) then
+      call compute_rhs_lagrange_vp_pp_pvp(mesh, sol, vp, &
+        dt, rhs, n_bc, bc_type, bc_val, boundary_2d, mass, gamma_arr, vp_is_imposed)
     else if( scheme == "vp_ep" .or. scheme == "vp_ep_wip" ) then
       ! vitesse nodale + energie nodale, puis solveur 1D par sous-face.
       call compute_rhs_lagrange_vp_ep(mesh, sol, vp, &
         dt, rhs, n_bc, bc_type, bc_val, boundary_2d, mass, gamma_arr, vp_is_imposed, &
         second_order, grad_v, grad_p, div_v)
-    else if( scheme == "vp_pp" .or. scheme == "nodal_vp" .or. scheme == "vp_pp_ppvp" ) then
+    else if( scheme == "vp_pp" .or. scheme == "nodal_vp" ) then
       ! vitesse nodale ET pression nodale, toutes deux issues de systemes nodaux :
       ! pas de h_p, donc aucune dependance a method_length / b2d_h.
       ! "nodal_vp" est l'ancien nom du schema, conserve en alias : beaucoup de
       ! input_data.f de runs deja effectues le portent encore.
       call compute_rhs_lagrange_vp_pp(mesh, sol, vp, &
         dt, rhs, n_bc, bc_type, bc_val, boundary_2d, mass, gamma_arr, vp_is_imposed, &
-        second_order, grad_v, grad_p, div_v, scheme == "vp_pp_ppvp")
+        second_order, grad_v, grad_p, div_v, .false.)
     else
       print*, "No scheme !"
       error stop
