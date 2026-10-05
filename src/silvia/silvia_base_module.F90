@@ -1361,9 +1361,10 @@ end subroutine three_wave
           qpw(4,j,i)=wts(j)
         end do
       else
+        ! We will use only the first point
         do j=1, 4
           qpw(1:3,j,i)=coord(1:3,1)
-          qpw(4,j,i)=mesh%sub_face(i)%area/4.0_DOUBLE
+          qpw(4,j,i)=mesh%sub_face(i)%area
         end do
       end if
     end do
