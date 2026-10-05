@@ -15,7 +15,8 @@ contains
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
     real(kind=DOUBLE), intent(in) :: t
 		real(kind=DOUBLE), intent(in) :: mach
-		real(kind=DOUBLE), intent(inout) :: h_err, l2_err
+		real(kind=DOUBLE), intent(inout) :: h_err
+    real(kind=DOUBLE), dimension(5), intent(inout) :: l2_err
 
 		if (init_uniform) then
       ! still nothign to do
@@ -33,7 +34,8 @@ contains
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
     real(kind=DOUBLE), intent(in) :: t
-		real(kind=DOUBLE), intent(inout) :: error, volume
+    real(kind=DOUBLE), dimension(5), intent(inout) :: error
+		real(kind=DOUBLE), intent(inout) :: volume
     
     integer(kind=ENTIER) :: i
     real(kind=DOUBLE), dimension(5) :: wexact, wsol
@@ -43,12 +45,13 @@ contains
     do i = 1, mesh%n_elems
       if (mesh%elem(i)%is_ghost) then
         cycle
-      else if (abs(mesh%elem(i)%coord(1)) < 3.0_DOUBLE &
-        .and. abs(mesh%elem(i)%coord(2)) < 3.0_DOUBLE &
-        .and. abs(mesh%elem(i)%coord(3)) < 3.0_DOUBLE) then
+      else 
+        ! if (abs(mesh%elem(i)%coord(1)) < 3.0_DOUBLE &
+        ! .and. abs(mesh%elem(i)%coord(2)) < 3.0_DOUBLE &
+        ! .and. abs(mesh%elem(i)%coord(3)) < 3.0_DOUBLE) then
         call sol_isentropic_vortex(mesh%elem(i)%coord, wexact, t)
         wsol = conserv_to_primit(sol(:, i))
-        error = error + mesh%elem(i)%volume*(wsol(1) - wexact(1))**2
+        error = error + mesh%elem(i)%volume*abs(wsol - wexact)
         volume = volume + mesh%elem(i)%volume
       end if
     end do
@@ -64,7 +67,8 @@ contains
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
 		real(kind=DOUBLE), intent(in) :: mach
-		real(kind=DOUBLE), intent(inout) :: error, volume
+		real(kind=DOUBLE), dimension(5), intent(inout) :: error
+    real(kind=DOUBLE), intent(inout) :: volume
 
     integer(kind=ENTIER) :: i
     real(kind=DOUBLE), dimension(5) :: wexact, wsol
@@ -80,7 +84,7 @@ contains
       else
         call sol_gresho_mach_C2(mesh%elem(i)%coord, wexact, mach)
         wsol = conserv_to_primit(sol(:, i))
-        error = error + mesh%elem(i)%volume*(wsol(1) - wexact(1))**2
+        error = error + mesh%elem(i)%volume*abs((wsol - wexact)**1)
         volume = volume + mesh%elem(i)%volume
       end if
     end do

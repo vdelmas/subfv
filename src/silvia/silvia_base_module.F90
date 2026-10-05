@@ -387,7 +387,7 @@ contains
     end if
   end subroutine sol_gresho_mach
 
-    pure subroutine sol_gresho_mach_C2(x, w, mach)
+  pure subroutine sol_gresho_mach_C2(x, w, mach)
     implicit none
 
     real(kind=DOUBLE), dimension(3), intent(in) :: x
