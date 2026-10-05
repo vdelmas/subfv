@@ -651,7 +651,7 @@ contains
               sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*qpw(4,1,id_sub_face)
             end if
             ! Other possible quadrature points to be treated with 2P flux
-            if (order>=3) then
+            if (order>=2) then
               do k = 2,4
                 wL = reconstruct(prim, grad, hess, il, qpw(1:3,k,id_sub_face), mesh%elem(il)%coord)
                 if (ir > 0) then
@@ -687,7 +687,7 @@ contains
               rhs(:, ir)     = rhs(:, ir)     - qpw(4,1,id_sub_face)*lr_flux(:, 2)
               sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*qpw(4,1,id_sub_face)
             end if
-            if (order>=3) then
+            if (order>=2) then
               do k = 2,4
                 wL = reconstruct(prim, grad, hess, il, qpw(1:3,k,id_sub_face), mesh%elem(il)%coord)
                 if (ir > 0) then
@@ -723,7 +723,7 @@ contains
               rhs(:, ir)     = rhs(:, ir)     - qpw(4,1,id_sub_face)*lr_flux(:, 2)
               sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*qpw(4,1,id_sub_face)
             end if
-            if (order>=3) then
+            if (order>=2) then
               do k = 2,4
                 wL = reconstruct(prim, grad, hess, il, qpw(1:3,k,id_sub_face), mesh%elem(il)%coord)
                 if (ir > 0) then
@@ -1348,23 +1348,29 @@ end subroutine three_wave
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(4,4,mesh%n_sub_faces), intent(inout) :: qpw
     integer(kind=ENTIER) :: i, j
-    real(kind=DOUBLE), dimension(3, 4) :: coord
+    real(kind=DOUBLE), dimension(3,4) :: coord
     real(kind=DOUBLE), dimension(3,4) :: pts
-    real(kind=DOUBLE), dimension(4) :: wts
+    real(kind=DOUBLE), dimension(4) :: wts, center
 
     do i=1,mesh%n_sub_faces
       coord = compute_subface_vert(mesh, i)
-      if (order>=3) then
+      if (order>=2) then
         call quad_face_rule(coord, 2, pts, wts)
         do j=1, 4
           qpw(1:3,j,i)=pts(:,j)
           qpw(4,j,i)=wts(j)
         end do
       else
-        ! We will use only the first point
+        ! We will use only one point
+        center = 0.0_DOUBLE
         do j=1, 4
-          qpw(1:3,j,i)=coord(1:3,1)
-          qpw(4,j,i)=mesh%sub_face(i)%area
+          ! center(1:3)=center(1:3)+0.25_DOUBLE*coord(1:3,j)
+          center(1:3)=coord(1:3,1)
+        end do
+        center(4)=mesh%sub_face(i)%area
+        do j=1,4
+          qpw(1:3,j,i)=center(1:3)
+          qpw(4,j,i)=center(4)
         end do
       end if
     end do
