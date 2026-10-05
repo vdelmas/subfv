@@ -82,7 +82,7 @@ contains
       !   .and. abs(mesh%elem(i)%coord(2)) < 0.35_DOUBLE &
       !   .and. abs(mesh%elem(i)%coord(3)) < 0.35_DOUBLE) then
       else
-        call sol_gresho_mach_C2(mesh%elem(i)%coord, wexact, mach)
+        call sol_gresho_mach(mesh%elem(i)%coord, wexact, mach)
         wsol = conserv_to_primit(sol(:, i))
         error = error + mesh%elem(i)%volume*abs((wsol - wexact)**1)
         volume = volume + mesh%elem(i)%volume

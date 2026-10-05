@@ -492,7 +492,7 @@ contains
       end do
     else if (init_gresho) then
       do i = 1, mesh%n_elems
-        call sol_gresho_mach_C2(mesh%elem(i)%coord, w, 1.0_DOUBLE)
+        call sol_gresho_mach(mesh%elem(i)%coord, w, 1.0_DOUBLE)
         sol(:, i) = primit_to_conserv(w)
       end do
     end if
