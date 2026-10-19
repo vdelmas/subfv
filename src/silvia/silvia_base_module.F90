@@ -338,11 +338,6 @@ contains
       print *, "ERROR: subface_quadrature must be 'simpson' or 'gauss': '", trim(t), "'"
       error stop
     end if
-    if (order >= 2 .and. scheme_id == SCHEME_MULTI_POINT .and. &
-        subface_quadrature_id /= SUBFACE_QUAD_SIMPSON) then
-      print *, "ERROR: multi_point requires Simpson quadrature so point 1 remains the subface vertex"
-      error stop
-    end if
   end subroutine init_flags
 
   pure function primit_to_conserv(w) result(u)
@@ -664,7 +659,8 @@ contains
         norm = mesh%sub_face(id_sub_face)%norm
         area = mesh%sub_face(id_sub_face)%area
 
-        ! First quadrature point corresponding to MP scheme, attached to vertex
+        ! The first quadrature point uses MP flux. With Simpson it is the
+        ! subface vertex; with Gauss it is the first Gauss point.
         select case (scheme_id)
           case (1)
             ! Same as ns: zero normal nodal velocity on wall sub-faces
