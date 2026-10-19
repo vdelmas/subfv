@@ -96,8 +96,6 @@ program main
     
     do while (t<tmax .AND. iter<n_max_iter)
     ! do while (t<tmax)  
-      if (t + dt > tmax) dt = tmax - t
-
       call mpi_barrier(mpi_comm_world, mpi_ierr)
 
       ! SSP-RK3 stage 1: u1 = u0 + dt * L(u0). A time-dependent BC uses the
@@ -107,6 +105,7 @@ program main
       call compute_rhs(mesh, qpw, sol, sol_w, grad, hess, rhs, sum_lambda, t, num_procs, mpi_send_recv)
       call compute_dt(mesh, sum_lambda, dt)
       call MPI_ALLREDUCE(MPI_IN_PLACE, dt, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
+      if (t + dt > tmax) dt = tmax - t
 
       select case (order)
         case (1)

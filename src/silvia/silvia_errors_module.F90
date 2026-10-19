@@ -40,7 +40,7 @@ contains
 		real(kind=DOUBLE), intent(inout) :: volume, diam
     
     integer(kind=ENTIER) :: i,q
-    real(kind=DOUBLE), dimension(5) :: wexact, wsol, wq
+    real(kind=DOUBLE), dimension(5) :: wexact, wsol, wq, uexact_avg
 
     error = 0.0_DOUBLE
     volume = 0.0_DOUBLE
@@ -53,12 +53,16 @@ contains
           if (order<=2) then
             call sol_isentropic_vortex(mesh%elem(i)%coord, wexact, t)
           else
-            wexact= 0.0_DOUBLE
+            ! sol stores conservative cell averages at order 3. Average the
+            ! exact conservative state first, then convert that average to
+            ! primitive variables for a like-for-like comparison.
+            uexact_avg = 0.0_DOUBLE
             do q = 1, size(qpw,DIM=2)
               call sol_isentropic_vortex(qpw(1:3,q,i), wq, t)
-              wexact = wexact + qpw(4,q,i) * wq
+              uexact_avg = uexact_avg + qpw(4,q,i) * primit_to_conserv(wq)
             end do
-            wexact = wexact / mesh%elem(i)%volume
+            uexact_avg = uexact_avg / mesh%elem(i)%volume
+            wexact = conserv_to_primit(uexact_avg)
           end if
           wsol = conserv_to_primit(sol(:, i))
           error = error + mesh%elem(i)%volume*abs(wsol - wexact)

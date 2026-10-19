@@ -561,16 +561,19 @@ contains
     type(mpi_send_recv_type), intent(inout) :: mpi_send_recv
 
     integer(kind=ENTIER) :: i
+    real(kind=DOUBLE), dimension(5, mesh%n_elems) :: reconstruction_data
 
     grad = 0.0_DOUBLE
     hess = 0.0_DOUBLE
-    if (order >= 2) call aho_reconstruction(mesh, prim, grad, hess, num_procs, mpi_send_recv)
+    reconstruction_data = prim
+    if (order >= 3) reconstruction_data = sol
+    if (order >= 2) call aho_reconstruction(mesh, reconstruction_data, grad, hess, num_procs, mpi_send_recv)
 
     !BJ
 
     rhs        = 0.0_DOUBLE
     sum_lambda = 0.0_DOUBLE
-    call subface_flux_loop(mesh, qpw, sol, prim, grad, hess, rhs, sum_lambda, t)
+    call subface_flux_loop(mesh, qpw, sol, reconstruction_data, grad, hess, rhs, sum_lambda, t)
 
     do i = 1, mesh%n_elems
       rhs(:, i) = rhs(:, i) / mesh%elem(i)%volume
@@ -1178,11 +1181,12 @@ end subroutine three_wave
     end do
   end subroutine count_elems
 
-  ! Polynomial reconstruction of primitive variable w at point xq from cell i.
-  ! Hierarchical fallback: if an order-p reconstruction gives unphysical
-  ! rho or p, it is replaced by the order-(p-1) result.
+  ! Polynomial reconstruction at point xq from cell i.
+  ! At order 3 the polynomial is in conservative variables, whose cell
+  ! average is the finite-volume unknown. It is converted to primitives only
+  ! after evaluating the polynomial at the requested point.
   function reconstruct(prim, grad, hess, i, xq, xc) result(w)
-    real(kind=DOUBLE), dimension(:, :),          intent(in) :: prim    ! (5, n_elems)
+    real(kind=DOUBLE), dimension(:, :),          intent(in) :: prim    ! primitive for order 2; conservative for order 3
     real(kind=DOUBLE), dimension(:, :, :),       intent(in) :: grad    ! (5, 3, n_elems)
     real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(in) :: hess
     integer(kind=ENTIER), intent(in) :: i
@@ -1191,13 +1195,24 @@ end subroutine three_wave
 
     real(kind=DOUBLE), dimension(3) :: dx
     real(kind=DOUBLE), dimension(5) :: w_try
+    real(kind=DOUBLE), dimension(5) :: var_try
     integer(kind=ENTIER) :: j, k
 
     dx = xq - xc
-    w  = prim(:, i)
+    if (order >= 3) then
+      w = conserv_to_primit(prim(:, i))
+    else
+      w = prim(:, i)
+    end if
 
     if (order >= 2) then
-      w_try = w + matmul(grad(:, :, i), dx)
+      if (order >= 3) then
+        var_try = prim(:, i) + matmul(grad(:, :, i), dx)
+        w_try = 0.0_DOUBLE
+        if (var_try(1) > 1.0e-12_DOUBLE) w_try = conserv_to_primit(var_try)
+      else
+        w_try = w + matmul(grad(:, :, i), dx)
+      end if
       if (physical_state(w_try, w)) w = w_try
     end if
 
@@ -1209,18 +1224,18 @@ end subroutine three_wave
           'compute_cell_moments(mesh) once, right after compute_geometry_mesh.'
         error stop 1
       end if
-      ! Always build from scratch: cell value + gradient + Hessian, MINUS
-      ! the cell's own curvature-average bias (see compute_cell_moments)
-      ! so that this polynomial's cell average is prim(:,i), not its
-      ! value at xc plus a spurious O(h^2) offset.
-      w_try = prim(:, i) + matmul(grad(:, :, i), dx)
+      ! Build from the cell average, subtracting the geometric curvature
+      ! moment so the polynomial average remains the finite-volume state.
+      var_try = prim(:, i) + matmul(grad(:, :, i), dx)
       do j = 1, 3
         do k = 1, 3
-          w_try = w_try + 0.5_DOUBLE * hess(:, j, k, i) &
+          var_try = var_try + 0.5_DOUBLE * hess(:, j, k, i) &
             * (dx(j) * dx(k) - cell_moment(j, k, i))
         end do
       end do
-      if (physical_state(w_try, prim(:, i))) w = w_try
+      w_try = 0.0_DOUBLE
+      if (var_try(1) > 1.0e-12_DOUBLE) w_try = conserv_to_primit(var_try)
+      if (physical_state(w_try, conserv_to_primit(prim(:, i)))) w = w_try
     end if
 
     ! Enforce positivity (safety net)
@@ -1289,8 +1304,9 @@ end subroutine three_wave
     end do
   end subroutine compute_cell_moments
 
-  ! Gradient (and Hessian at order >= 3) of the 5 primitives from
-  ! arbitrary_high_order_module, same settings as euler_ho's
+  ! Gradient (and Hessian at order >= 3) of the reconstructed variables from
+  ! arbitrary_high_order_module. At order 3 these are conservative variables;
+  ! at order 2 they are primitive variables.
   ! aho_reconstruction: Green-Gauss nodal derivatives blended to the cells.
   ! grad is exchanged across MPI ranks before being differentiated again,
   ! since a ghost cell's vertex stencil can be incomplete.
