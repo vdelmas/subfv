@@ -82,6 +82,9 @@ module silvia_base_module
   integer, parameter :: SCHEME_USI3D                   = 9  ! "USI3D"
   integer, parameter :: SCHEME_MULTI_POINT_VILAR       = 10 ! "multi_point_vilar"
   integer, parameter :: SCHEME_ZB                   = 42 ! "ZB_*_*"
+  integer, parameter :: N_QP_SUBFACE_SIMPSON = 9
+  integer, parameter :: SUBFACE_QUAD_SIMPSON = 1
+  integer, parameter :: SUBFACE_QUAD_GAUSS2 = 2
   ! ZB advection sub-scheme IDs
   integer, parameter :: SCHEME_ADV_AR1D     = 1  ! "AR1D"
   integer, parameter :: SCHEME_ADV_AM       = 2  ! "AM"
@@ -115,6 +118,8 @@ module silvia_base_module
 
   !Scheme
   character(len=255) :: scheme = ""
+  character(len=32) :: subface_quadrature = "simpson"
+  integer :: subface_quadrature_id = SUBFACE_QUAD_SIMPSON
   logical :: exclude_bound_vert = .FALSE.
   integer(kind=ENTIER) :: bc_style = 1
   logical :: boundary_2d = .FALSE.
@@ -220,7 +225,7 @@ contains
       n_iter_print, n_iter_write_sol, &
       order, use_aho_reconstruction, &
       second_order, method, &
-      scheme, exclude_bound_vert, &
+      scheme, subface_quadrature, exclude_bound_vert, &
       activate_diffusion, &
       local_time_step, &
       bc_style, boundary_2d, &
@@ -321,6 +326,21 @@ contains
       scheme_id = SCHEME_MODIFIED_THREE_WAVE
     else
       print *, "ERROR: scheme unrecognized: '", trim(t), "'"
+      error stop
+    end if
+
+    t = trim(adjustl(subface_quadrature))
+    if (t == "simpson") then
+      subface_quadrature_id = SUBFACE_QUAD_SIMPSON
+    else if (t == "gauss" .or. t == "gauss2") then
+      subface_quadrature_id = SUBFACE_QUAD_GAUSS2
+    else
+      print *, "ERROR: subface_quadrature must be 'simpson' or 'gauss': '", trim(t), "'"
+      error stop
+    end if
+    if (order >= 2 .and. scheme_id == SCHEME_MULTI_POINT .and. &
+        subface_quadrature_id /= SUBFACE_QUAD_SIMPSON) then
+      print *, "ERROR: multi_point requires Simpson quadrature so point 1 remains the subface vertex"
       error stop
     end if
   end subroutine init_flags
@@ -529,7 +549,7 @@ contains
   subroutine compute_rhs(mesh, qpw, sol, prim, grad, hess, rhs, sum_lambda, t, &
       num_procs, mpi_send_recv)
     type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(4, 9, mesh%n_sub_faces), intent(in)  :: qpw
+    real(kind=DOUBLE), dimension(:, :, :), intent(in) :: qpw
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: sol
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: prim
     real(kind=DOUBLE), dimension(5, 3, mesh%n_elems), intent(inout) :: grad
@@ -563,7 +583,7 @@ contains
     implicit none
 
     type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(4, 9, mesh%n_sub_faces), intent(in)  :: qpw
+    real(kind=DOUBLE), dimension(:, :, :), intent(in) :: qpw
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: sol, prim
     real(kind=DOUBLE), dimension(5, 3, mesh%n_elems), intent(in) :: grad
     real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(in) :: hess
@@ -664,7 +684,7 @@ contains
             end if
             ! Other possible quadrature points to be treated with 2P flux
             if (order>=2) then
-              do k = 2,9
+              do k = 2,n_subface_quad_points()
                 wL = reconstruct(prim, grad, hess, il, qpw(1:3,k,id_sub_face), mesh%elem(il)%coord)
                 if (ir > 0) then
                   wR = reconstruct(prim, grad, hess, ir, qpw(1:3,k,id_sub_face), mesh%elem(ir)%coord)
@@ -700,7 +720,7 @@ contains
               sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*qpw(4,1,id_sub_face)
             end if
             if (order>=2) then
-              do k = 2,9
+              do k = 2,n_subface_quad_points()
                 wL = reconstruct(prim, grad, hess, il, qpw(1:3,k,id_sub_face), mesh%elem(il)%coord)
                 if (ir > 0) then
                   wR = reconstruct(prim, grad, hess, ir, qpw(1:3,k,id_sub_face), mesh%elem(ir)%coord)
@@ -736,7 +756,7 @@ contains
               sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*qpw(4,1,id_sub_face)
             end if
             if (order>=2) then
-              do k = 2,9
+              do k = 2,n_subface_quad_points()
                 wL = reconstruct(prim, grad, hess, il, qpw(1:3,k,id_sub_face), mesh%elem(il)%coord)
                 if (ir > 0) then
                   wR = reconstruct(prim, grad, hess, ir, qpw(1:3,k,id_sub_face), mesh%elem(ir)%coord)
@@ -1358,37 +1378,49 @@ end subroutine three_wave
   subroutine compute_sub_face_qpw(mesh, qpw)
     use quadrature_module
     type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(4,9,mesh%n_sub_faces), intent(inout) :: qpw
-    integer(kind=ENTIER) :: i, j
+    real(kind=DOUBLE), allocatable, dimension(:, :, :), intent(out) :: qpw
+    integer(kind=ENTIER) :: i, j, n_qp
     real(kind=DOUBLE), dimension(3,4) :: coord
-    real(kind=DOUBLE), dimension(3,9) :: pts
-    real(kind=DOUBLE), dimension(9) :: wts
+    real(kind=DOUBLE), dimension(3,N_QP_SUBFACE_SIMPSON) :: pts
+    real(kind=DOUBLE), dimension(N_QP_SUBFACE_SIMPSON) :: wts
     real(kind=DOUBLE), dimension(4) :: center
+
+    n_qp = n_subface_quad_points()
+    allocate(qpw(4,n_qp,mesh%n_sub_faces))
 
     do i=1,mesh%n_sub_faces
       coord = compute_subface_vert(mesh, i)
-      if (order>=2) then
-        ! call quad_face_rule(coord, 2, pts, wts)
+      if (order < 2) then
+        center = 0.0_DOUBLE
+        center(1:3) = coord(:,1)
+        center(4) = mesh%sub_face(i)%area
+        qpw(1:3,1,i) = center(1:3)
+        qpw(4,1,i) = center(4)
+      else if (subface_quadrature_id == SUBFACE_QUAD_SIMPSON) then
         call quad_simpson(coord, pts, wts)
-        do j=1, 9
+        do j=1,n_qp
           qpw(1:3,j,i)=pts(:,j)
           qpw(4,j,i)=wts(j)
         end do
       else
-        ! We will use only one point
-        center = 0.0_DOUBLE
-        do j=1, 4
-          ! center(1:3)=center(1:3)+0.25_DOUBLE*coord(1:3,j)
-          center(1:3)=coord(1:3,1)
-        end do
-        center(4)=mesh%sub_face(i)%area
-        do j=1,4
-          qpw(1:3,j,i)=center(1:3)
-          qpw(4,j,i)=center(4)
+        call quad_face_rule(coord, 2_ENTIER, pts(:,1:4), wts(1:4))
+        do j=1,n_qp
+          qpw(1:3,j,i)=pts(:,j)
+          qpw(4,j,i)=wts(j)
         end do
       end if
     end do
   end subroutine compute_sub_face_qpw
+
+  integer(kind=ENTIER) function n_subface_quad_points() result(n_qp)
+    if (order < 2) then
+      n_qp = 1
+    else if (subface_quadrature_id == SUBFACE_QUAD_SIMPSON) then
+      n_qp = N_QP_SUBFACE_SIMPSON
+    else
+      n_qp = 4  ! 2x2 Gauss rule
+    end if
+  end function n_subface_quad_points
 
   subroutine compute_face_qpw(mesh, qpw)
     use quadrature_module
@@ -1426,21 +1458,22 @@ end subroutine three_wave
 
 subroutine quad_simpson(v, xn, w)
   ! v(1:3,4): vertici in ordine ciclico (non necessariamente complanari)
-  ! xn(1:3,9): nodi (1-4 vertici, 5-8 punti medi lati 12,23,34,41, 9 centro)
-  ! w(9): pesi per l'integrale di superficie sulla superficie bilineare
+  ! xn/w: the 3x3 tensor-product Simpson rule on a bilinear subface.
   ! Se i vertici sono complanari e il quadrilatero e' convesso,
   ! e' esatta per polinomi di grado <= 2 nelle coordinate 3D.
   implicit none
   double precision, intent(in)  :: v(3,4)
-  double precision, intent(out) :: xn(3,9), w(9)
-  double precision, parameter :: sx(9) = [-1d0, 1d0, 1d0,-1d0, 0d0, 1d0, 0d0,-1d0, 0d0]
-  double precision, parameter :: sy(9) = [-1d0,-1d0, 1d0, 1d0,-1d0, 0d0, 1d0, 0d0, 0d0]
+  double precision, intent(out) :: xn(3,N_QP_SUBFACE_SIMPSON), w(N_QP_SUBFACE_SIMPSON)
+  double precision, parameter :: sx(N_QP_SUBFACE_SIMPSON) = &
+    [-1d0, 1d0, 1d0,-1d0, 0d0, 1d0, 0d0,-1d0, 0d0]
+  double precision, parameter :: sy(N_QP_SUBFACE_SIMPSON) = &
+    [-1d0,-1d0, 1d0, 1d0,-1d0, 0d0, 1d0, 0d0, 0d0]
   double precision, parameter :: w1(3) = [1d0/3d0, 4d0/3d0, 1d0/3d0]
   double precision :: xi, eta, n(4), dnx(4), dny(4)
   double precision :: tx(3), te(3), cr(3)
   integer :: k, i, ix, iy
 
-  do k = 1, 9
+  do k = 1, N_QP_SUBFACE_SIMPSON
      xi = sx(k); eta = sy(k)
      n(1) = 0.25d0*(1d0-xi)*(1d0-eta)
      n(2) = 0.25d0*(1d0+xi)*(1d0-eta)

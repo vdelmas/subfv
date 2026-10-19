@@ -46,6 +46,7 @@ program main
     call init_flags()
 
     if (me == 0) print *, "SUBFV METHOD ORDER ", order, "TYPE ", scheme_id
+    if (me == 0) print *, "SUBFACE QUADRATURE ", trim(subface_quadrature)
 
     call read_mesh_msh(mesh, meshfile_path, meshfile, &
         n_bc, bc_name, me, num_procs, mpi_send_recv)
@@ -60,7 +61,6 @@ program main
     allocate(rhs(5,mesh%n_elems))
     allocate(sum_lambda(mesh%n_elems))
 
-    allocate(qpw(4,9,mesh%n_sub_faces))
     allocate(qpw_face(4,4,mesh%n_faces))
     allocate(qpw_vol (4,6,mesh%n_elems))
     call compute_sub_face_qpw(mesh, qpw)
