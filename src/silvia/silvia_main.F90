@@ -32,7 +32,7 @@ program main
     real(kind=DOUBLE), allocatable :: grad(:, :, :)  ! (5, 3, n_elems)
     real(kind=DOUBLE), allocatable :: hess(:, :, :, :) ! (5, 3, 3, n_elems)
 
-    real(kind=DOUBLE), dimension(:,:,:), allocatable :: qpw
+    real(kind=DOUBLE), dimension(:,:,:), allocatable :: qpw, qpw_face, qpw_vol
 
 
     call MPI_INIT(mpi_ierr)
@@ -60,8 +60,12 @@ program main
     allocate(rhs(5,mesh%n_elems))
     allocate(sum_lambda(mesh%n_elems))
 
-    allocate(qpw(4,4,mesh%n_sub_faces))
+    allocate(qpw(4,9,mesh%n_sub_faces))
+    allocate(qpw_face(4,4,mesh%n_faces))
+    allocate(qpw_vol (4,6,mesh%n_elems))
     call compute_sub_face_qpw(mesh, qpw)
+    call compute_face_qpw(mesh,qpw_face)
+    call compute_vol_qpw(mesh,qpw_vol)
 
     if (order>=2) then
       allocate(sol1(5,mesh%n_elems))
@@ -77,7 +81,7 @@ program main
       sum_lambda(i) = 0.0_DOUBLE
     end do
 
-    call init_sol(mesh, sol)
+    call init_sol(mesh, qpw_vol, sol)
     if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)
     
     ! call face_geometry(mesh)
@@ -151,15 +155,15 @@ program main
         end select
 
       ! Periodic output
-      if (n_iter_write_sol > 1) then
-        if (t >= real(iter_write_sol, DOUBLE) * tmax / real(n_iter_write_sol - 1, DOUBLE)) then
+      if (n_iter_write_sol > 1 .or. n_iter_write_sol==-1) then
+        if (t >= real(iter_write_sol, DOUBLE) * tmax / real(n_iter_write_sol - 1, DOUBLE) .or. n_iter_write_sol==-1) then
           call write_vtu(mesh, sol, me, iter_write_sol)
           if (me==0) print*, 'output save at iter=', iter, ' dt=', dt, ' time=', t
           if (compute_error) then
             volume_err = 0.0_DOUBLE
             diam = 1.0e5
             err = 0.0_DOUBLE
-            call compute_error_test(mesh, sol, t, 1.0_DOUBLE, volume_err, diam, err)
+            call compute_error_test(mesh, qpw_vol, sol, t, 1.0_DOUBLE, volume_err, diam, err)
             call MPI_ALLREDUCE(MPI_IN_PLACE, volume_err, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
             call MPI_ALLREDUCE(MPI_IN_PLACE, diam, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
             call MPI_ALLREDUCE(MPI_IN_PLACE, err, 5, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
@@ -180,7 +184,7 @@ program main
       volume_err = 0.0_DOUBLE
       diam = 1.0e5
       err = 0.0_DOUBLE
-      call compute_error_test(mesh, sol, t, 1.0_DOUBLE, volume_err, diam, err)
+      call compute_error_test(mesh, qpw_vol, sol, t, 1.0_DOUBLE, volume_err, diam, err)
       call MPI_ALLREDUCE(MPI_IN_PLACE, volume_err, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
       call MPI_ALLREDUCE(MPI_IN_PLACE, diam, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
       call MPI_ALLREDUCE(MPI_IN_PLACE, err, 5, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)

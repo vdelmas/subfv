@@ -10,8 +10,9 @@ module silvia_errors_module
 
 contains
 
-	subroutine compute_error_test(mesh, sol, t, mach, volume, h_err, l2_err)
+	subroutine compute_error_test(mesh, qpw, sol, t, mach, volume, h_err, l2_err)
 		type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(4,6,mesh%n_elems), intent(in) :: qpw
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
     real(kind=DOUBLE), intent(in) :: t
 		real(kind=DOUBLE), intent(in) :: mach
@@ -23,22 +24,23 @@ contains
     else if (init_1drp) then
       ! still nothign to do
     else if (init_isentropic_vortex) then
-			call compute_error_isentropic(mesh,sol,t,volume,h_err,l2_err)
+			call compute_error_isentropic(mesh,qpw,sol,t,volume,h_err,l2_err)
     else if (init_gresho) then
-      call compute_error_gresho(mesh,sol,mach,h_err,l2_err)
+      call compute_error_gresho(mesh,qpw,sol,mach,h_err,l2_err)
     end if
 
 	end subroutine compute_error_test
 
-  subroutine compute_error_isentropic(mesh, sol, t, volume, diam, error)
+  subroutine compute_error_isentropic(mesh, qpw, sol, t, volume, diam, error)
     type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(4,6,mesh%n_elems), intent(in) :: qpw
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
     real(kind=DOUBLE), intent(in) :: t
     real(kind=DOUBLE), dimension(5), intent(inout) :: error
 		real(kind=DOUBLE), intent(inout) :: volume, diam
     
-    integer(kind=ENTIER) :: i
-    real(kind=DOUBLE), dimension(5) :: wexact, wsol
+    integer(kind=ENTIER) :: i,q
+    real(kind=DOUBLE), dimension(5) :: wexact, wsol, wq
 
     error = 0.0_DOUBLE
     volume = 0.0_DOUBLE
@@ -47,10 +49,17 @@ contains
       if (mesh%elem(i)%is_ghost) then
         cycle
       else 
-        if (abs(mesh%elem(i)%coord(1)) < 3.0_DOUBLE &
-        .and. abs(mesh%elem(i)%coord(2)) < 3.0_DOUBLE &
-        .and. abs(mesh%elem(i)%coord(3)) < 3.0_DOUBLE) then
-          call sol_isentropic_vortex(mesh%elem(i)%coord, wexact, t)
+        if (abs(mesh%elem(i)%coord(1)) < 3.0_DOUBLE .and. abs(mesh%elem(i)%coord(2)) < 3.0_DOUBLE .and. abs(mesh%elem(i)%coord(3)) < 3.0_DOUBLE) then
+          if (order<=2) then
+            call sol_isentropic_vortex(mesh%elem(i)%coord, wexact, t)
+          else
+            wexact= 0.0_DOUBLE
+            do q = 1, size(qpw,DIM=2)
+              call sol_isentropic_vortex(qpw(1:3,q,i), wq, t)
+              wexact = wexact + qpw(4,q,i) * wq
+            end do
+            wexact = wexact / mesh%elem(i)%volume
+          end if
           wsol = conserv_to_primit(sol(:, i))
           error = error + mesh%elem(i)%volume*abs(wsol - wexact)
           volume = volume + mesh%elem(i)%volume
@@ -64,8 +73,9 @@ contains
     end do
   end subroutine compute_error_isentropic
 
-	subroutine compute_error_gresho(mesh, sol, mach, volume, error)
+	subroutine compute_error_gresho(mesh, qpw, sol, mach, volume, error)
     type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(4,6,mesh%n_elems), intent(in) :: qpw
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
 		real(kind=DOUBLE), intent(in) :: mach
 		real(kind=DOUBLE), dimension(5), intent(inout) :: error

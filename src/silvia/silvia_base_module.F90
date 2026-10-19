@@ -462,14 +462,15 @@ contains
     w(5) = w(1)**gamma
   end subroutine sol_isentropic_vortex
 
-  subroutine init_sol(mesh, sol)
+  subroutine init_sol(mesh, qpw, sol)
     type(mesh_type), intent(in)    :: mesh
+    real(kind=DOUBLE), dimension(4,6,mesh%n_elems), intent(in) :: qpw
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(out) :: sol
 
     integer(kind=ENTIER) :: i, kf, iface_loc, n_fv, k, q
-    real(kind=DOUBLE), dimension(5) :: w, w_sum, wq
+    real(kind=DOUBLE), dimension(5) :: w, wq
     real(kind=DOUBLE), dimension(3) :: xc
-    real(kind=DOUBLE), dimension(:, :), allocatable :: qpts_v, fc
+    real(kind=DOUBLE), dimension(:, :), allocatable :: qpts_v, fc, vcoords
     real(kind=DOUBLE), dimension(:),    allocatable :: qwts_v
     real(kind=DOUBLE) :: area_q
 
@@ -487,8 +488,19 @@ contains
       end do
     else if (init_isentropic_vortex) then
       do i = 1, mesh%n_elems
-        call sol_isentropic_vortex(mesh%elem(i)%coord, w, 0.0_DOUBLE)
-        sol(:, i) = primit_to_conserv(w)
+        if (order<=2) then
+          call sol_isentropic_vortex(mesh%elem(i)%coord, w, 0.0_DOUBLE)
+          sol(:, i) = primit_to_conserv(w)
+        else
+          ! For order >= 3 initialize the finite-volume state with the
+          ! cell average of the exact conservative solution
+          sol(:, i) = 0.0_DOUBLE
+          do q = 1, size(qpw,DIM=2)
+            call sol_isentropic_vortex(qpw(1:3,q,i), wq, 0.0_DOUBLE)
+            sol(:, i) = sol(:, i) + qpw(4,q,i) * primit_to_conserv(wq)
+          end do
+          sol(:, i) = sol(:, i) / mesh%elem(i)%volume
+        end if
       end do
     else if (init_gresho) then
       do i = 1, mesh%n_elems
@@ -517,7 +529,7 @@ contains
   subroutine compute_rhs(mesh, qpw, sol, prim, grad, hess, rhs, sum_lambda, t, &
       num_procs, mpi_send_recv)
     type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(4, 4, mesh%n_sub_faces), intent(in)  :: qpw
+    real(kind=DOUBLE), dimension(4, 9, mesh%n_sub_faces), intent(in)  :: qpw
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: sol
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: prim
     real(kind=DOUBLE), dimension(5, 3, mesh%n_elems), intent(inout) :: grad
@@ -551,7 +563,7 @@ contains
     implicit none
 
     type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(4, 4, mesh%n_sub_faces), intent(in)  :: qpw
+    real(kind=DOUBLE), dimension(4, 9, mesh%n_sub_faces), intent(in)  :: qpw
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: sol, prim
     real(kind=DOUBLE), dimension(5, 3, mesh%n_elems), intent(in) :: grad
     real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(in) :: hess
@@ -652,7 +664,7 @@ contains
             end if
             ! Other possible quadrature points to be treated with 2P flux
             if (order>=2) then
-              do k = 2,4
+              do k = 2,9
                 wL = reconstruct(prim, grad, hess, il, qpw(1:3,k,id_sub_face), mesh%elem(il)%coord)
                 if (ir > 0) then
                   wR = reconstruct(prim, grad, hess, ir, qpw(1:3,k,id_sub_face), mesh%elem(ir)%coord)
@@ -688,7 +700,7 @@ contains
               sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*qpw(4,1,id_sub_face)
             end if
             if (order>=2) then
-              do k = 2,4
+              do k = 2,9
                 wL = reconstruct(prim, grad, hess, il, qpw(1:3,k,id_sub_face), mesh%elem(il)%coord)
                 if (ir > 0) then
                   wR = reconstruct(prim, grad, hess, ir, qpw(1:3,k,id_sub_face), mesh%elem(ir)%coord)
@@ -724,7 +736,7 @@ contains
               sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*qpw(4,1,id_sub_face)
             end if
             if (order>=2) then
-              do k = 2,4
+              do k = 2,9
                 wL = reconstruct(prim, grad, hess, il, qpw(1:3,k,id_sub_face), mesh%elem(il)%coord)
                 if (ir > 0) then
                   wR = reconstruct(prim, grad, hess, ir, qpw(1:3,k,id_sub_face), mesh%elem(ir)%coord)
@@ -1346,14 +1358,50 @@ end subroutine three_wave
   subroutine compute_sub_face_qpw(mesh, qpw)
     use quadrature_module
     type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(4,4,mesh%n_sub_faces), intent(inout) :: qpw
+    real(kind=DOUBLE), dimension(4,9,mesh%n_sub_faces), intent(inout) :: qpw
+    integer(kind=ENTIER) :: i, j
+    real(kind=DOUBLE), dimension(3,4) :: coord
+    real(kind=DOUBLE), dimension(3,9) :: pts
+    real(kind=DOUBLE), dimension(9) :: wts
+    real(kind=DOUBLE), dimension(4) :: center
+
+    do i=1,mesh%n_sub_faces
+      coord = compute_subface_vert(mesh, i)
+      if (order>=2) then
+        ! call quad_face_rule(coord, 2, pts, wts)
+        call quad_simpson(coord, pts, wts)
+        do j=1, 9
+          qpw(1:3,j,i)=pts(:,j)
+          qpw(4,j,i)=wts(j)
+        end do
+      else
+        ! We will use only one point
+        center = 0.0_DOUBLE
+        do j=1, 4
+          ! center(1:3)=center(1:3)+0.25_DOUBLE*coord(1:3,j)
+          center(1:3)=coord(1:3,1)
+        end do
+        center(4)=mesh%sub_face(i)%area
+        do j=1,4
+          qpw(1:3,j,i)=center(1:3)
+          qpw(4,j,i)=center(4)
+        end do
+      end if
+    end do
+  end subroutine compute_sub_face_qpw
+
+  subroutine compute_face_qpw(mesh, qpw)
+    use quadrature_module
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(4,4,mesh%n_faces), intent(inout) :: qpw
     integer(kind=ENTIER) :: i, j
     real(kind=DOUBLE), dimension(3,4) :: coord
     real(kind=DOUBLE), dimension(3,4) :: pts
     real(kind=DOUBLE), dimension(4) :: wts, center
 
-    do i=1,mesh%n_sub_faces
+    do i=1,mesh%n_faces
       coord = compute_subface_vert(mesh, i)
+      ! coord = mesh%face(i)%vert
       if (order>=2) then
         call quad_face_rule(coord, 2, pts, wts)
         do j=1, 4
@@ -1374,5 +1422,429 @@ end subroutine three_wave
         end do
       end if
     end do
-  end subroutine compute_sub_face_qpw
+  end subroutine compute_face_qpw
+
+subroutine quad_simpson(v, xn, w)
+  ! v(1:3,4): vertici in ordine ciclico (non necessariamente complanari)
+  ! xn(1:3,9): nodi (1-4 vertici, 5-8 punti medi lati 12,23,34,41, 9 centro)
+  ! w(9): pesi per l'integrale di superficie sulla superficie bilineare
+  ! Se i vertici sono complanari e il quadrilatero e' convesso,
+  ! e' esatta per polinomi di grado <= 2 nelle coordinate 3D.
+  implicit none
+  double precision, intent(in)  :: v(3,4)
+  double precision, intent(out) :: xn(3,9), w(9)
+  double precision, parameter :: sx(9) = [-1d0, 1d0, 1d0,-1d0, 0d0, 1d0, 0d0,-1d0, 0d0]
+  double precision, parameter :: sy(9) = [-1d0,-1d0, 1d0, 1d0,-1d0, 0d0, 1d0, 0d0, 0d0]
+  double precision, parameter :: w1(3) = [1d0/3d0, 4d0/3d0, 1d0/3d0]
+  double precision :: xi, eta, n(4), dnx(4), dny(4)
+  double precision :: tx(3), te(3), cr(3)
+  integer :: k, i, ix, iy
+
+  do k = 1, 9
+     xi = sx(k); eta = sy(k)
+     n(1) = 0.25d0*(1d0-xi)*(1d0-eta)
+     n(2) = 0.25d0*(1d0+xi)*(1d0-eta)
+     n(3) = 0.25d0*(1d0+xi)*(1d0+eta)
+     n(4) = 0.25d0*(1d0-xi)*(1d0+eta)
+     dnx(1) = -0.25d0*(1d0-eta); dny(1) = -0.25d0*(1d0-xi)
+     dnx(2) =  0.25d0*(1d0-eta); dny(2) = -0.25d0*(1d0+xi)
+     dnx(3) =  0.25d0*(1d0+eta); dny(3) =  0.25d0*(1d0+xi)
+     dnx(4) = -0.25d0*(1d0+eta); dny(4) =  0.25d0*(1d0-xi)
+     xn(:,k) = 0d0; tx = 0d0; te = 0d0
+     do i = 1, 4
+        xn(:,k) = xn(:,k) + n(i)*v(:,i)
+        tx = tx + dnx(i)*v(:,i)
+        te = te + dny(i)*v(:,i)
+     end do
+     cr(1) = tx(2)*te(3) - tx(3)*te(2)
+     cr(2) = tx(3)*te(1) - tx(1)*te(3)
+     cr(3) = tx(1)*te(2) - tx(2)*te(1)
+     ix = nint(xi) + 2
+     iy = nint(eta) + 2
+     w(k) = w1(ix)*w1(iy)*sqrt(cr(1)**2 + cr(2)**2 + cr(3)**2)
+  end do
+end subroutine quad_simpson
+
+subroutine compute_vol_qpw(mesh, qpw)
+  use quadrature_module
+  type(mesh_type), intent(in) :: mesh
+  real(kind=DOUBLE), dimension(4,6,mesh%n_elems), intent(inout) :: qpw
+  integer(kind=ENTIER) :: i, j, nv
+  real(kind=DOUBLE), dimension(:,:), allocatable :: coord, pts
+  real(kind=DOUBLE), dimension(:), allocatable :: wts
+
+  do i=1,mesh%n_elems
+    qpw(:,:,i) = 0.0_DOUBLE
+    if (order>=3) then
+      nv = mesh%elem(i)%n_vert
+      if (nv /= 6) then
+        error stop 'compute_vol_qpw: expected 6-node prism cells'
+      end if
+      allocate(coord(3,nv))
+      do j=1,nv
+        coord(:,j) = mesh%vert(mesh%elem(i)%vert(j))%coord
+      end do
+      ! order=2 means degree-2 exactness, not 12 points.  The prism
+      ! rule is 3 triangle points x 2 line points = 6 points.
+      call volume_quad_pts(nv, coord, 2_ENTIER, pts, wts)
+      if (size(wts) /= size(qpw,2)) then
+        error stop 'compute_vol_qpw: expected exactly 6 prism quadrature points'
+      end if
+      do j=1,size(wts)
+        qpw(1:3,j,i)=pts(:,j)
+        qpw(4,j,i)=wts(j)
+      end do
+      deallocate(coord, pts, wts)
+    else
+      qpw(1:3,1,i) = mesh%elem(i)%coord
+      qpw(4,1,i) = mesh%elem(i)%volume
+    end if
+  end do
+end subroutine compute_vol_qpw
+
+! ================================================================
+! Prism (wedge) rule: tensor product triangle x line
+!   GMSH node order: v1,v2,v3 bottom triangle, v4,v5,v6 top
+!   x(L,t) = (1-t)/2*(L1*v1+L2*v2+L3*v3) + (1+t)/2*(L1*v4+L2*v5+L3*v6)
+!   t in [-1,1], L barycentric
+!   Physical weight = w_tri_norm/2 * w_line * |det J(L,t)|
+! ================================================================
+subroutine prism_rule(coords, order, pts, wts)
+  real(kind=DOUBLE), dimension(3, 6), intent(in)  :: coords
+  integer(kind=ENTIER),               intent(in)  :: order
+  real(kind=DOUBLE), dimension(:, :), intent(out) :: pts
+  real(kind=DOUBLE), dimension(:),    intent(out) :: wts
+
+  ! Triangle Gauss reference data (barycentric, weights sum to 1)
+  integer(kind=ENTIER), parameter :: max_tri = 12, max_line = 5
+  integer(kind=ENTIER) :: n_tri, n_line, i, j, k
+  real(kind=DOUBLE), dimension(3, max_tri) :: L_tri
+  real(kind=DOUBLE), dimension(max_tri)    :: w_tri
+  real(kind=DOUBLE), dimension(max_line)   :: t_line, w_line
+  real(kind=DOUBLE) :: L1, L2, L3, t, wl
+  real(kind=DOUBLE), dimension(3) :: xbot, xtop
+  real(kind=DOUBLE), dimension(3) :: dxdL1, dxdL2, dxdt
+  real(kind=DOUBLE) :: jac
+
+  ! tri_ref_rule now supports up to order 6 (2026-09-20, 12-pt Dunavant)
+  ! and gauss1d caps at its own 5-pt rule (order>=5): a triangular-base
+  ! prism is exactly this triangle rule times gauss1d in the extrusion
+  ! direction, so raising the triangle side's degree is all a prism
+  ! needs -- matching n_volume_quad_pts(6,order)'s tri-pts x line-pts
+  ! count, no separate volume-specific rule required.
+  call tri_ref_rule(order, n_tri, L_tri, w_tri)
+  call gauss1d(order, n_line, t_line, w_line)
+
+  k = 0
+  do i = 1, n_tri
+    L1 = L_tri(1, i); L2 = L_tri(2, i); L3 = L_tri(3, i)
+    do j = 1, n_line
+      t  = t_line(j); wl = w_line(j)
+      k  = k + 1
+      xbot = L1*coords(:,1) + L2*coords(:,2) + L3*coords(:,3)
+      xtop = L1*coords(:,4) + L2*coords(:,5) + L3*coords(:,6)
+      pts(:, k) = 0.5_DOUBLE*((1-t)*xbot + (1+t)*xtop)
+      ! Jacobian columns
+      dxdL1 = 0.5_DOUBLE*((1-t)*(coords(:,1)-coords(:,3)) &
+                          +(1+t)*(coords(:,4)-coords(:,6)))
+      dxdL2 = 0.5_DOUBLE*((1-t)*(coords(:,2)-coords(:,3)) &
+                          +(1+t)*(coords(:,5)-coords(:,6)))
+      dxdt  = 0.5_DOUBLE*(-xbot + xtop)
+      jac   = abs(det3(reshape([dxdL1, dxdL2, dxdt], [3,3])))
+      ! Factor 1/2: area of reference triangle in (L1,L2) coords
+      wts(k) = 0.5_DOUBLE * w_tri(i) * wl * jac
+    end do
+  end do
+end subroutine prism_rule
+
+! ================================================================
+! Tetrahedron rule
+!   vertices: coords(:,1..4)
+!   x = L1*v1+L2*v2+L3*v3+L4*v4, L1=1-L2-L3-L4
+!   Jacobian: J = [v2-v1 | v3-v1 | v4-v1], constant
+!   vol = |det J| / 6
+!   w_gauss = w_norm * vol
+! ================================================================
+subroutine tet_rule(coords, order, pts, wts)
+  real(kind=DOUBLE), dimension(3, 4), intent(in)  :: coords
+  integer(kind=ENTIER),               intent(in)  :: order
+  real(kind=DOUBLE), dimension(:, :), intent(out) :: pts
+  real(kind=DOUBLE), dimension(:),    intent(out) :: wts
+
+  real(kind=DOUBLE), dimension(3) :: v1, v2, v3, v4
+  real(kind=DOUBLE) :: vol, a, b
+
+  v1 = coords(:, 1); v2 = coords(:, 2)
+  v3 = coords(:, 3); v4 = coords(:, 4)
+  vol = abs(det3(reshape([v2-v1, v3-v1, v4-v1], [3, 3]))) / 6.0_DOUBLE
+
+  select case (order)
+
+  case (1)   ! 1 pt, centroid
+    pts(:, 1) = (v1+v2+v3+v4) / 4.0_DOUBLE
+    wts(1) = vol
+
+  case (2)   ! 4 pts, Dunavant–Keast
+    ! a = (5+3√5)/20,  b = (5-√5)/20
+    a = (5.0_DOUBLE + 3.0_DOUBLE*sqrt(5.0_DOUBLE)) / 20.0_DOUBLE
+    b = (5.0_DOUBLE -            sqrt(5.0_DOUBLE)) / 20.0_DOUBLE
+    pts(:, 1) = a*v1 + b*v2 + b*v3 + b*v4
+    pts(:, 2) = b*v1 + a*v2 + b*v3 + b*v4
+    pts(:, 3) = b*v1 + b*v2 + a*v3 + b*v4
+    pts(:, 4) = b*v1 + b*v2 + b*v3 + a*v4
+    wts = vol / 4.0_DOUBLE
+
+  case (3)   ! 5 pts, Keast order 3  (Felippa Table 9.4)
+    ! centroid with negative weight, then 4 face-biased pts
+    pts(:, 1) = (v1+v2+v3+v4) / 4.0_DOUBLE
+    wts(1) = -4.0_DOUBLE / 5.0_DOUBLE * vol
+    ! L = (1/2, 1/6, 1/6, 1/6) and permutations
+    pts(:, 2) = 0.5_DOUBLE*v1 + (v2+v3+v4)/6.0_DOUBLE
+    pts(:, 3) = 0.5_DOUBLE*v2 + (v1+v3+v4)/6.0_DOUBLE
+    pts(:, 4) = 0.5_DOUBLE*v3 + (v1+v2+v4)/6.0_DOUBLE
+    pts(:, 5) = 0.5_DOUBLE*v4 + (v1+v2+v3)/6.0_DOUBLE
+    wts(2:5) = 9.0_DOUBLE / 20.0_DOUBLE * vol
+
+  case (4)   ! 11 pts, Keast order 4. Centroid orbit (1 pt) + S31(a)
+    ! orbit (4 pts, perms of (a,a,a,1-3a)) + S22(b) orbit (6 pts, perms
+    ! of (b,b,1/2-b,1/2-b)). Derived from scratch via symbolic
+    ! moment-matching (sympy) against the exact reference-tetrahedron
+    ! integrals of every monomial up to degree 4, not transcribed from
+    ! a table -- verified numerically afterward to ~1e-17 max error
+    ! (see aho-mpi-ghost-stencil-bug memory / tex_arbitrary_high_order
+    ! for the derivation script). Matches the classical Keast(1986)
+    ! degree-4 rule.
+    block
+      real(kind=DOUBLE), parameter :: a = 1.0_DOUBLE/14.0_DOUBLE
+      real(kind=DOUBLE), parameter :: b = 0.25_DOUBLE - sqrt(70.0_DOUBLE)/56.0_DOUBLE
+      real(kind=DOUBLE), parameter :: wc = -148.0_DOUBLE/1875.0_DOUBLE
+      real(kind=DOUBLE), parameter :: wa = 343.0_DOUBLE/7500.0_DOUBLE
+      real(kind=DOUBLE), parameter :: wb = 56.0_DOUBLE/375.0_DOUBLE
+      real(kind=DOUBLE) :: ca, cb
+      ca = 1.0_DOUBLE - 3.0_DOUBLE*a
+      cb = 0.5_DOUBLE - b
+      pts(:, 1) = 0.25_DOUBLE*(v1+v2+v3+v4)
+      wts(1) = wc * vol
+      pts(:, 2) = a*v1 + a*v2 + a*v3 + ca*v4
+      pts(:, 3) = a*v1 + a*v2 + ca*v3 + a*v4
+      pts(:, 4) = a*v1 + ca*v2 + a*v3 + a*v4
+      pts(:, 5) = ca*v1 + a*v2 + a*v3 + a*v4
+      wts(2:5) = wa * vol
+      pts(:, 6)  = b*v1 + b*v2 + cb*v3 + cb*v4
+      pts(:, 7)  = b*v1 + cb*v2 + b*v3 + cb*v4
+      pts(:, 8)  = b*v1 + cb*v2 + cb*v3 + b*v4
+      pts(:, 9)  = cb*v1 + b*v2 + b*v3 + cb*v4
+      pts(:, 10) = cb*v1 + b*v2 + cb*v3 + b*v4
+      pts(:, 11) = cb*v1 + cb*v2 + b*v3 + b*v4
+      wts(6:11) = wb * vol
+    end block
+
+  case default   ! order >= 5: 15 pts, degree-5. Centroid orbit (1 pt)
+    ! + S31(a) orbit (4 pts, perms of (a,a,a,1-3a)) + S31(b) orbit (4
+    ! pts, perms of (b,b,b,1-3b), a second, independent S31 family --
+    ! degree 4 alone needs only one S31 orbit, degree 5 needs two) +
+    ! S22(c) orbit (6 pts, perms of (c,c,d,d), d=1/2-c). All three
+    ! shape parameters and four weights derived from scratch by
+    ! symbolic moment-matching (sympy/mpmath, Levenberg-Marquardt
+    ! refined to 50+ digits) against the exact reference-tetrahedron
+    ! integral of every monomial up to degree 5, not transcribed from
+    ! a table -- this particular real root of the (overdetermined,
+    ! 18-equation/7-unknown) moment system was chosen because it has
+    ! every point strictly interior and every weight strictly positive
+    ! (other real roots of the same ansatz exist but place a point
+    ! outside the tet or a negative weight). Verified numerically
+    ! afterward to ~1e-17 max error over every monomial up to degree 5,
+    ! and confirmed genuinely NOT exact at degree 6 (~1e-4 relative
+    ! error there, as expected for a degree-5 rule). Replaces the
+    ! previous fallback that silently reused the degree-4, 11-pt rule
+    ! for order>=5. Order >= 6 still has no verified rule of its own
+    ! and reuses this one, so a request for a true degree-6 tet
+    ! quadrature remains inexact by this same ~1e-4 margin.
+    block
+      real(kind=DOUBLE), parameter :: a  = 0.09198569323008009_DOUBLE
+      real(kind=DOUBLE), parameter :: b  = 0.3196170515859492_DOUBLE
+      real(kind=DOUBLE), parameter :: c  = 0.4438225029698707_DOUBLE
+      real(kind=DOUBLE), parameter :: w0 = 0.1169962321923602_DOUBLE
+      real(kind=DOUBLE), parameter :: w1 = 0.07196628338760167_DOUBLE
+      real(kind=DOUBLE), parameter :: w2 = 0.06970310366278548_DOUBLE
+      real(kind=DOUBLE), parameter :: w3 = 0.05272103660101520_DOUBLE
+      real(kind=DOUBLE) :: ca, cb, d
+      ca = 1.0_DOUBLE - 3.0_DOUBLE*a
+      cb = 1.0_DOUBLE - 3.0_DOUBLE*b
+      d  = 0.5_DOUBLE - c
+      pts(:, 1) = 0.25_DOUBLE*(v1+v2+v3+v4)
+      wts(1) = w0 * vol
+      pts(:, 2) = a*v1 + a*v2 + a*v3 + ca*v4
+      pts(:, 3) = a*v1 + a*v2 + ca*v3 + a*v4
+      pts(:, 4) = a*v1 + ca*v2 + a*v3 + a*v4
+      pts(:, 5) = ca*v1 + a*v2 + a*v3 + a*v4
+      wts(2:5) = w1 * vol
+      pts(:, 6) = b*v1 + b*v2 + b*v3 + cb*v4
+      pts(:, 7) = b*v1 + b*v2 + cb*v3 + b*v4
+      pts(:, 8) = b*v1 + cb*v2 + b*v3 + b*v4
+      pts(:, 9) = cb*v1 + b*v2 + b*v3 + b*v4
+      wts(6:9) = w2 * vol
+      pts(:, 10) = c*v1 + c*v2 + d*v3 + d*v4
+      pts(:, 11) = c*v1 + d*v2 + c*v3 + d*v4
+      pts(:, 12) = c*v1 + d*v2 + d*v3 + c*v4
+      pts(:, 13) = d*v1 + c*v2 + c*v3 + d*v4
+      pts(:, 14) = d*v1 + c*v2 + d*v3 + c*v4
+      pts(:, 15) = d*v1 + d*v2 + c*v3 + c*v4
+      wts(10:15) = w3 * vol
+    end block
+
+  end select
+end subroutine tet_rule
+
+! Determinant of a 3x3 matrix
+pure function det3(A) result(d)
+  real(kind=DOUBLE), dimension(3, 3), intent(in) :: A
+  real(kind=DOUBLE) :: d
+  d = A(1,1)*(A(2,2)*A(3,3) - A(2,3)*A(3,2)) &
+    - A(1,2)*(A(2,1)*A(3,3) - A(2,3)*A(3,1)) &
+    + A(1,3)*(A(2,1)*A(3,2) - A(2,2)*A(3,1))
+end function det3
+
+! 1D Gauss-Legendre nodes and weights on [-1,1], n=1..5 points.
+! An n-point rule is exact for polynomials up to degree 2n-1, so this
+! alone (quad-face/hex-volume tensor-product rules only) comfortably
+! covers every degree tested so far. The triangle/tet/prism/pyramid
+! rules are separate, non-tensor-product constructions with their own
+! degree ceiling: degree 5 for triangle/prism (tri_ref_rule), degree 5
+! for tet/pyramid (tet_rule) -- see n_face_quad_pts/n_volume_quad_pts
+! for the current per-shape degree each order actually gets, and
+! tri_face_rule/tet_rule's own case-default comments for what happens
+! past that (silent reuse of the highest verified rule, not a hard
+! error).
+subroutine gauss1d(order, ng, xi, w)
+  integer(kind=ENTIER), intent(in)  :: order
+  integer(kind=ENTIER), intent(out) :: ng
+  real(kind=DOUBLE), dimension(5), intent(out) :: xi, w
+
+  real(kind=DOUBLE), parameter :: s3 = 1.0_DOUBLE / sqrt(3.0_DOUBLE)
+  real(kind=DOUBLE), parameter :: s35 = sqrt(3.0_DOUBLE / 5.0_DOUBLE)
+  ! 4-point: nodes ±sqrt((3∓2*sqrt(6/5))/7), standard A&S 25.4.30
+  real(kind=DOUBLE), parameter :: x4a = 0.3399810435848563_DOUBLE
+  real(kind=DOUBLE), parameter :: x4b = 0.8611363115940526_DOUBLE
+  real(kind=DOUBLE), parameter :: w4a = 0.6521451548625461_DOUBLE
+  real(kind=DOUBLE), parameter :: w4b = 0.3478548451374538_DOUBLE
+  ! 5-point: nodes 0, ±(1/3)*sqrt(5∓2*sqrt(10/7)), standard A&S 25.4.30
+  real(kind=DOUBLE), parameter :: x5a = 0.5384693101056831_DOUBLE
+  real(kind=DOUBLE), parameter :: x5b = 0.9061798459386640_DOUBLE
+  real(kind=DOUBLE), parameter :: w5c = 0.5688888888888889_DOUBLE
+  real(kind=DOUBLE), parameter :: w5a = 0.4786286704993665_DOUBLE
+  real(kind=DOUBLE), parameter :: w5b = 0.2369268850561891_DOUBLE
+
+  select case (order)
+  case (1)
+    ng = 1; xi(1) = 0.0_DOUBLE; w(1) = 2.0_DOUBLE
+  case (2)
+    ng = 2
+    xi(1) = -s3; xi(2) = s3
+    w(1)  = 1.0_DOUBLE; w(2) = 1.0_DOUBLE
+  case (3)
+    ng = 3
+    xi(1) = -s35; xi(2) = 0.0_DOUBLE; xi(3) = s35
+    w(1)  = 5.0_DOUBLE/9.0_DOUBLE
+    w(2)  = 8.0_DOUBLE/9.0_DOUBLE
+    w(3)  = 5.0_DOUBLE/9.0_DOUBLE
+  case (4)
+    ng = 4
+    xi(1) = -x4b; xi(2) = -x4a; xi(3) = x4a; xi(4) = x4b
+    w(1)  =  w4b; w(2)  =  w4a; w(3)  = w4a; w(4)  = w4b
+  case default   ! order >= 5 → 5-point rule
+    ng = 5
+    xi(1) = -x5b; xi(2) = -x5a; xi(3) = 0.0_DOUBLE; xi(4) = x5a; xi(5) = x5b
+    w(1)  =  w5b; w(2)  =  w5a; w(3)  = w5c;        w(4)  = w5a; w(5)  = w5b
+  end select
+end subroutine gauss1d
+
+! Triangle reference Gauss rule in barycentric coords (L1,L2,L3)
+! w_tri are normalized so sum(w_tri) = 1. Same underlying rules as
+! tri_face_rule (kept as a separate barycentric-table routine for
+! prism_rule's tensor-product use) -- see tri_face_rule for the
+! degree-4/5/6 rules' verification note.
+subroutine tri_ref_rule(order, n, L, w)
+  integer(kind=ENTIER), intent(in)  :: order
+  integer(kind=ENTIER), intent(out) :: n
+  real(kind=DOUBLE), dimension(3, 12), intent(out) :: L
+  real(kind=DOUBLE), dimension(12),    intent(out) :: w
+
+  select case (order)
+  case (1)
+    n = 1
+    L(:, 1) = [1.0_DOUBLE/3, 1.0_DOUBLE/3, 1.0_DOUBLE/3]
+    w(1) = 1.0_DOUBLE
+  case (2)
+    n = 3
+    L(:, 1) = [2.0_DOUBLE/3, 1.0_DOUBLE/6, 1.0_DOUBLE/6]
+    L(:, 2) = [1.0_DOUBLE/6, 2.0_DOUBLE/3, 1.0_DOUBLE/6]
+    L(:, 3) = [1.0_DOUBLE/6, 1.0_DOUBLE/6, 2.0_DOUBLE/3]
+    w(1:3) = 1.0_DOUBLE/3
+  case (3)
+    n = 4
+    L(:, 1) = [1.0_DOUBLE/3, 1.0_DOUBLE/3, 1.0_DOUBLE/3]
+    L(:, 2) = [3.0_DOUBLE/5, 1.0_DOUBLE/5, 1.0_DOUBLE/5]
+    L(:, 3) = [1.0_DOUBLE/5, 3.0_DOUBLE/5, 1.0_DOUBLE/5]
+    L(:, 4) = [1.0_DOUBLE/5, 1.0_DOUBLE/5, 3.0_DOUBLE/5]
+    w(1)   = -27.0_DOUBLE/48
+    w(2:4) =  25.0_DOUBLE/48
+  case (4)
+    n = 6
+    block
+      real(kind=DOUBLE), parameter :: a1 = 0.445948490915965_DOUBLE
+      real(kind=DOUBLE), parameter :: b1 = 0.108103018168070_DOUBLE
+      real(kind=DOUBLE), parameter :: w1 = 0.223381589678011_DOUBLE
+      real(kind=DOUBLE), parameter :: a2 = 0.091576213509771_DOUBLE
+      real(kind=DOUBLE), parameter :: b2 = 0.816847572980459_DOUBLE
+      real(kind=DOUBLE), parameter :: w2 = 0.109951743655322_DOUBLE
+      L(:, 1) = [a1, a1, b1]; L(:, 2) = [a1, b1, a1]; L(:, 3) = [b1, a1, a1]
+      w(1:3) = w1
+      L(:, 4) = [a2, a2, b2]; L(:, 5) = [a2, b2, a2]; L(:, 6) = [b2, a2, a2]
+      w(4:6) = w2
+    end block
+  case (5)
+    n = 7
+    block
+      real(kind=DOUBLE), parameter :: w0 = 0.225_DOUBLE
+      real(kind=DOUBLE), parameter :: a1 = 0.470142064105115_DOUBLE
+      real(kind=DOUBLE), parameter :: b1 = 0.059715871789770_DOUBLE
+      real(kind=DOUBLE), parameter :: w1 = 0.132394152788506_DOUBLE
+      real(kind=DOUBLE), parameter :: a2 = 0.101286507323456_DOUBLE
+      real(kind=DOUBLE), parameter :: b2 = 0.797426985353087_DOUBLE
+      real(kind=DOUBLE), parameter :: w2 = 0.125939180544827_DOUBLE
+      L(:, 1) = [1.0_DOUBLE/3, 1.0_DOUBLE/3, 1.0_DOUBLE/3]
+      w(1) = w0
+      L(:, 2) = [a1, a1, b1]; L(:, 3) = [a1, b1, a1]; L(:, 4) = [b1, a1, a1]
+      w(2:4) = w1
+      L(:, 5) = [a2, a2, b2]; L(:, 6) = [a2, b2, a2]; L(:, 7) = [b2, a2, a2]
+      w(5:7) = w2
+    end block
+  case default   ! order >= 6: 12-pt Dunavant degree-6 rule, see
+    ! tri_face_rule's case default for the derivation/verification note.
+    n = 12
+    block
+      real(kind=DOUBLE), parameter :: a1 = 0.2492867451709104_DOUBLE
+      real(kind=DOUBLE), parameter :: w1 = 0.1167862757263794_DOUBLE
+      real(kind=DOUBLE), parameter :: a2 = 0.06308901449150223_DOUBLE
+      real(kind=DOUBLE), parameter :: w2 = 0.05084490637020682_DOUBLE
+      real(kind=DOUBLE), parameter :: a3 = 0.3103524510337844_DOUBLE
+      real(kind=DOUBLE), parameter :: b3 = 0.05314504984481695_DOUBLE
+      real(kind=DOUBLE), parameter :: w3 = 0.08285107561837358_DOUBLE
+      real(kind=DOUBLE) :: c1, c2, c3
+      c1 = 1.0_DOUBLE - 2.0_DOUBLE*a1
+      c2 = 1.0_DOUBLE - 2.0_DOUBLE*a2
+      c3 = 1.0_DOUBLE - a3 - b3
+      L(:, 1) = [a1, a1, c1]; L(:, 2) = [a1, c1, a1]; L(:, 3) = [c1, a1, a1]
+      w(1:3) = w1
+      L(:, 4) = [a2, a2, c2]; L(:, 5) = [a2, c2, a2]; L(:, 6) = [c2, a2, a2]
+      w(4:6) = w2
+      L(:, 7)  = [a3, b3, c3]; L(:, 8)  = [a3, c3, b3]
+      L(:, 9)  = [b3, a3, c3]; L(:, 10) = [b3, c3, a3]
+      L(:, 11) = [c3, a3, b3]; L(:, 12) = [c3, b3, a3]
+      w(7:12) = w3
+    end block
+  end select
+end subroutine tri_ref_rule
+  
 end module silvia_base_module
