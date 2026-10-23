@@ -607,7 +607,7 @@ contains
     integer(kind=ENTIER) :: ng
     real(kind=DOUBLE), dimension(:, :), allocatable :: sol_w_l, sol_w_r, norm_list, xq_list
     real(kind=DOUBLE), dimension(:), allocatable :: lambda_l, lambda_r, weight
-    real(kind=DOUBLE), dimension(3) :: v_node, v_node_avg
+    real(kind=DOUBLE), dimension(3) :: v_node, v_node_avg, v_node_q
     real(kind=DOUBLE), dimension(3, 3) :: gradv_node
     real(kind=DOUBLE), dimension(5) :: u_node_avg
     real(kind=DOUBLE) :: rho_node_avg, vol_sum
@@ -699,7 +699,9 @@ contains
           case (1)
             ! Same as ns: zero normal nodal velocity on wall sub-faces
             ! (re == 0 is the default wall in compute_right_state)
-            vn_nodal = dot_product(v_node, norm)
+            v_node_q = v_node + matmul(gradv_node, &
+              qpw(1:3,1,id_sub_face) - mesh%vert(i)%coord)
+            vn_nodal = dot_product(v_node_q, norm)
             if (ir == 0) then
               vn_nodal = 0.0_DOUBLE
             else if (ir < 0) then

@@ -1333,7 +1333,8 @@ contains
         pr = sol_w_r(5, j)
         ar = sound_speed_w(sol_w_r(:, j))
 
-        vn_star = dot_product(v_node, norm(:, j))
+        gradv_dx = matmul(gradv_node, xq(:, j) - xp)
+        vn_star = dot_product(v_node + gradv_dx, norm(:, j))
 
         lambda_l(j) = max(lambda_l(j), al*rhol*(1.0_DOUBLE &
           + 1.5_DOUBLE*max(0.0_DOUBLE, -(vn_star - vn_l)/al)))
@@ -1344,7 +1345,6 @@ contains
 
         mat = mat + weight(j)*(lambda_r(j)+lambda_l(j))&
           *tensor_product_3(norm(:, j), norm(:, j))
-        gradv_dx = matmul(gradv_node, xq(:, j) - xp)
         v_bar_xq = v_bar - dot_product(norm(:, j), gradv_dx)
         rhs = rhs + weight(j)*(lambda_r(j)+lambda_l(j))&
           *v_bar_xq*norm(:, j)
