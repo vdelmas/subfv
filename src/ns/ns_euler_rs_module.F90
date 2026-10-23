@@ -1251,7 +1251,7 @@ contains
   end subroutine compute_lambdas_and_solve_nodal_velocity_new
 
   subroutine compute_lambdas_and_solve_nodal_velocity_xq(ng, weight, norm, &
-      lambda_l, lambda_r, sol_w_l, sol_w_r, v_node, gradv_node)
+      lambda_l, lambda_r, sol_w_l, sol_w_r, v_node, gradv_node, xq, xp)
     use ns_global_data_module, only: bc_style, boundary_2d
     use linear_solver_module
     implicit none
@@ -1263,12 +1263,15 @@ contains
     real(kind=DOUBLE), dimension(3, ng), intent(in) :: norm
     real(kind=DOUBLE), dimension(3,3), intent(in) :: gradv_node
     real(kind=DOUBLE), dimension(3), intent(inout) :: v_node
+    real(kind=DOUBLE), dimension(3, ng), intent(in) :: xq
+    real(kind=DOUBLE), dimension(3), intent(in) :: xp
 
     integer(kind=ENTIER) :: iter, j
     real(kind=DOUBLE) :: rhol, vn_l, pl, al
     real(kind=DOUBLE) :: rhor, vn_r, pr, ar
     real(kind=DOUBLE) :: v_bar, vn_star
-    real(kind=DOUBLE), dimension(3) :: rhs
+    real(kind=DOUBLE), dimension(3) :: rhs, gradv_dx
+    real(kind=DOUBLE) :: v_bar_xq
     real(kind=DOUBLE), dimension(3, 3) :: mat
 
     !Init lambdas with two-point positivity conditions 
@@ -1305,8 +1308,10 @@ contains
 
       mat = mat + weight(j)*(lambda_r(j)+lambda_l(j))&
         *tensor_product_3(norm(:, j), norm(:, j))
+      gradv_dx = matmul(gradv_node, xq(:, j) - xp)
+      v_bar_xq = v_bar - dot_product(norm(:, j), gradv_dx)
       rhs = rhs + weight(j)*(lambda_r(j)+lambda_l(j))&
-        *v_bar*norm(:, j)
+        *v_bar_xq*norm(:, j)
     end do
     call pseudo_inverse_inplace_lapack(3, mat)
     v_node = matmul(mat, rhs)
@@ -1339,8 +1344,10 @@ contains
 
         mat = mat + weight(j)*(lambda_r(j)+lambda_l(j))&
           *tensor_product_3(norm(:, j), norm(:, j))
+        gradv_dx = matmul(gradv_node, xq(:, j) - xp)
+        v_bar_xq = v_bar - dot_product(norm(:, j), gradv_dx)
         rhs = rhs + weight(j)*(lambda_r(j)+lambda_l(j))&
-          *v_bar*norm(:, j)
+          *v_bar_xq*norm(:, j)
       end do
       call pseudo_inverse_inplace_lapack(3, mat)
       v_node = matmul(mat, rhs)

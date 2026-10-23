@@ -605,9 +605,12 @@ contains
     logical :: is_zsubface
 
     integer(kind=ENTIER) :: ng
-    real(kind=DOUBLE), dimension(:, :), allocatable :: sol_w_l, sol_w_r, norm_list
+    real(kind=DOUBLE), dimension(:, :), allocatable :: sol_w_l, sol_w_r, norm_list, xq_list
     real(kind=DOUBLE), dimension(:), allocatable :: lambda_l, lambda_r, weight
-    real(kind=DOUBLE), dimension(3) :: v_node
+    real(kind=DOUBLE), dimension(3) :: v_node, v_node_avg
+    real(kind=DOUBLE), dimension(3, 3) :: gradv_node
+    real(kind=DOUBLE), dimension(5) :: u_node_avg
+    real(kind=DOUBLE) :: rho_node_avg, vol_sum
     real(kind=DOUBLE) :: vn_nodal, sl, sr, area
 
 
@@ -621,6 +624,7 @@ contains
       allocate(lambda_r(ng))
       allocate(weight(ng))
       allocate(norm_list(3, ng))
+      allocate(xq_list(3, ng))
     
 
       do j = 1, mesh%vert(i)%n_sub_faces_neigh
@@ -649,11 +653,36 @@ contains
         lambda_r(j) = 0.0_DOUBLE
         weight(j) = qpw(4,1,id_sub_face)
         norm_list(:, j) = norm
+        xq_list(:, j) = qpw(1:3,1,id_sub_face)
       end do
+
+      ! grad_p is primitive at order 2 and conservative at order 3+.
+      if (order == 2) then
+        gradv_node = grad_p(2:4, :, i)
+      else
+        u_node_avg = 0.0_DOUBLE
+        vol_sum = 0.0_DOUBLE
+        do j = 1, mesh%vert(i)%n_elems_neigh
+          il = mesh%vert(i)%elem_neigh(j)
+          u_node_avg = u_node_avg + mesh%elem(il)%volume * sol(:, il)
+          vol_sum = vol_sum + mesh%elem(il)%volume
+        end do
+        if (vol_sum > 0.0_DOUBLE) then
+          u_node_avg = u_node_avg / vol_sum
+          rho_node_avg = max(u_node_avg(1), tiny(1.0_DOUBLE))
+          v_node_avg = u_node_avg(2:4) / rho_node_avg
+          do j = 1, 3
+            gradv_node(:, j) = (grad_p(2:4, j, i) - v_node_avg * grad_p(1, j, i)) / rho_node_avg
+          end do
+        else
+          gradv_node = 0.0_DOUBLE
+        end if
+      end if
 
       !Solve the nodal system 
       call compute_lambdas_and_solve_nodal_velocity_xq(ng, weight,&
-         norm_list, lambda_l, lambda_r, sol_w_l, sol_w_r, v_node, grad_p)
+         norm_list, lambda_l, lambda_r, sol_w_l, sol_w_r, v_node, gradv_node, &
+         xq_list, mesh%vert(i)%coord)
 
       !Compute flux integral on subface
       do j = 1, mesh%vert(i)%n_sub_faces_neigh
@@ -781,7 +810,7 @@ contains
         end select
       end do
 
-      deallocate(sol_w_l, sol_w_r, lambda_l, lambda_r, weight, norm_list)
+      deallocate(sol_w_l, sol_w_r, lambda_l, lambda_r, weight, norm_list, xq_list)
     end do
   end subroutine subface_flux_loop
 
