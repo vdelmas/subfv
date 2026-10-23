@@ -31,6 +31,8 @@ program main
 
     real(kind=DOUBLE), allocatable :: grad(:, :, :)  ! (5, 3, n_elems)
     real(kind=DOUBLE), allocatable :: hess(:, :, :, :) ! (5, 3, 3, n_elems)
+    real(kind=DOUBLE), allocatable :: grad_p(:, :, :)  ! (5, 3, n_vert)
+    real(kind=DOUBLE), allocatable :: hess_p(:, :, :, :) ! (5, 3, 3, n_vert)
 
     real(kind=DOUBLE), dimension(:,:,:), allocatable :: qpw, qpw_face, qpw_vol
 
@@ -57,6 +59,8 @@ program main
     allocate(sol(5,mesh%n_elems))
     allocate(grad(5,3,mesh%n_elems))
     allocate(hess(5,3,3,mesh%n_elems))
+    allocate(grad_p(5,3,mesh%n_vert))
+    allocate(hess_p(5,3,3,mesh%n_vert))
     allocate(sol_w(5,mesh%n_elems))
     allocate(rhs(5,mesh%n_elems))
     allocate(sum_lambda(mesh%n_elems))
@@ -102,7 +106,7 @@ program main
       do i=1, mesh%n_elems
         sol_w(:,i) = conserv_to_primit(sol(:,i))
       end do
-      call compute_rhs(mesh, qpw, sol, sol_w, grad, hess, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+      call compute_rhs(mesh, qpw, sol, sol_w, grad, hess, grad_p, hess_p, rhs, sum_lambda, t, num_procs, mpi_send_recv)
       call compute_dt(mesh, sum_lambda, dt)
       call MPI_ALLREDUCE(MPI_IN_PLACE, dt, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
       if (t + dt > tmax) dt = tmax - t
@@ -122,7 +126,7 @@ program main
           do i=1, mesh%n_elems
             sol_w(:,i) = conserv_to_primit(sol1(:,i))
           end do
-          call compute_rhs(mesh, qpw, sol1, sol_w, grad, hess, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+          call compute_rhs(mesh, qpw, sol1, sol_w, grad, hess, grad_p, hess_p, rhs, sum_lambda, t, num_procs, mpi_send_recv)
           sol = 0.5_DOUBLE * sol + 0.5_DOUBLE * (sol1 + dt * rhs)
           if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)
           ! 
@@ -135,14 +139,14 @@ program main
           do i=1, mesh%n_elems
             sol_w(:,i) = conserv_to_primit(sol1(:,i))
           end do
-          call compute_rhs(mesh, qpw, sol1, sol_w, grad, hess, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+          call compute_rhs(mesh, qpw, sol1, sol_w, grad, hess, grad_p, hess_p, rhs, sum_lambda, t, num_procs, mpi_send_recv)
           sol2 = 0.75_DOUBLE * sol + 0.25_DOUBLE * (sol1 + dt * rhs)
           if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol2)
           ! Third step of SSP RK 
           do i=1, mesh%n_elems
             sol_w(:,i) = conserv_to_primit(sol2(:,i))
           end do
-          call compute_rhs(mesh, qpw, sol2, sol_w, grad, hess, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+          call compute_rhs(mesh, qpw, sol2, sol_w, grad, hess, grad_p, hess_p, rhs, sum_lambda, t, num_procs, mpi_send_recv)
           sol  = (1.0_DOUBLE/3.0_DOUBLE) * sol + (2.0_DOUBLE/3.0_DOUBLE) * (sol2 + dt * rhs)
           if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)
           !

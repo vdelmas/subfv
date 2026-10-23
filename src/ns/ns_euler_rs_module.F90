@@ -1249,6 +1249,104 @@ contains
 
     end do
   end subroutine compute_lambdas_and_solve_nodal_velocity_new
+
+  subroutine compute_lambdas_and_solve_nodal_velocity_xq(ng, weight, norm, &
+      lambda_l, lambda_r, sol_w_l, sol_w_r, v_node, gradv_node)
+    use ns_global_data_module, only: bc_style, boundary_2d
+    use linear_solver_module
+    implicit none
+
+    integer(kind=ENTIER), intent(in) :: ng
+    real(kind=DOUBLE), dimension(ng), intent(in) :: weight
+    real(kind=DOUBLE), dimension(ng), intent(inout) :: lambda_l, lambda_r
+    real(kind=DOUBLE), dimension(5, ng), intent(in) :: sol_w_l, sol_w_r
+    real(kind=DOUBLE), dimension(3, ng), intent(in) :: norm
+    real(kind=DOUBLE), dimension(3,3), intent(in) :: gradv_node
+    real(kind=DOUBLE), dimension(3), intent(inout) :: v_node
+
+    integer(kind=ENTIER) :: iter, j
+    real(kind=DOUBLE) :: rhol, vn_l, pl, al
+    real(kind=DOUBLE) :: rhor, vn_r, pr, ar
+    real(kind=DOUBLE) :: v_bar, vn_star
+    real(kind=DOUBLE), dimension(3) :: rhs
+    real(kind=DOUBLE), dimension(3, 3) :: mat
+
+    !Init lambdas with two-point positivity conditions 
+    !and Duckowitz correction
+    mat(:, :) = 0.0_DOUBLE
+    rhs(:) = 0.0_DOUBLE
+    do j=1, ng
+      rhol = sol_w_l(1, j)
+      vn_l = dot_product(sol_w_l(2:4, j), norm(:, j))
+      pl = sol_w_l(5, j)
+      al = sound_speed_w(sol_w_l(:, j))
+
+      rhor = sol_w_r(1, j)
+      vn_r = dot_product(sol_w_r(2:4, j), norm(:, j))
+      pr = sol_w_r(5, j)
+      ar = sound_speed_w(sol_w_r(:, j))
+
+      lambda_l(j) = max(al*rhol, &
+        sqrt(rhol*max(0.0_DOUBLE, pr - pl)), &
+        -rhol*(vn_r - vn_l))
+      lambda_r(j) = max(ar*rhor, &
+        sqrt(rhor*max(0.0_DOUBLE, pl - pr)), &
+        -rhor*(vn_r - vn_l))
+      v_bar = (lambda_l(j)*vn_l + lambda_r(j)*vn_r - (pr - pl))&
+        /(lambda_r(j) + lambda_l(j))
+
+      !Duckowitz correction
+      lambda_l(j) = max(lambda_l(j), al*rhol*(1.0_DOUBLE &
+        + 1.5_DOUBLE*max(0.0_DOUBLE, -(v_bar - vn_l)/al)))
+      lambda_r(j) = max(lambda_r(j), ar*rhor*(1.0_DOUBLE &
+        + 1.5_DOUBLE*max(0.0_DOUBLE, (v_bar - vn_r)/ar)))
+      v_bar = (lambda_l(j)*vn_l + lambda_r(j)*vn_r - (pr - pl))&
+        /(lambda_r(j) + lambda_l(j))
+
+      mat = mat + weight(j)*(lambda_r(j)+lambda_l(j))&
+        *tensor_product_3(norm(:, j), norm(:, j))
+      rhs = rhs + weight(j)*(lambda_r(j)+lambda_l(j))&
+        *v_bar*norm(:, j)
+    end do
+    call pseudo_inverse_inplace_lapack(3, mat)
+    v_node = matmul(mat, rhs)
+
+    iter = 0
+    do while (iter < 4)
+      iter = iter + 1
+
+      mat(:, :) = 0.0_DOUBLE
+      rhs(:) = 0.0_DOUBLE
+      do j = 1, ng
+        rhol = sol_w_l(1, j)
+        vn_l = dot_product(sol_w_l(2:4, j), norm(:, j))
+        pl = sol_w_l(5, j)
+        al = sound_speed_w(sol_w_l(:, j))
+
+        rhor = sol_w_r(1, j)
+        vn_r = dot_product(sol_w_r(2:4, j), norm(:, j))
+        pr = sol_w_r(5, j)
+        ar = sound_speed_w(sol_w_r(:, j))
+
+        vn_star = dot_product(v_node, norm(:, j))
+
+        lambda_l(j) = max(lambda_l(j), al*rhol*(1.0_DOUBLE &
+          + 1.5_DOUBLE*max(0.0_DOUBLE, -(vn_star - vn_l)/al)))
+        lambda_r(j) = max(lambda_r(j), ar*rhor*(1.0_DOUBLE &
+          + 1.5_DOUBLE*max(0.0_DOUBLE, (vn_star - vn_r)/ar)))
+        v_bar = (lambda_l(j)*vn_l + lambda_r(j)*vn_r - (pr - pl)) &
+          /(lambda_r(j) + lambda_l(j))
+
+        mat = mat + weight(j)*(lambda_r(j)+lambda_l(j))&
+          *tensor_product_3(norm(:, j), norm(:, j))
+        rhs = rhs + weight(j)*(lambda_r(j)+lambda_l(j))&
+          *v_bar*norm(:, j)
+      end do
+      call pseudo_inverse_inplace_lapack(3, mat)
+      v_node = matmul(mat, rhs)
+
+    end do
+  end subroutine compute_lambdas_and_solve_nodal_velocity_xq
   ! ---------------------------------------------------------------------------
   ! VILAR degenerate case: single nodal intermediate state U_p^*
   ! U_p^* = sum_pf A_pf*(sr*U_r - sl*U_l + fl - fr) / sum_pf A_pf*(sr - sl)

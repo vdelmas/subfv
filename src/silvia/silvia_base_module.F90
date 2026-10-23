@@ -541,7 +541,7 @@ contains
     end do
   end subroutine compute_dt
 
-  subroutine compute_rhs(mesh, qpw, sol, prim, grad, hess, rhs, sum_lambda, t, &
+  subroutine compute_rhs(mesh, qpw, sol, prim, grad, hess, grad_p, hess_p, rhs, sum_lambda, t, &
       num_procs, mpi_send_recv)
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(:, :, :), intent(in) :: qpw
@@ -549,6 +549,8 @@ contains
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: prim
     real(kind=DOUBLE), dimension(5, 3, mesh%n_elems), intent(inout) :: grad
     real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(inout) :: hess
+    real(kind=DOUBLE), dimension(5, 3, mesh%n_vert), intent(inout) :: grad_p
+    real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(inout) :: hess_p
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(out) :: rhs
     real(kind=DOUBLE), dimension(mesh%n_elems),    intent(out) :: sum_lambda
     real(kind=DOUBLE), intent(in) :: t
@@ -560,24 +562,26 @@ contains
 
     grad = 0.0_DOUBLE
     hess = 0.0_DOUBLE
+    grad_p = 0.0_DOUBLE
+    if (allocated(hess_p)) hess_p = 0.0_DOUBLE
     reconstruction_data = prim
     if (order >= 3) reconstruction_data = sol
-    if (order >= 2) call aho_reconstruction(mesh, reconstruction_data, grad, hess, num_procs, mpi_send_recv)
+    if (order >= 2) call aho_reconstruction(mesh, reconstruction_data, grad, hess, grad_p, hess_p, num_procs, mpi_send_recv)
 
     !BJ
 
     rhs        = 0.0_DOUBLE
     sum_lambda = 0.0_DOUBLE
-    call subface_flux_loop(mesh, qpw, sol, reconstruction_data, grad, hess, rhs, sum_lambda, t)
+    call subface_flux_loop(mesh, qpw, sol, reconstruction_data, grad, hess, grad_p, rhs, sum_lambda, t)
 
     do i = 1, mesh%n_elems
       rhs(:, i) = rhs(:, i) / mesh%elem(i)%volume
     end do
   end subroutine compute_rhs
 
-  subroutine subface_flux_loop(mesh, qpw, sol, prim, grad, hess, rhs, sum_lambda, t)
+  subroutine subface_flux_loop(mesh, qpw, sol, prim, grad, hess, grad_p, rhs, sum_lambda, t)
     use ns_euler_rs_module, only: compute_lambdas_and_solve_nodal_velocity_new, &
-      multi_point
+      compute_lambdas_and_solve_nodal_velocity_xq, multi_point
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -585,6 +589,7 @@ contains
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: sol, prim
     real(kind=DOUBLE), dimension(5, 3, mesh%n_elems), intent(in) :: grad
     real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(in) :: hess
+    real(kind=DOUBLE), dimension(5, 3, mesh%n_vert), intent(in) :: grad_p
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(inout) :: rhs
     real(kind=DOUBLE), dimension(mesh%n_elems),    intent(inout) :: sum_lambda
     real(kind=DOUBLE), intent(in) :: t
@@ -647,8 +652,8 @@ contains
       end do
 
       !Solve the nodal system 
-      call compute_lambdas_and_solve_nodal_velocity_new(ng, weight,&
-         norm_list, lambda_l, lambda_r, sol_w_l, sol_w_r, v_node)
+      call compute_lambdas_and_solve_nodal_velocity_xq(ng, weight,&
+         norm_list, lambda_l, lambda_r, sol_w_l, sol_w_r, v_node, grad_p)
 
       !Compute flux integral on subface
       do j = 1, mesh%vert(i)%n_sub_faces_neigh
@@ -1306,24 +1311,29 @@ end subroutine three_wave
   ! aho_reconstruction: Green-Gauss nodal derivatives blended to the cells.
   ! grad is exchanged across MPI ranks before being differentiated again,
   ! since a ghost cell's vertex stencil can be incomplete.
-  subroutine aho_reconstruction(mesh, prim, grad, hess, num_procs, mpi_send_recv)
+  subroutine aho_reconstruction(mesh, prim, grad, hess, grad_p, hess_p, num_procs, mpi_send_recv)
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: prim
     real(kind=DOUBLE), dimension(5, 3, mesh%n_elems), intent(inout) :: grad
     real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(inout) :: hess
+    real(kind=DOUBLE), dimension(5, 3, mesh%n_vert), intent(inout) :: grad_p
+    real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(inout) :: hess_p
     integer, intent(in) :: num_procs
     type(mpi_send_recv_type), intent(inout) :: mpi_send_recv
 
     real(kind=DOUBLE), dimension(:, :), allocatable :: grad_flat, hess_flat
+    real(kind=DOUBLE), dimension(:, :), allocatable :: grad_p_flat, hess_p_flat
     integer(kind=ENTIER) :: e, v, dir1, dir2
 
     aho_use_green_gauss = .true.
 
     ! Flat layout of the aho module: component (dir-1)*nc_in + v
     allocate(grad_flat(15, mesh%n_elems))
+    allocate(grad_p_flat(15, mesh%n_vert))
     call compute_next_order_derivative(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, &
-      prim, grad_flat, deriv_order=1_ENTIER)
+      prim, grad_flat, deriv_order=1_ENTIER, dphi_v_out=grad_p_flat)
     if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 15_ENTIER, grad_flat)
+    if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_vert, 15_ENTIER, grad_p_flat)
 
     do e = 1, mesh%n_elems
       do dir1 = 1, 3
@@ -1332,12 +1342,21 @@ end subroutine three_wave
         end do
       end do
     end do
+    do e = 1, mesh%n_vert
+      do dir1 = 1, 3
+        do v = 1, 5
+          grad_p(v, dir1, e) = grad_p_flat((dir1-1)*5 + v, e)
+        end do
+      end do
+    end do
 
-    if (order >= 3 .and. allocated(hess)) then
+    if (order >= 3 .and. allocated(hess) .and. allocated(hess_p)) then
       allocate(hess_flat(45, mesh%n_elems))
+      allocate(hess_p_flat(45, mesh%n_vert))
       call compute_next_order_derivative(mesh, 3_ENTIER, 15_ENTIER, boundary_2d, &
-        grad_flat, hess_flat, deriv_order=2_ENTIER)
+        grad_flat, hess_flat, deriv_order=2_ENTIER, dphi_v_out=hess_p_flat)
       if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 45_ENTIER, hess_flat)
+      if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_vert, 45_ENTIER, hess_p_flat)
 
       do e = 1, mesh%n_elems
         do dir2 = 1, 3
@@ -1349,6 +1368,16 @@ end subroutine three_wave
         end do
       end do
       deallocate(hess_flat)
+      do e = 1, mesh%n_vert
+        do dir2 = 1, 3
+          do dir1 = 1, 3
+            do v = 1, 5
+              hess_p(v, dir1, dir2, e) = hess_p_flat((dir2-1)*15 + (dir1-1)*5 + v, e)
+            end do
+          end do
+        end do
+      end do
+      deallocate(hess_p_flat)
     end if
 
     deallocate(grad_flat)
