@@ -546,6 +546,97 @@ contains
     lr_flux(:, 2) = -lr_flux(:, 2)
   end subroutine multi_point
 
+    subroutine multi_point_ener(sol_w_l, sol_w_r, n, lr_flux, vn_nodal, e_nodal, &
+      lambda_l, lambda_r, sl, sr)
+    implicit none
+
+    real(kind=DOUBLE), intent(in) :: vn_nodal, e_nodal
+    real(kind=DOUBLE), dimension(5), intent(in) :: sol_w_l, sol_w_r
+    real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), dimension(5) :: sol_l, sol_r
+    real(kind=DOUBLE), intent(inout) :: lambda_l, lambda_r
+    real(kind=DOUBLE), dimension(5, 2), intent(inout) :: lr_flux
+    real(kind=DOUBLE), intent(inout) :: sl, sr
+
+    real(kind=DOUBLE) :: rhol, rhor, vn_l, vn_r
+    real(kind=DOUBLE) :: pl, pr, rhol_et, rhor_et
+    real(kind=DOUBLE) :: v_et, el, er
+    real(kind=DOUBLE) :: v_bar, pl_bar, pr_bar, pvl_bar, pvr_bar
+    real(kind=DOUBLE), dimension(5) :: fl, fr
+    real(kind=DOUBLE), dimension(5) :: sol_l_et, sol_r_et
+
+    rhol = sol_w_l(1)
+    vn_l = dot_product(sol_w_l(2:4), n)
+    pl = sol_w_l(5)
+    sol_l = primit_to_conserv(sol_w_l)
+    el = sol_l(5)/rhol
+
+    rhor = sol_w_r(1)
+    vn_r = dot_product(sol_w_r(2:4), n)
+    pr = sol_w_r(5)
+    sol_r = primit_to_conserv(sol_w_r)
+    er = sol_r(5)/rhor
+
+    fl(1)   = vn_l*sol_l(1)
+    fl(2:4) = vn_l*sol_l(2:4) + pl*n
+    fl(5)   = (sol_l(5) + pl)*vn_l
+
+    fr(1)   = vn_r*sol_r(1)
+    fr(2:4) = vn_r*sol_r(2:4) + pr*n
+    fr(5)   = (sol_r(5) + pr)*vn_r
+
+    v_bar = (lambda_l*vn_l + lambda_r*vn_r - (pr - pl))/(lambda_r + lambda_l)
+
+    v_et = vn_nodal
+
+    rhol_et = 1.0_DOUBLE/(1.0_DOUBLE/rhol + (v_et - vn_l)/lambda_l)
+    pl_bar = pl - lambda_l*(v_et - vn_l)
+    pvl_bar = pl*vn_l - lambda_l*(e_nodal - el)
+
+    sol_l_et(1)   = rhol_et
+    sol_l_et(2:4) = rhol_et*(sol_w_l(2:4) + (v_et - vn_l)*n)
+    !sol_l_et(5)   = rhol_et*(el + (pl*vn_l - pl_bar*v_et)/lambda_l)
+    sol_l_et(5)   = rhol_et*e_nodal
+
+    rhor_et = 1.0_DOUBLE/(1.0_DOUBLE/rhor + (vn_r - v_et)/lambda_r)
+    pr_bar = pr + lambda_r*(v_et - vn_r)
+    pvr_bar = pr*vn_r + lambda_r*(e_nodal - er)
+
+    sol_r_et(1)   = rhor_et
+    sol_r_et(2:4) = rhor_et*(sol_w_r(2:4) + (v_et - vn_r)*n)
+    !sol_r_et(5)   = rhor_et*(er + (pr_bar*v_et - pr*vn_r)/lambda_r)
+    sol_r_et(5)   = rhor_et*e_nodal
+
+    if (rhol_et < 0.0_DOUBLE .or. rhor_et < 0.0_DOUBLE) then
+      print *, "Negative specific volume MPCC !", rhol_et, rhor_et
+      print*, rhol, rhor
+      print*, lambda_l, lambda_r
+      print*, sol_l_et(2:4)/rhol_et
+      print*, sol_r_et(2:4)/rhor_et
+      print*,"R"
+      print*, 1.0_DOUBLE/rhor, (vn_r - v_et)/lambda_r
+      error stop
+    end if
+
+    sl = vn_l - lambda_l/rhol
+    sr = vn_r + lambda_r/rhor
+
+    lr_flux(:, 1) = 0.5_DOUBLE*(fl + fr) - 0.5_DOUBLE* &
+      (abs(sl)*(sol_l_et - sol_l) + &
+      abs(v_et)*(sol_r_et - sol_l_et) + &
+      abs(sr)*(sol_r - sol_r_et)) &
+      - 0.5_DOUBLE*(/0.0_DOUBLE, (pr_bar - pl_bar)*n, pvr_bar - pvl_bar/)
+
+    lr_flux(:, 2) = 0.5_DOUBLE*(fl + fr) - 0.5_DOUBLE* &
+      (abs(sl)*(sol_l_et - sol_l) + &
+      abs(v_et)*(sol_r_et - sol_l_et) + &
+      abs(sr)*(sol_r - sol_r_et)) &
+      + 0.5_DOUBLE*(/0.0_DOUBLE, (pr_bar - pl_bar)*n, pvr_bar - pvl_bar/)
+
+
+    lr_flux(:, 2) = -lr_flux(:, 2)
+  end subroutine multi_point_ener
+
   ! Reference:
   !   L. Tallois, "Enthalpy preserving Simple Riemann solvers for steady hypersonic flows",
   !   CEA-CESTA preprint, June 2026 (papers/talois.pdf), section 5.
@@ -1354,6 +1445,59 @@ contains
 
     end do
   end subroutine compute_lambdas_and_solve_nodal_velocity_xq
+
+  !Solver for the new scheme nodal energy
+  subroutine compute_lambdas_and_solve_nodal_ener_xq(ng, weight, norm, &
+      lambda_l, lambda_r, sol_w_l, sol_w_r, e_node, grade_node, xq, xp)
+    use ns_global_data_module, only: bc_style, boundary_2d
+    use linear_solver_module
+    implicit none
+
+    integer(kind=ENTIER), intent(in) :: ng
+    real(kind=DOUBLE), dimension(ng), intent(in) :: weight
+    real(kind=DOUBLE), dimension(ng), intent(in) :: lambda_l, lambda_r
+    real(kind=DOUBLE), dimension(5, ng), intent(in) :: sol_w_l, sol_w_r
+    real(kind=DOUBLE), dimension(3, ng), intent(in) :: norm
+    real(kind=DOUBLE), dimension(3), intent(in) :: grade_node
+    real(kind=DOUBLE), intent(inout) :: e_node
+    real(kind=DOUBLE), dimension(3, ng), intent(in) :: xq
+    real(kind=DOUBLE), dimension(3), intent(in) :: xp
+
+    integer(kind=ENTIER) :: iter, j
+    real(kind=DOUBLE) :: rhol, vn_l, pl, al, el
+    real(kind=DOUBLE) :: rhor, vn_r, pr, ar, er
+    real(kind=DOUBLE) :: v_bar, vn_star, e_bar
+    real(kind=DOUBLE), dimension(3) :: rhs, gradv_dx
+    real(kind=DOUBLE) :: v_bar_xq, denom
+    real(kind=DOUBLE), dimension(3, 3) :: mat
+    real(kind=DOUBLE), dimension(5) :: sol_l, sol_r
+
+
+    e_node = 0.0_DOUBLE
+    do j=1, ng
+      rhol = sol_w_l(1, j)
+      vn_l = dot_product(sol_w_l(2:4, j), norm(:, j))
+      pl = sol_w_l(5, j)
+      al = sound_speed_w(sol_w_l(:, j))
+      sol_l = primit_to_conserv(sol_w_l(:, j))
+      el = sol_l(5)/sol_l(1)
+
+      rhor = sol_w_r(1, j)
+      vn_r = dot_product(sol_w_r(2:4, j), norm(:, j))
+      pr = sol_w_r(5, j)
+      ar = sound_speed_w(sol_w_r(:, j))
+      sol_r = primit_to_conserv(sol_w_r(:, j))
+      er = sol_r(5)/sol_r(1)
+
+      e_bar = (lambda_l(j)*el + lambda_r(j)*er - (pr*vn_r - pl*vn_l))&
+        /(lambda_r(j) + lambda_l(j))
+      e_bar = e_bar - dot_product(grade_node, xq(:, j) - xp)
+      e_node = e_node + weight(j)*(lambda_r(j)+lambda_l(j))*e_bar
+      denom = denom + weight(j)*(lambda_r(j)+lambda_l(j))
+    end do
+    e_node = e_node / denom
+  end subroutine compute_lambdas_and_solve_nodal_ener_xq
+
   ! ---------------------------------------------------------------------------
   ! VILAR degenerate case: single nodal intermediate state U_p^*
   ! U_p^* = sum_pf A_pf*(sr*U_r - sl*U_l + fl - fr) / sum_pf A_pf*(sr - sl)

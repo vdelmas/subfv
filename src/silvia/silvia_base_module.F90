@@ -581,7 +581,9 @@ contains
 
   subroutine subface_flux_loop(mesh, qpw, sol, prim, grad, hess, grad_p, rhs, sum_lambda, t)
     use ns_euler_rs_module, only: compute_lambdas_and_solve_nodal_velocity_new, &
-      compute_lambdas_and_solve_nodal_velocity_xq, multi_point
+      compute_lambdas_and_solve_nodal_velocity_xq, multi_point, &
+      compute_lambdas_and_solve_nodal_ener_xq, multi_point_ener
+
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -607,10 +609,10 @@ contains
     integer(kind=ENTIER) :: ng
     real(kind=DOUBLE), dimension(:, :), allocatable :: sol_w_l, sol_w_r, norm_list, xq_list
     real(kind=DOUBLE), dimension(:), allocatable :: lambda_l, lambda_r, weight
-    real(kind=DOUBLE), dimension(3) :: v_node, v_node_avg, v_node_q
+    real(kind=DOUBLE), dimension(3) :: v_node, v_node_avg, v_node_q, grade_node
     real(kind=DOUBLE), dimension(3, 3) :: gradv_node
     real(kind=DOUBLE), dimension(5) :: u_node_avg
-    real(kind=DOUBLE) :: rho_node_avg, vol_sum
+    real(kind=DOUBLE) :: rho_node_avg, vol_sum, er, el, e_node, e_node_q
     real(kind=DOUBLE) :: vn_nodal, sl, sr, area
 
 
@@ -657,9 +659,33 @@ contains
       end do
 
       ! grad_p is primitive at order 2 and conservative at order 3+.
-      if (order == 2) then
+      gradv_node = 0.0_DOUBLE
+      grade_node = 0.0_DOUBLE
+      if (order == 2) then !MODIF
         gradv_node = grad_p(2:4, :, i)
-      else
+
+        !grade
+        grade_node = 0.0_DOUBLE
+        do j = 1, mesh%vert(i)%n_sub_faces_neigh
+          id_sub_face = mesh%vert(i)%sub_face_neigh(j)
+          id_face = mesh%sub_face(id_sub_face)%mesh_face
+          il   = mesh%sub_face(id_sub_face)%left_elem_neigh
+          ir   = mesh%sub_face(id_sub_face)%right_elem_neigh
+          norm = mesh%sub_face(id_sub_face)%norm
+          area = mesh%sub_face(id_sub_face)%area
+          sol_l = sol(:, il)
+          if ( ir > 0 ) then
+            sol_r = sol(:, ir)
+          else
+            call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
+          end if
+          er = sol_r(5)/sol_r(1)
+          el = sol_l(5)/sol_l(1)
+          grade_node = grade_node + area*(er-el)*norm
+        end do
+        grade_node = grade_node / mesh%vert(i)%volume
+
+      else if ( order == 3 ) then
         u_node_avg = 0.0_DOUBLE
         vol_sum = 0.0_DOUBLE
         do j = 1, mesh%vert(i)%n_elems_neigh
@@ -680,8 +706,13 @@ contains
       end if
 
       !Solve the nodal system 
+      !call compute_lambdas_and_solve_nodal_velocity_new(ng, weight,&
+      !  norm_list, lambda_l, lambda_r, sol_w_l, sol_w_r, v_node)
       call compute_lambdas_and_solve_nodal_velocity_xq(ng, weight,&
-         norm_list, lambda_l, lambda_r, sol_w_l, sol_w_r, v_node, gradv_node, &
+        norm_list, lambda_l, lambda_r, sol_w_l, sol_w_r, v_node, gradv_node, &
+         xq_list, mesh%vert(i)%coord)
+      call compute_lambdas_and_solve_nodal_ener_xq(ng, weight,&
+        norm_list, lambda_l, lambda_r, sol_w_l, sol_w_r, e_node, grade_node, &
          xq_list, mesh%vert(i)%coord)
 
       !Compute flux integral on subface
@@ -707,7 +738,10 @@ contains
             else if (ir < 0) then
               if (bc_euler_id(-ir) == BC_EULER_WALL) vn_nodal = 0.0_DOUBLE
             end if
-            call multi_point(sol_w_l(:, j), sol_w_r(:, j), norm, lr_flux, vn_nodal, &
+            !call multi_point(sol_w_l(:, j), sol_w_r(:, j), norm, lr_flux, vn_nodal, &
+            !  lambda_l(j), lambda_r(j), sl, sr)
+            e_node_q = e_node + dot_product(grade_node, qpw(1:3,1,id_sub_face) - mesh%vert(i)%coord)
+            call multi_point_ener(sol_w_l(:, j), sol_w_r(:, j), norm, lr_flux, vn_nodal, e_node_q, &
               lambda_l(j), lambda_r(j), sl, sr)
             ! lr_flux is per unit area; lr_flux(:, 2) is already the right cell's
             ! outgoing flux (multi_point negates it)
