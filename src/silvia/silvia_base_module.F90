@@ -1398,7 +1398,7 @@ end subroutine three_wave
     call compute_next_order_derivative(mesh, 3_ENTIER, 5_ENTIER, boundary_2d, &
       prim, grad_flat, deriv_order=1_ENTIER, dphi_v_out=grad_p_flat)
     if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 15_ENTIER, grad_flat)
-    if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_vert, 15_ENTIER, grad_p_flat)
+    if (num_procs > 1) call mpi_memory_exchange_vert_data(mesh, mpi_send_recv, 15_ENTIER, grad_p_flat)
 
     do e = 1, mesh%n_elems
       do dir1 = 1, 3
@@ -1421,7 +1421,7 @@ end subroutine three_wave
       call compute_next_order_derivative(mesh, 3_ENTIER, 15_ENTIER, boundary_2d, &
         grad_flat, hess_flat, deriv_order=2_ENTIER, dphi_v_out=hess_p_flat)
       if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 45_ENTIER, hess_flat)
-      if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_vert, 45_ENTIER, hess_p_flat)
+      if (num_procs > 1) call mpi_memory_exchange_vert_data(mesh, mpi_send_recv, 45_ENTIER, hess_p_flat)
 
       do e = 1, mesh%n_elems
         do dir2 = 1, 3

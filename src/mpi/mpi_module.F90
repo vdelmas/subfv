@@ -218,4 +218,80 @@ contains
 
     call mpi_barrier(mpi_comm_world, mpi_ierr)
   end subroutine mpi_memory_exchange_partial_int
+
+  ! MPI exchange of a vertex-based array data(n_var, n_vert). mpi_memory_exchange
+  ! cannot be used for that: it indexes its array with the ids of the exchanged
+  ! ELEMENTS. Same packing as the mpi_memory_exchange_vert of the lagrange/ale/
+  ! shock_adapt modules (which exchange vert%coord only): every
+  ! vertex of every exchanged element, in element order, which is the same on
+  ! both sides. Only ghost vertices (all neighbouring elements are ghosts, so
+  ! their local stencil is incomplete) take the received value; vertices on the
+  ! partition cut were computed locally from a complete stencil.
+  subroutine mpi_memory_exchange_vert_data(mesh, mpi_send_recv, n_var, data)
+    use mpi
+    use mesh_module, only: mesh_type
+    type(mesh_type), intent(in) :: mesh
+    type(mpi_send_recv_type), intent(inout) :: mpi_send_recv
+    integer(kind=ENTIER), intent(in) :: n_var
+    real(kind=DOUBLE), dimension(n_var, mesh%n_vert), intent(inout) :: data
+
+    integer :: mpi_ierr
+    integer(kind=ENTIER) :: i, k, j, n, id_elem, id_vert
+
+    do i = 1, mpi_send_recv%n_mpi_send_neigh
+      n = 0
+      do k = 1, mpi_send_recv%mpi_send_neigh(i)%n_elems
+        id_elem = mpi_send_recv%mpi_send_neigh(i)%elem_id(k)
+        n = n + mesh%elem(id_elem)%n_vert
+      end do
+      allocate(mpi_send_recv%mpi_send_neigh(i)%sol(n_var, n))
+      n = 0
+      do k = 1, mpi_send_recv%mpi_send_neigh(i)%n_elems
+        id_elem = mpi_send_recv%mpi_send_neigh(i)%elem_id(k)
+        do j = 1, mesh%elem(id_elem)%n_vert
+          n = n + 1
+          mpi_send_recv%mpi_send_neigh(i)%sol(:, n) = data(:, mesh%elem(id_elem)%vert(j))
+        end do
+      end do
+      call mpi_isend(mpi_send_recv%mpi_send_neigh(i)%sol(1, 1), n_var*n, MPI_DOUBLE, &
+        mpi_send_recv%mpi_send_neigh(i)%partition_id, 0, MPI_COMM_WORLD, &
+        mpi_send_recv%mpi_reqsend(i), mpi_ierr)
+    end do
+
+    do i = 1, mpi_send_recv%n_mpi_recv_neigh
+      n = 0
+      do k = 1, mpi_send_recv%mpi_recv_neigh(i)%n_elems
+        id_elem = mpi_send_recv%mpi_recv_neigh(i)%elem_id(k)
+        n = n + mesh%elem(id_elem)%n_vert
+      end do
+      allocate(mpi_send_recv%mpi_recv_neigh(i)%sol(n_var, n))
+      call mpi_irecv(mpi_send_recv%mpi_recv_neigh(i)%sol(1, 1), n_var*n, MPI_DOUBLE, &
+        mpi_send_recv%mpi_recv_neigh(i)%partition_id, MPI_ANY_TAG, MPI_COMM_WORLD, &
+        mpi_send_recv%mpi_reqrecv(i), mpi_ierr)
+    end do
+
+    call mpi_waitall(mpi_send_recv%n_mpi_send_neigh, &
+      mpi_send_recv%mpi_reqsend, mpi_send_recv%mpi_sendstat, mpi_ierr)
+    call mpi_waitall(mpi_send_recv%n_mpi_recv_neigh, &
+      mpi_send_recv%mpi_reqrecv, mpi_send_recv%mpi_recvstat, mpi_ierr)
+
+    do i = 1, mpi_send_recv%n_mpi_recv_neigh
+      n = 0
+      do k = 1, mpi_send_recv%mpi_recv_neigh(i)%n_elems
+        id_elem = mpi_send_recv%mpi_recv_neigh(i)%elem_id(k)
+        do j = 1, mesh%elem(id_elem)%n_vert
+          n = n + 1
+          id_vert = mesh%elem(id_elem)%vert(j)
+          if (mesh%vert(id_vert)%is_ghost) data(:, id_vert) = mpi_send_recv%mpi_recv_neigh(i)%sol(:, n)
+        end do
+      end do
+    end do
+
+    do i = 1, mpi_send_recv%n_mpi_send_neigh
+      deallocate(mpi_send_recv%mpi_send_neigh(i)%sol)
+    end do
+    do i = 1, mpi_send_recv%n_mpi_recv_neigh
+      deallocate(mpi_send_recv%mpi_recv_neigh(i)%sol)
+    end do
+  end subroutine mpi_memory_exchange_vert_data
 end module mpi_module
