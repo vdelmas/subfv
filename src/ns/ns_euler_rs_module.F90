@@ -1474,6 +1474,7 @@ contains
 
 
     e_node = 0.0_DOUBLE
+    denom = 0.0_DOUBLE
     do j=1, ng
       rhol = sol_w_l(1, j)
       vn_l = dot_product(sol_w_l(2:4, j), norm(:, j))
