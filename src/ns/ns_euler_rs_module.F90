@@ -1342,7 +1342,7 @@ contains
   end subroutine compute_lambdas_and_solve_nodal_velocity_new
 
   subroutine compute_lambdas_and_solve_nodal_velocity_xq(ng, weight, norm, &
-      lambda_l, lambda_r, sol_w_l, sol_w_r, v_node, gradv_node, xq, xp)
+      lambda_l, lambda_r, sol_w_l, sol_w_r, v_node, gradv_node, hessv_node, xq, xp)
     use ns_global_data_module, only: bc_style, boundary_2d
     use linear_solver_module
     implicit none
@@ -1353,6 +1353,7 @@ contains
     real(kind=DOUBLE), dimension(5, ng), intent(in) :: sol_w_l, sol_w_r
     real(kind=DOUBLE), dimension(3, ng), intent(in) :: norm
     real(kind=DOUBLE), dimension(3,3), intent(in) :: gradv_node
+    real(kind=DOUBLE), dimension(3,3,3), intent(in) :: hessv_node
     real(kind=DOUBLE), dimension(3), intent(inout) :: v_node
     real(kind=DOUBLE), dimension(3, ng), intent(in) :: xq
     real(kind=DOUBLE), dimension(3), intent(in) :: xp
@@ -1361,7 +1362,7 @@ contains
     real(kind=DOUBLE) :: rhol, vn_l, pl, al
     real(kind=DOUBLE) :: rhor, vn_r, pr, ar
     real(kind=DOUBLE) :: v_bar, vn_star
-    real(kind=DOUBLE), dimension(3) :: rhs, gradv_dx
+    real(kind=DOUBLE), dimension(3) :: rhs, gradv_dx, dx
     real(kind=DOUBLE) :: v_bar_xq
     real(kind=DOUBLE), dimension(3, 3) :: mat
 
@@ -1399,7 +1400,16 @@ contains
 
       mat = mat + weight(j)*(lambda_r(j)+lambda_l(j))&
         *tensor_product_3(norm(:, j), norm(:, j))
-      gradv_dx = matmul(gradv_node, xq(:, j) - xp)
+      dx = xq(:, j) - xp
+      gradv_dx = matmul(gradv_node, dx)
+      block
+        integer(kind=ENTIER) :: k, m
+        do k = 1, 3
+          do m = 1, 3
+            gradv_dx = gradv_dx + 0.5_DOUBLE*hessv_node(:, k, m)*dx(k)*dx(m)
+          end do
+        end do
+      end block
       v_bar_xq = v_bar - dot_product(norm(:, j), gradv_dx)
       rhs = rhs + weight(j)*(lambda_r(j)+lambda_l(j))&
         *v_bar_xq*norm(:, j)
@@ -1424,7 +1434,16 @@ contains
         pr = sol_w_r(5, j)
         ar = sound_speed_w(sol_w_r(:, j))
 
-        gradv_dx = matmul(gradv_node, xq(:, j) - xp)
+        dx = xq(:, j) - xp
+        gradv_dx = matmul(gradv_node, dx)
+        block
+          integer(kind=ENTIER) :: k, m
+          do k = 1, 3
+            do m = 1, 3
+              gradv_dx = gradv_dx + 0.5_DOUBLE*hessv_node(:, k, m)*dx(k)*dx(m)
+            end do
+          end do
+        end block
         vn_star = dot_product(v_node + gradv_dx, norm(:, j))
 
         lambda_l(j) = max(lambda_l(j), al*rhol*(1.0_DOUBLE &
@@ -1448,7 +1467,7 @@ contains
 
   !Solver for the new scheme nodal energy
   subroutine compute_lambdas_and_solve_nodal_ener_xq(ng, weight, norm, &
-      lambda_l, lambda_r, sol_w_l, sol_w_r, e_node, grade_node, xq, xp)
+      lambda_l, lambda_r, sol_w_l, sol_w_r, e_node, grade_node, hesse_node, xq, xp)
     use ns_global_data_module, only: bc_style, boundary_2d
     use linear_solver_module
     implicit none
@@ -1459,6 +1478,7 @@ contains
     real(kind=DOUBLE), dimension(5, ng), intent(in) :: sol_w_l, sol_w_r
     real(kind=DOUBLE), dimension(3, ng), intent(in) :: norm
     real(kind=DOUBLE), dimension(3), intent(in) :: grade_node
+    real(kind=DOUBLE), dimension(3,3), intent(in) :: hesse_node
     real(kind=DOUBLE), intent(inout) :: e_node
     real(kind=DOUBLE), dimension(3, ng), intent(in) :: xq
     real(kind=DOUBLE), dimension(3), intent(in) :: xp
@@ -1467,9 +1487,7 @@ contains
     real(kind=DOUBLE) :: rhol, vn_l, pl, al, el
     real(kind=DOUBLE) :: rhor, vn_r, pr, ar, er
     real(kind=DOUBLE) :: v_bar, vn_star, e_bar
-    real(kind=DOUBLE), dimension(3) :: rhs, gradv_dx
-    real(kind=DOUBLE) :: v_bar_xq, denom
-    real(kind=DOUBLE), dimension(3, 3) :: mat
+    real(kind=DOUBLE) :: denom
     real(kind=DOUBLE), dimension(5) :: sol_l, sol_r
 
 
@@ -1492,7 +1510,17 @@ contains
 
       e_bar = (lambda_l(j)*el + lambda_r(j)*er - (pr*vn_r - pl*vn_l))&
         /(lambda_r(j) + lambda_l(j))
-      e_bar = e_bar - dot_product(grade_node, xq(:, j) - xp)
+      block
+        integer(kind=ENTIER) :: k, m
+        real(kind=DOUBLE), dimension(3) :: dx
+        dx = xq(:, j) - xp
+        e_bar = e_bar - dot_product(grade_node, dx)
+        do k = 1, 3
+          do m = 1, 3
+            e_bar = e_bar - 0.5_DOUBLE*hesse_node(k, m)*dx(k)*dx(m)
+          end do
+        end do
+      end block
       e_node = e_node + weight(j)*(lambda_r(j)+lambda_l(j))*e_bar
       denom = denom + weight(j)*(lambda_r(j)+lambda_l(j))
     end do

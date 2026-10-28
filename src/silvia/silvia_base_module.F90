@@ -572,14 +572,15 @@ contains
 
     rhs        = 0.0_DOUBLE
     sum_lambda = 0.0_DOUBLE
-    call subface_flux_loop(mesh, qpw, sol, reconstruction_data, grad, hess, grad_p, rhs, sum_lambda, t)
+    call subface_flux_loop(mesh, qpw, sol, reconstruction_data, grad, hess, grad_p, hess_p, &
+      rhs, sum_lambda, t)
 
     do i = 1, mesh%n_elems
       rhs(:, i) = rhs(:, i) / mesh%elem(i)%volume
     end do
   end subroutine compute_rhs
 
-  subroutine subface_flux_loop(mesh, qpw, sol, prim, grad, hess, grad_p, rhs, sum_lambda, t)
+  subroutine subface_flux_loop(mesh, qpw, sol, prim, grad, hess, grad_p, hess_p, rhs, sum_lambda, t)
     use ns_euler_rs_module, only: compute_lambdas_and_solve_nodal_velocity_new, &
       compute_lambdas_and_solve_nodal_velocity_xq, multi_point, &
       compute_lambdas_and_solve_nodal_ener_xq, multi_point_ener
@@ -592,12 +593,13 @@ contains
     real(kind=DOUBLE), dimension(5, 3, mesh%n_elems), intent(in) :: grad
     real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(in) :: hess
     real(kind=DOUBLE), dimension(5, 3, mesh%n_vert), intent(in) :: grad_p
+    real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(in) :: hess_p
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(inout) :: rhs
     real(kind=DOUBLE), dimension(mesh%n_elems),    intent(inout) :: sum_lambda
     real(kind=DOUBLE), intent(in) :: t
 
     integer(kind=ENTIER) :: iface, il, ir, iv, n_fvert, q, inode
-    integer(kind=ENTIER) :: iloop
+    integer(kind=ENTIER) :: iloop, m
     integer(kind=ENTIER) :: i, j, k, id_sub_face, id_face
     real(kind=DOUBLE), dimension(3) :: norm, xface
     real(kind=DOUBLE), dimension(:, :),  allocatable :: face_coords
@@ -609,8 +611,10 @@ contains
     integer(kind=ENTIER) :: ng
     real(kind=DOUBLE), dimension(:, :), allocatable :: sol_w_l, sol_w_r, norm_list, xq_list
     real(kind=DOUBLE), dimension(:), allocatable :: lambda_l, lambda_r, weight
-    real(kind=DOUBLE), dimension(3) :: v_node, v_node_avg, v_node_q, grade_node
+    real(kind=DOUBLE), dimension(3) :: v_node, v_node_avg, v_node_q, grade_node, dx_node_q
     real(kind=DOUBLE), dimension(3, 3) :: gradv_node
+    real(kind=DOUBLE), dimension(3, 3, 3) :: hessv_node
+    real(kind=DOUBLE), dimension(3, 3) :: hesse_node
     real(kind=DOUBLE), dimension(5) :: u_node_avg
     real(kind=DOUBLE) :: rho_node_avg, vol_sum, er, el, e_node, e_node_q
     real(kind=DOUBLE) :: vn_nodal, sl, sr, area
@@ -661,6 +665,8 @@ contains
       ! grad_p is primitive at order 2 and conservative at order 3+.
       gradv_node = 0.0_DOUBLE
       grade_node = 0.0_DOUBLE
+      hessv_node = 0.0_DOUBLE
+      hesse_node = 0.0_DOUBLE
       if (order == 2) then !MODIF
         gradv_node = grad_p(2:4, :, i)
 
@@ -699,6 +705,20 @@ contains
           v_node_avg = u_node_avg(2:4) / rho_node_avg
           do j = 1, 3
             gradv_node(:, j) = (grad_p(2:4, j, i) - v_node_avg * grad_p(1, j, i)) / rho_node_avg
+            grade_node(j) = (grad_p(5, j, i) &
+              - (u_node_avg(5) / rho_node_avg) * grad_p(1, j, i)) / rho_node_avg
+          end do
+          do j = 1, 3
+            do m = 1, 3
+              hessv_node(:, j, m) = (hess_p(2:4, j, m, i) &
+                - v_node_avg * hess_p(1, j, m, i) &
+                - gradv_node(:, j) * grad_p(1, m, i) &
+                - gradv_node(:, m) * grad_p(1, j, i)) / rho_node_avg
+              hesse_node(j, m) = (hess_p(5, j, m, i) &
+                - (u_node_avg(5) / rho_node_avg) * hess_p(1, j, m, i) &
+                - grade_node(j) * grad_p(1, m, i) &
+                - grade_node(m) * grad_p(1, j, i)) / rho_node_avg
+            end do
           end do
         else
           gradv_node = 0.0_DOUBLE
@@ -709,7 +729,7 @@ contains
       !call compute_lambdas_and_solve_nodal_velocity_new(ng, weight,&
       !  norm_list, lambda_l, lambda_r, sol_w_l, sol_w_r, v_node)
       call compute_lambdas_and_solve_nodal_velocity_xq(ng, weight,&
-        norm_list, lambda_l, lambda_r, sol_w_l, sol_w_r, v_node, gradv_node, &
+        norm_list, lambda_l, lambda_r, sol_w_l, sol_w_r, v_node, gradv_node, hessv_node, &
          xq_list, mesh%vert(i)%coord)
       ! Wall sub-faces (v* = 0): the mirror ghost doubles the impedance
       ! (lambda_l + lambda_r = 2 lambda_l) while only the interior cell
@@ -724,7 +744,7 @@ contains
         end if
       end do
       call compute_lambdas_and_solve_nodal_ener_xq(ng, weight,&
-        norm_list, lambda_l, lambda_r, sol_w_l, sol_w_r, e_node, grade_node, &
+        norm_list, lambda_l, lambda_r, sol_w_l, sol_w_r, e_node, grade_node, hesse_node, &
          xq_list, mesh%vert(i)%coord)
 
       !Compute flux integral on subface
@@ -742,8 +762,17 @@ contains
           case (1)
             ! Same as ns: zero normal nodal velocity on wall sub-faces
             ! (re == 0 is the default wall in compute_right_state)
-            v_node_q = v_node + matmul(gradv_node, &
-              qpw(1:3,1,id_sub_face) - mesh%vert(i)%coord)
+            dx_node_q = qpw(1:3,1,id_sub_face) - mesh%vert(i)%coord
+            v_node_q = v_node + matmul(gradv_node, dx_node_q)
+            e_node_q = e_node + dot_product(grade_node, dx_node_q)
+            do k = 1, 3
+              do m = 1, 3
+                v_node_q = v_node_q + 0.5_DOUBLE*hessv_node(:, k, m) &
+                  *dx_node_q(k)*dx_node_q(m)
+                e_node_q = e_node_q + 0.5_DOUBLE*hesse_node(k, m) &
+                  *dx_node_q(k)*dx_node_q(m)
+              end do
+            end do
             vn_nodal = dot_product(v_node_q, norm)
             if (ir == 0) then
               vn_nodal = 0.0_DOUBLE
@@ -752,7 +781,6 @@ contains
             end if
             !call multi_point(sol_w_l(:, j), sol_w_r(:, j), norm, lr_flux, vn_nodal, &
             !  lambda_l(j), lambda_r(j), sl, sr)
-            e_node_q = e_node + dot_product(grade_node, qpw(1:3,1,id_sub_face) - mesh%vert(i)%coord)
             call multi_point_ener(sol_w_l(:, j), sol_w_r(:, j), norm, lr_flux, vn_nodal, e_node_q, &
               lambda_l(j), lambda_r(j), sl, sr)
             ! lr_flux is per unit area; lr_flux(:, 2) is already the right cell's
