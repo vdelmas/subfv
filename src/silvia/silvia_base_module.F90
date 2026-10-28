@@ -711,6 +711,18 @@ contains
       call compute_lambdas_and_solve_nodal_velocity_xq(ng, weight,&
         norm_list, lambda_l, lambda_r, sol_w_l, sol_w_r, v_node, gradv_node, &
          xq_list, mesh%vert(i)%coord)
+      ! Wall sub-faces (v* = 0): the mirror ghost doubles the impedance
+      ! (lambda_l + lambda_r = 2 lambda_l) while only the interior cell
+      ! exchanges energy, so they count with half the weight in the energy
+      ! solve. weight is not used after this point.
+      do j = 1, ng
+        ir = mesh%sub_face(mesh%vert(i)%sub_face_neigh(j))%right_elem_neigh
+        if (ir == 0) then
+          weight(j) = 0.5_DOUBLE * weight(j)
+        else if (ir < 0) then
+          if (bc_euler_id(-ir) == BC_EULER_WALL) weight(j) = 0.5_DOUBLE * weight(j)
+        end if
+      end do
       call compute_lambdas_and_solve_nodal_ener_xq(ng, weight,&
         norm_list, lambda_l, lambda_r, sol_w_l, sol_w_r, e_node, grade_node, &
          xq_list, mesh%vert(i)%coord)
