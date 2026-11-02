@@ -65,10 +65,10 @@ program main
     allocate(rhs(5,mesh%n_elems))
     allocate(sum_lambda(mesh%n_elems))
 
-    allocate(qpw_face(4,4,mesh%n_faces))
+    allocate(qpw_face(4,9,mesh%n_faces))
     allocate(qpw_vol (4,6,mesh%n_elems))
     call compute_sub_face_qpw(mesh, qpw)
-    call compute_face_qpw(mesh,qpw_face)
+    if (.not. subface_quad) call compute_face_qpw(mesh, qpw_face)
     call compute_vol_qpw(mesh,qpw_vol)
 
     if (order>=2) then
@@ -106,7 +106,11 @@ program main
       do i=1, mesh%n_elems
         sol_w(:,i) = conserv_to_primit(sol(:,i))
       end do
-      call compute_rhs(mesh, qpw, sol, sol_w, grad, hess, grad_p, hess_p, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+      if (subface_quad) then
+        call compute_rhs(mesh, qpw, sol, sol_w, grad, hess, grad_p, hess_p, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+      else
+        call compute_rhs(mesh, qpw_face, sol, sol_w, grad, hess, grad_p, hess_p, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+      end if
       call compute_dt(mesh, sum_lambda, dt)
       call MPI_ALLREDUCE(MPI_IN_PLACE, dt, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
       if (t + dt > tmax) dt = tmax - t
@@ -126,7 +130,11 @@ program main
           do i=1, mesh%n_elems
             sol_w(:,i) = conserv_to_primit(sol1(:,i))
           end do
-          call compute_rhs(mesh, qpw, sol1, sol_w, grad, hess, grad_p, hess_p, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+          if (subface_quad) then
+            call compute_rhs(mesh, qpw, sol1, sol_w, grad, hess, grad_p, hess_p, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+          else
+            call compute_rhs(mesh, qpw_face, sol1, sol_w, grad, hess, grad_p, hess_p, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+          end if
           sol = 0.5_DOUBLE * sol + 0.5_DOUBLE * (sol1 + dt * rhs)
           if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)
           ! 
@@ -139,14 +147,22 @@ program main
           do i=1, mesh%n_elems
             sol_w(:,i) = conserv_to_primit(sol1(:,i))
           end do
-          call compute_rhs(mesh, qpw, sol1, sol_w, grad, hess, grad_p, hess_p, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+          if (subface_quad) then
+            call compute_rhs(mesh, qpw, sol1, sol_w, grad, hess, grad_p, hess_p, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+          else
+            call compute_rhs(mesh, qpw_face, sol1, sol_w, grad, hess, grad_p, hess_p, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+          end if
           sol2 = 0.75_DOUBLE * sol + 0.25_DOUBLE * (sol1 + dt * rhs)
           if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol2)
           ! Third step of SSP RK 
           do i=1, mesh%n_elems
             sol_w(:,i) = conserv_to_primit(sol2(:,i))
           end do
-          call compute_rhs(mesh, qpw, sol2, sol_w, grad, hess, grad_p, hess_p, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+          if (subface_quad) then
+            call compute_rhs(mesh, qpw, sol2, sol_w, grad, hess, grad_p, hess_p, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+          else
+            call compute_rhs(mesh, qpw_face, sol2, sol_w, grad, hess, grad_p, hess_p, rhs, sum_lambda, t, num_procs, mpi_send_recv)
+          end if
           sol  = (1.0_DOUBLE/3.0_DOUBLE) * sol + (2.0_DOUBLE/3.0_DOUBLE) * (sol2 + dt * rhs)
           if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)
           !

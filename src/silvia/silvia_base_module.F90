@@ -121,6 +121,7 @@ module silvia_base_module
   character(len=32) :: subface_quadrature = "simpson"
   integer :: subface_quadrature_id = SUBFACE_QUAD_SIMPSON
   logical :: exclude_bound_vert = .FALSE.
+  logical :: subface_quad = .TRUE.
   integer(kind=ENTIER) :: bc_style = 1
   logical :: boundary_2d = .FALSE.
   logical :: activate_diffusion
@@ -226,6 +227,7 @@ contains
       order, use_aho_reconstruction, &
       second_order, method, &
       scheme, subface_quadrature, exclude_bound_vert, &
+      subface_quad, &
       activate_diffusion, &
       local_time_step, &
       bc_style, boundary_2d, &
@@ -572,8 +574,13 @@ contains
 
     rhs        = 0.0_DOUBLE
     sum_lambda = 0.0_DOUBLE
-    call subface_flux_loop(mesh, qpw, sol, reconstruction_data, grad, hess, grad_p, hess_p, &
+    if (subface_quad) then
+      call subface_flux_loop(mesh, qpw, sol, reconstruction_data, grad, hess, grad_p, hess_p, &
       rhs, sum_lambda, t)
+    else
+      call face_flux_loop(mesh, qpw, sol, reconstruction_data, grad, hess, grad_p, hess_p, &
+      rhs, sum_lambda, t)
+    end if
 
     do i = 1, mesh%n_elems
       rhs(:, i) = rhs(:, i) / mesh%elem(i)%volume
@@ -954,24 +961,206 @@ contains
     end if
   end subroutine compute_right_state
 
-  subroutine face_flux_loop(mesh, sol, prim, grad, hess, rhs, sum_lambda, t)
+  subroutine face_flux_loop(mesh, qpw, sol, prim, grad, hess, grad_p, hess_p, rhs, sum_lambda, t)
+    use ns_euler_rs_module, only: compute_lambdas_and_solve_nodal_velocity_xq, &
+      compute_lambdas_and_solve_nodal_ener_xq, multi_point_ener
     type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(:, :, :), intent(in) :: qpw
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in)  :: sol, prim
     real(kind=DOUBLE), dimension(5, 3, mesh%n_elems), intent(in) :: grad
     real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(in) :: hess
+    real(kind=DOUBLE), dimension(5, 3, mesh%n_vert), intent(in) :: grad_p
+    real(kind=DOUBLE), dimension(:, :, :, :), allocatable, intent(in) :: hess_p
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(inout) :: rhs
     real(kind=DOUBLE), dimension(mesh%n_elems),    intent(inout) :: sum_lambda
     real(kind=DOUBLE), intent(in) :: t
 
-    integer(kind=ENTIER) :: iface, il, ir, iv, k, n_fvert, n_qpts, q
-    integer(kind=ENTIER) :: iloop, id_sub_face
+    integer(kind=ENTIER) :: iface, il, ir, n_qpts, q, j, k, m, ng, iv, iq, id_sub_face
     real(kind=DOUBLE), dimension(3) :: norm, xface
-    real(kind=DOUBLE), dimension(:, :), allocatable :: face_coords, qpts
-    real(kind=DOUBLE), dimension(:),    allocatable :: qwts
     real(kind=DOUBLE), dimension(5) :: wL, wR, sol_l, sol_r
     real(kind=DOUBLE), dimension(5,2) :: lr_flux
     real(kind=DOUBLE) :: sl, sr
     logical :: is_zface
+    real(kind=DOUBLE), allocatable :: wl_node(:,:), wr_node(:,:), lam_l(:), lam_r(:), wt(:), norms(:,:), xqs(:,:)
+    integer(kind=ENTIER), allocatable :: face_ids(:)
+    real(kind=DOUBLE), allocatable :: nodal_lam_l(:,:), nodal_lam_r(:,:), nodal_vn(:,:), nodal_e(:,:)
+    real(kind=DOUBLE) :: vnode(3), enode, grade(3), hesse(3,3), gv(3,3), hv(3,3,3), vn
+    real(kind=DOUBLE) :: dx(3)
+    real(kind=DOUBLE) :: uavg(5), vavg(3), rhoavg, volsum, el, er
+
+    allocate(nodal_lam_l(4,mesh%n_faces), nodal_lam_r(4,mesh%n_faces))
+    allocate(nodal_vn(4,mesh%n_faces), nodal_e(4,mesh%n_faces))
+    nodal_lam_l = 0.0_DOUBLE; nodal_lam_r = 0.0_DOUBLE
+    nodal_vn = 0.0_DOUBLE; nodal_e = 0.0_DOUBLE
+
+    if (scheme_id == SCHEME_MULTI_POINT .and. order >= 2) then
+      do iv = 1, mesh%n_vert
+        ng = 0
+        do j = 1, mesh%vert(iv)%n_faces_neigh
+          iface = mesh%vert(iv)%face_neigh(j)
+          if (mesh%face(iface)%n_vert /= 4) cycle
+          norm = mesh%face(iface)%norm
+          if (boundary_2d .and. abs(norm(3)) > 1.0e-6_DOUBLE) cycle
+          ng = ng + 1
+        end do
+        if (ng <= 0) cycle
+        allocate(face_ids(ng))
+        k = 0
+        do j = 1, mesh%vert(iv)%n_faces_neigh
+          iface = mesh%vert(iv)%face_neigh(j)
+          if (mesh%face(iface)%n_vert /= 4) cycle
+          norm = mesh%face(iface)%norm
+          if (boundary_2d .and. abs(norm(3)) > 1.0e-6_DOUBLE) cycle
+          k = k + 1
+          face_ids(k) = iface
+        end do
+        allocate(wl_node(5,ng), wr_node(5,ng), lam_l(ng), lam_r(ng), wt(ng), norms(3,ng), xqs(3,ng))
+        do j = 1, ng
+          iface = face_ids(j)
+          il = mesh%face(iface)%left_neigh; ir = mesh%face(iface)%right_neigh
+          do k = 1, mesh%face(iface)%n_vert
+            if (mesh%face(iface)%vert(k) == iv) exit
+          end do
+          if (subface_quadrature_id == SUBFACE_QUAD_SIMPSON) then
+            iq = k
+          else
+            select case (k)
+            case (1); iq = 1
+            case (2); iq = 3
+            case (3); iq = 4
+            case default; iq = 2
+            end select
+          end if
+          xqs(:,j) = qpw(1:3,iq,iface); wt(j) = qpw(4,iq,iface)
+          norms(:,j) = mesh%face(iface)%norm
+          wl_node(:,j) = reconstruct(prim,grad,hess,il,xqs(:,j),mesh%elem(il)%coord)
+          if (ir > 0) then
+            wr_node(:,j) = reconstruct(prim,grad,hess,ir,xqs(:,j),mesh%elem(ir)%coord)
+          else
+            id_sub_face = mesh%face(iface)%sub_face(1)
+            sol_l = primit_to_conserv(wl_node(:,j))
+            call compute_right_state(mesh,id_sub_face,ir,sol_l,sol_r)
+            wr_node(:,j) = conserv_to_primit(sol_r)
+          end if
+          lam_l(j) = 0.0_DOUBLE; lam_r(j) = 0.0_DOUBLE
+        end do
+        gv = 0.0_DOUBLE; hv = 0.0_DOUBLE; grade = 0.0_DOUBLE; hesse = 0.0_DOUBLE
+        if (order == 2) then
+          gv = grad_p(2:4,:,iv)
+        else if (order >= 3) then
+          uavg = 0.0_DOUBLE; volsum = 0.0_DOUBLE
+          do j = 1, mesh%vert(iv)%n_elems_neigh
+            il = mesh%vert(iv)%elem_neigh(j)
+            uavg = uavg + mesh%elem(il)%volume * sol(:,il)
+            volsum = volsum + mesh%elem(il)%volume
+          end do
+          if (volsum > 0.0_DOUBLE) then
+            uavg = uavg / volsum
+            rhoavg = max(uavg(1),tiny(1.0_DOUBLE))
+            vavg = uavg(2:4) / rhoavg
+            do j = 1, 3
+              gv(:,j) = (grad_p(2:4,j,iv) - vavg*grad_p(1,j,iv)) / rhoavg
+              grade(j) = (grad_p(5,j,iv) - (uavg(5)/rhoavg)*grad_p(1,j,iv)) / rhoavg
+            end do
+            do j = 1, 3
+              do k = 1, 3
+                hv(:,j,k) = (hess_p(2:4,j,k,iv) - vavg*hess_p(1,j,k,iv) &
+                  - gv(:,j)*grad_p(1,k,iv) - gv(:,k)*grad_p(1,j,iv)) / rhoavg
+                hesse(j,k) = (hess_p(5,j,k,iv) - (uavg(5)/rhoavg)*hess_p(1,j,k,iv) &
+                  - grade(j)*grad_p(1,k,iv) - grade(k)*grad_p(1,j,iv)) / rhoavg
+              end do
+            end do
+          end if
+        end if
+        if (order == 2) then
+          grade = 0.0_DOUBLE
+          do j = 1, ng
+            iface = face_ids(j)
+            il = mesh%face(iface)%left_neigh
+            ir = mesh%face(iface)%right_neigh
+            sol_l = sol(:,il)
+            if (ir > 0) then
+              sol_r = sol(:,ir)
+            else
+              id_sub_face = mesh%face(iface)%sub_face(1)
+              call compute_right_state(mesh,id_sub_face,ir,sol_l,sol_r)
+            end if
+            el = sol_l(5) / max(sol_l(1),tiny(1.0_DOUBLE))
+            er = sol_r(5) / max(sol_r(1),tiny(1.0_DOUBLE))
+            grade = grade + wt(j) * (er - el) * norms(:,j)
+          end do
+          if (mesh%vert(iv)%volume > 0.0_DOUBLE) grade = grade / mesh%vert(iv)%volume
+        end if
+        call compute_lambdas_and_solve_nodal_velocity_xq(ng,wt,norms,lam_l,lam_r,wl_node,wr_node, &
+          vnode,gv,hv,xqs,mesh%vert(iv)%coord)
+        do j = 1, ng
+          iface = face_ids(j)
+          do k = 1, mesh%face(iface)%n_vert
+            if (mesh%face(iface)%vert(k) == iv) exit
+          end do
+          if (subface_quadrature_id == SUBFACE_QUAD_SIMPSON) then
+            iq = k
+          else
+            select case (k)
+            case (1); iq = 1
+            case (2); iq = 3
+            case (3); iq = 4
+            case default; iq = 2
+            end select
+          end if
+          nodal_lam_l(iq,iface) = lam_l(j); nodal_lam_r(iq,iface) = lam_r(j)
+          dx = xqs(:,j) - mesh%vert(iv)%coord
+          block
+            integer(kind=ENTIER) :: a, b
+            real(kind=DOUBLE) :: vq(3)
+            vq = vnode + matmul(gv,dx)
+            do a = 1, 3
+              do b = 1, 3
+                vq = vq + 0.5_DOUBLE*hv(:,a,b)*dx(a)*dx(b)
+              end do
+            end do
+            nodal_vn(iq,iface) = dot_product(vq,mesh%face(iface)%norm)
+          end block
+          nodal_e(iq,iface) = 0.0_DOUBLE
+        end do
+        do j = 1, ng
+          iface = face_ids(j)
+          ir = mesh%face(iface)%right_neigh
+          if (ir == 0) then
+            wt(j) = 0.5_DOUBLE * wt(j)
+          else if (ir < 0) then
+            if (bc_euler_id(-ir) == BC_EULER_WALL) wt(j) = 0.5_DOUBLE * wt(j)
+          end if
+        end do
+        call compute_lambdas_and_solve_nodal_ener_xq(ng,wt,norms,lam_l,lam_r,wl_node,wr_node, &
+          enode,grade,hesse,xqs,mesh%vert(iv)%coord)
+        do j = 1, ng
+          iface = face_ids(j)
+          do k = 1, mesh%face(iface)%n_vert
+            if (mesh%face(iface)%vert(k) == iv) exit
+          end do
+          if (subface_quadrature_id == SUBFACE_QUAD_SIMPSON) then
+            iq = k
+          else
+            select case (k)
+            case (1); iq = 1
+            case (2); iq = 3
+            case (3); iq = 4
+            case default; iq = 2
+            end select
+          end if
+          dx = xqs(:,j) - mesh%vert(iv)%coord
+          nodal_e(iq,iface) = enode + dot_product(grade,dx)
+          do k = 1, 3
+            do m = 1, 3
+              nodal_e(iq,iface) = nodal_e(iq,iface) &
+                + 0.5_DOUBLE*hesse(k,m)*dx(k)*dx(m)
+            end do
+          end do
+        end do
+        deallocate(wl_node,wr_node,lam_l,lam_r,wt,norms,xqs,face_ids)
+      end do
+    end if
 
     do iface = 1, mesh%n_faces
       il   = mesh%face(iface)%left_neigh
@@ -981,41 +1170,27 @@ contains
       ! Skip ghost-owned faces
       if (mesh%elem(il)%is_ghost) cycle
 
-      n_fvert = mesh%face(iface)%n_vert
+      ! In an extruded 2D mesh, only the lateral quadrilateral faces carry
+      ! the in-plane flux. Triangular caps are normal to z and are excluded.
+      if (mesh%face(iface)%n_vert /= 4) cycle
 
-      ! For z-faces on 2D-extruded meshes (norm_z ≈ ±1, boundary_2d=T), the
-      ! solution has no z-variation. A single centroid point is exact AND
-      ! avoids spurious net z-flux from GMSH's vertex ordering (top/bottom
-      ! faces get different (x,y) Gauss points due to opposite windings).
+      ! For z-faces on 2D-extruded meshes the solution has no z-variation.
       is_zface = boundary_2d .and. abs(abs(norm(3)) - 1.0_DOUBLE) < 1.0e-6_DOUBLE
-      if (order >= 2 .and. n_fvert > 0 .and. allocated(mesh%face(iface)%vert) &
-          .and. .not. is_zface) then
-        ! Quadrature points on face
-        allocate(face_coords(3, n_fvert))
-        do k = 1, n_fvert
-          iv = mesh%face(iface)%vert(k)
-          face_coords(:, k) = mesh%vert(iv)%coord
-        end do
-        call face_quad_pts(int(n_fvert, ENTIER), face_coords, &
-          int(order, ENTIER), qpts, qwts)
-        deallocate(face_coords)
-      else
-        ! Order 1 or z-face (2D extrusion): single point at face centroid
+      if (order < 2) then
         n_qpts = 1
-        allocate(qpts(3, 1), qwts(1))
-        qpts(:, 1) = mesh%face(iface)%coord
-        qwts(1)    = mesh%face(iface)%area
+      else if (subface_quadrature_id == SUBFACE_QUAD_SIMPSON) then
+        n_qpts = 9
+      else
+        n_qpts = 4
       end if
 
       ! For z-faces in 2D mode: zero net physics, skip entirely
       if (is_zface) then
-        deallocate(qpts, qwts)
         cycle
       end if
 
-      n_qpts = size(qwts)
       do q = 1, n_qpts
-        xface = qpts(:, q)
+        xface = qpw(1:3, q, iface)
 
         wL = reconstruct(prim, grad, hess, il, xface, mesh%elem(il)%coord)
         if (ir > 0) then
@@ -1030,17 +1205,29 @@ contains
           call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
           wR = conserv_to_primit(sol_r)
         end if
-        call three_wave(wL, wR, norm, lr_flux, sl, sr)
-        rhs(:, il)  = rhs(:, il)  - lr_flux(:, 1) * qwts(q)
-        sum_lambda(il) = sum_lambda(il) + max(0.0_DOUBLE, -sl)*qwts(q)
+        if (scheme_id == SCHEME_MULTI_POINT .and. order >= 2 .and. &
+            (subface_quadrature_id == SUBFACE_QUAD_GAUSS2 .or. q <= 4)) then
+          vn = nodal_vn(q,iface)
+          if (ir == 0) then
+            vn = 0.0_DOUBLE
+          else if (ir < 0) then
+            if (bc_euler_id(-ir) == BC_EULER_WALL) vn = 0.0_DOUBLE
+          end if
+          call multi_point_ener(wL,wR,norm,lr_flux,vn,nodal_e(q,iface), &
+            nodal_lam_l(q,iface),nodal_lam_r(q,iface),sl,sr)
+        else
+          call three_wave(wL, wR, norm, lr_flux, sl, sr)
+        end if
+        rhs(:, il)  = rhs(:, il)  - lr_flux(:, 1) * qpw(4, q, iface)
+        sum_lambda(il) = sum_lambda(il) + max(0.0_DOUBLE, -sl)*qpw(4, q, iface)
         if (ir > 0) then
-          rhs(:, ir)     = rhs(:, ir)     - lr_flux(:, 2)*qwts(q)
-          sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*qwts(q)
+          rhs(:, ir)     = rhs(:, ir)     - lr_flux(:, 2)*qpw(4, q, iface)
+          sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE, sr)*qpw(4, q, iface)
         end if
       end do
 
-      deallocate(qpts, qwts)
     end do
+    deallocate(nodal_lam_l,nodal_lam_r,nodal_vn,nodal_e)
   end subroutine face_flux_loop
 
   subroutine face_geometry(mesh)
@@ -1571,33 +1758,39 @@ end subroutine three_wave
   subroutine compute_face_qpw(mesh, qpw)
     use quadrature_module
     type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(4,4,mesh%n_faces), intent(inout) :: qpw
+    real(kind=DOUBLE), dimension(4,9,mesh%n_faces), intent(inout) :: qpw
     integer(kind=ENTIER) :: i, j
     real(kind=DOUBLE), dimension(3,4) :: coord
-    real(kind=DOUBLE), dimension(3,4) :: pts
-    real(kind=DOUBLE), dimension(4) :: wts, center
+    real(kind=DOUBLE), dimension(3,9) :: pts
+    real(kind=DOUBLE), dimension(9) :: wts
+    real(kind=DOUBLE), dimension(3,4) :: face_coords
+    real(kind=DOUBLE), dimension(3) :: center
 
     do i=1,mesh%n_faces
-      coord = compute_subface_vert(mesh, i)
-      ! coord = mesh%face(i)%vert
+      qpw(:,:,i) = 0.0_DOUBLE
+      pts = 0.0_DOUBLE
+      wts = 0.0_DOUBLE
+      if (mesh%face(i)%n_vert /= 4) cycle
+      do j = 1, 4
+        face_coords(:,j) = mesh%vert(mesh%face(i)%vert(j))%coord
+      end do
       if (order>=2) then
-        call quad_face_rule(coord, 2, pts, wts)
-        do j=1, 4
+        if (subface_quadrature_id == SUBFACE_QUAD_SIMPSON) then
+          call quad_simpson(face_coords, pts, wts)
+        else
+          call quad_face_rule(face_coords, 2, pts(:,1:4), wts(1:4))
+        end if
+        do j=1, 9
           qpw(1:3,j,i)=pts(:,j)
           qpw(4,j,i)=wts(j)
         end do
       else
-        ! We will use only one point
-        center = 0.0_DOUBLE
-        do j=1, 4
-          ! center(1:3)=center(1:3)+0.25_DOUBLE*coord(1:3,j)
-          center(1:3)=coord(1:3,1)
+        center = mesh%face(i)%coord
+        do j=1,9
+          qpw(1:3,j,i)=center
+          qpw(4,j,i)=0.0_DOUBLE
         end do
-        center(4)=mesh%sub_face(i)%area
-        do j=1,4
-          qpw(1:3,j,i)=center(1:3)
-          qpw(4,j,i)=center(4)
-        end do
+        qpw(4,1,i)=mesh%face(i)%area
       end if
     end do
   end subroutine compute_face_qpw
