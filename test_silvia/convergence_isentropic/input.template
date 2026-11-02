@@ -1,0 +1,28 @@
+&INPUT_PARAM
+
+  meshfile_path='',
+  meshfile='vortex.msh'
+
+  order = ORDER_PLACEHOLDER
+  scheme = 'SCHEME_PLACEHOLDER'
+  subface_quadrature = 'QUAD_PLACEHOLDER'
+  subface_quad = SUBFACE_QUAD_PLACEHOLDER 
+
+  cfl  = CFL_PLACEHOLDER
+  tmax = TMAX_PLACEHOLDER
+  ! no periodic output: only the final state (output_-1) is written
+  n_iter_write_sol = 0
+
+  ! stationary isentropic vortex centred at the origin (beta = 5)
+  init_isentropic_vortex = .true.
+  compute_error = .true.
+  error_2d = .true.
+
+  ! far field = vortex state at infinity (rho = 1, u = v = 0, p = 1)
+  n_bc = 1,
+  bc_name = 'far_surf',
+  bc_type = 'freestream',
+  bc_val = 1., 0., 0., 0., 1.
+
+  boundary_2d = .true.
+  /
