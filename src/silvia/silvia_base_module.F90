@@ -1021,7 +1021,7 @@ contains
     real(kind=DOUBLE), dimension(mesh%n_elems),    intent(inout) :: sum_lambda
     real(kind=DOUBLE), intent(in) :: t
 
-    integer(kind=ENTIER) :: iface, il, ir, n_qpts, q, j, k, m, ng, iv, iq, id_sub_face
+    integer(kind=ENTIER) :: iface, il, ir, n_qpts, q, j, k, m, ng, iv, iq, isf, id_sub_face
     real(kind=DOUBLE), dimension(3) :: norm, xface
     real(kind=DOUBLE), dimension(5) :: wL, wR, sol_l, sol_r
     real(kind=DOUBLE), dimension(5,2) :: lr_flux
@@ -1031,7 +1031,7 @@ contains
     integer(kind=ENTIER), allocatable :: face_ids(:)
     real(kind=DOUBLE), allocatable :: nodal_lam_l(:,:), nodal_lam_r(:,:), nodal_vn(:,:), nodal_e(:,:)
     real(kind=DOUBLE) :: vnode(3), enode, grade(3), hesse(3,3), gv(3,3), hv(3,3,3), vn
-    real(kind=DOUBLE) :: dx(3)
+    real(kind=DOUBLE) :: dx(3), face_weight
     real(kind=DOUBLE) :: uavg(5), vavg(3), rhoavg, volsum, el, er
 
     allocate(nodal_lam_l(4,mesh%n_faces), nodal_lam_r(4,mesh%n_faces))
@@ -1039,7 +1039,7 @@ contains
     nodal_lam_l = 0.0_DOUBLE; nodal_lam_r = 0.0_DOUBLE
     nodal_vn = 0.0_DOUBLE; nodal_e = 0.0_DOUBLE
 
-    if (scheme_id == SCHEME_MULTI_POINT .and. order >= 2) then
+    if (scheme_id == SCHEME_MULTI_POINT) then
       do iv = 1, mesh%n_vert
         ng = 0
         do j = 1, mesh%vert(iv)%n_faces_neigh
@@ -1067,7 +1067,9 @@ contains
           do k = 1, mesh%face(iface)%n_vert
             if (mesh%face(iface)%vert(k) == iv) exit
           end do
-          if (subface_quadrature_id == SUBFACE_QUAD_SIMPSON) then
+          if (order == 1) then
+            iq = 1
+          else if (subface_quadrature_id == SUBFACE_QUAD_SIMPSON) then
             iq = k
           else
             select case (k)
@@ -1077,7 +1079,23 @@ contains
             case default; iq = 2
             end select
           end if
-          xqs(:,j) = qpw(1:3,iq,iface); wt(j) = qpw(4,iq,iface)
+          if (order == 1) then
+            ! The first-order MP state belongs to this mesh vertex. Use an
+            ! equal-weight four-corner quadrature for the whole face.
+            id_sub_face = 0
+            do isf = 1, mesh%face(iface)%n_sub_faces
+              if (mesh%sub_face(mesh%face(iface)%sub_face(isf))%mesh_vert == iv) then
+                id_sub_face = mesh%face(iface)%sub_face(isf)
+                exit
+              end if
+            end do
+            if (id_sub_face == 0) error stop "face has no subface for one of its vertices"
+            xqs(:,j) = mesh%vert(iv)%coord
+            wt(j) = mesh%face(iface)%area / 4.0_DOUBLE
+          else
+            xqs(:,j) = qpw(1:3,iq,iface)
+            wt(j) = qpw(4,iq,iface)
+          end if
           norms(:,j) = mesh%face(iface)%norm
           wl_node(:,j) = reconstruct(prim,grad,hess,il,xqs(:,j),mesh%elem(il)%coord)
           if (ir > 0) then
@@ -1144,7 +1162,9 @@ contains
           do k = 1, mesh%face(iface)%n_vert
             if (mesh%face(iface)%vert(k) == iv) exit
           end do
-          if (subface_quadrature_id == SUBFACE_QUAD_SIMPSON) then
+          if (order == 1) then
+            iq = k
+          else if (subface_quadrature_id == SUBFACE_QUAD_SIMPSON) then
             iq = k
           else
             select case (k)
@@ -1185,7 +1205,9 @@ contains
           do k = 1, mesh%face(iface)%n_vert
             if (mesh%face(iface)%vert(k) == iv) exit
           end do
-          if (subface_quadrature_id == SUBFACE_QUAD_SIMPSON) then
+          if (order == 1) then
+            iq = k
+          else if (subface_quadrature_id == SUBFACE_QUAD_SIMPSON) then
             iq = k
           else
             select case (k)
@@ -1232,6 +1254,50 @@ contains
 
       ! For z-faces in 2D mode: zero net physics, skip entirely
       if (is_zface) then
+        cycle
+      end if
+
+      ! Multi-point is a vertex flux. At first order the full-face rule has
+      ! only a centre point, so assemble its four vertex contributions with
+      ! an equal-weight face quadrature and the corresponding nodal states.
+      if (scheme_id == SCHEME_MULTI_POINT .and. order == 1) then
+        do k = 1, mesh%face(iface)%n_vert
+          iv = mesh%face(iface)%vert(k)
+          id_sub_face = 0
+          do isf = 1, mesh%face(iface)%n_sub_faces
+            if (mesh%sub_face(mesh%face(iface)%sub_face(isf))%mesh_vert == iv) then
+              id_sub_face = mesh%face(iface)%sub_face(isf)
+              exit
+            end if
+          end do
+          if (id_sub_face == 0) error stop "face has no subface for one of its vertices"
+          face_weight = mesh%face(iface)%area / 4.0_DOUBLE
+
+          xface = mesh%vert(iv)%coord
+          wL = reconstruct(prim, grad, hess, il, xface, mesh%elem(il)%coord)
+          if (ir > 0) then
+            wR = reconstruct(prim, grad, hess, ir, xface, mesh%elem(ir)%coord)
+          else
+            sol_l = primit_to_conserv(wL)
+            call compute_right_state(mesh, id_sub_face, ir, sol_l, sol_r)
+            wR = conserv_to_primit(sol_r)
+          end if
+
+          vn = nodal_vn(k,iface)
+          if (ir == 0) then
+            vn = 0.0_DOUBLE
+          else if (ir < 0) then
+            if (bc_euler_id(-ir) == BC_EULER_WALL) vn = 0.0_DOUBLE
+          end if
+          call multi_point_ener(wL,wR,norm,lr_flux,vn,nodal_e(k,iface), &
+            nodal_lam_l(k,iface),nodal_lam_r(k,iface),sl,sr)
+          rhs(:, il) = rhs(:, il) - face_weight*lr_flux(:,1)
+          sum_lambda(il) = sum_lambda(il) + max(0.0_DOUBLE,-sl)*face_weight
+          if (ir > 0) then
+            rhs(:, ir) = rhs(:, ir) - face_weight*lr_flux(:,2)
+            sum_lambda(ir) = sum_lambda(ir) + max(0.0_DOUBLE,sr)*face_weight
+          end if
+        end do
         cycle
       end if
 
