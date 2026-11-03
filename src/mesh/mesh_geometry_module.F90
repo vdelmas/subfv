@@ -310,7 +310,11 @@ contains
       else
         norm = -mesh%face(id_face)%norm
       end if
-      vol = vol + dot_product(mesh%face(id_face)%coord, &
+      ! The divergence-theorem volume is invariant to a constant coordinate
+      ! shift for a closed cell. Referencing face centroids to the cell
+      ! centroid avoids cancellation when global coordinates are large
+      ! compared with the cell size.
+      vol = vol + dot_product(mesh%face(id_face)%coord - mesh%elem(i)%coord, &
         mesh%face(id_face)%area*norm)
     end do
     vol = vol / 3.0_DOUBLE
