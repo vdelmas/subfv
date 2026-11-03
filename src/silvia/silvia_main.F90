@@ -85,7 +85,7 @@ program main
       sum_lambda(i) = 0.0_DOUBLE
     end do
 
-    call init_sol(mesh, qpw_vol, sol)
+    call init_sol(mesh, qpw_vol, sol, num_procs)
     if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)
     
     ! call face_geometry(mesh)

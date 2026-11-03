@@ -479,17 +479,20 @@ contains
     w(5) = w(1)**gamma
   end subroutine sol_isentropic_vortex
 
-  subroutine init_sol(mesh, qpw, sol)
+  subroutine init_sol(mesh, qpw, sol, num_procs)
+    use mpi
     type(mesh_type), intent(in)    :: mesh
     real(kind=DOUBLE), dimension(4,6,mesh%n_elems), intent(in) :: qpw
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(out) :: sol
+    integer, intent(in) :: num_procs
 
     integer(kind=ENTIER) :: i, kf, iface_loc, n_fv, k, q
+    integer :: mpi_ierr
     real(kind=DOUBLE), dimension(5) :: w, wq
     real(kind=DOUBLE), dimension(3) :: xc
     real(kind=DOUBLE), dimension(:, :), allocatable :: qpts_v, fc, vcoords
     real(kind=DOUBLE), dimension(:),    allocatable :: qwts_v
-    real(kind=DOUBLE) :: area_q
+    real(kind=DOUBLE) :: area_q, radius, rmin, rmin_global
 
     if (init_uniform) then
       do i = 1, mesh%n_elems
@@ -531,6 +534,40 @@ contains
             sol(:, i) = sol(:, i) + qpw(4,q,i) * primit_to_conserv(wq)
           end do
           sol(:, i) = sol(:, i) / mesh%elem(i)%volume
+        end if
+      end do
+    else if (init_sedov) then
+      ! 2D Sedov blast: quiescent unit-density gas and a small ambient
+      ! pressure, with the standard blast energy deposited in the cell
+      ! nearest the origin. The odd number of cells per side gives one
+      ! unique central cell on a Cartesian mesh.
+      rmin = huge(1.0_DOUBLE)
+      do i = 1, mesh%n_elems
+        if (boundary_2d) then
+          radius = norm2(mesh%elem(i)%coord(1:2))
+        else
+          radius = norm2(mesh%elem(i)%coord)
+        end if
+        rmin = min(rmin, radius)
+        w = (/1.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 1.0e-12_DOUBLE/)
+        sol(:, i) = primit_to_conserv(w)
+      end do
+
+      rmin_global = rmin
+      if (num_procs > 1) then
+        call MPI_ALLREDUCE(MPI_IN_PLACE, rmin_global, 1, MPI_DOUBLE, MPI_MIN, &
+                           MPI_COMM_WORLD, mpi_ierr)
+      end if
+
+      do i = 1, mesh%n_elems
+        if (boundary_2d) then
+          radius = norm2(mesh%elem(i)%coord(1:2))
+        else
+          radius = norm2(mesh%elem(i)%coord)
+        end if
+        if (abs(radius - rmin_global) < 1.0e-14_DOUBLE) then
+          sol(:, i) = (/1.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, 0.0_DOUBLE, &
+                        0.984042_DOUBLE / mesh%elem(i)%volume/)
         end if
       end do
     end if

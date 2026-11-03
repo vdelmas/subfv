@@ -1,0 +1,24 @@
+&INPUT_PARAM
+
+  meshfile_path='',
+  meshfile='sedov.msh'
+
+  order = ORDER_PLACEHOLDER
+  scheme = 'SCHEME_PLACEHOLDER'
+  subface_quadrature = 'QUAD_PLACEHOLDER'
+  subface_quad = SUBFACE_QUAD_PLACEHOLDER
+
+  cfl  = CFL_PLACEHOLDER
+  tmax = TMAX_PLACEHOLDER
+  n_iter_write_sol = 0
+  n_iter_print = 100
+  n_max_iter = 1000000
+
+  init_sedov = .true.
+  boundary_2d = .true.
+
+  n_bc = 1,
+  bc_name = 'walls',
+  bc_type = 'wall'
+
+  /
