@@ -521,8 +521,17 @@ contains
       end do
     else if (init_gresho) then
       do i = 1, mesh%n_elems
-        call sol_gresho_mach(mesh%elem(i)%coord, w, 1.0_DOUBLE)
-        sol(:, i) = primit_to_conserv(w)
+        if (order <= 2) then
+          call sol_gresho_mach(mesh%elem(i)%coord, w, 1.0_DOUBLE)
+          sol(:, i) = primit_to_conserv(w)
+        else
+          sol(:, i) = 0.0_DOUBLE
+          do q = 1, size(qpw, DIM=2)
+            call sol_gresho_mach(qpw(1:3,q,i), wq, 1.0_DOUBLE)
+            sol(:, i) = sol(:, i) + qpw(4,q,i) * primit_to_conserv(wq)
+          end do
+          sol(:, i) = sol(:, i) / mesh%elem(i)%volume
+        end if
       end do
     end if
   end subroutine init_sol
