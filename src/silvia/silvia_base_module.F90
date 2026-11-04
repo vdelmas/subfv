@@ -482,7 +482,7 @@ contains
   subroutine init_sol(mesh, qpw, sol, num_procs)
     use mpi
     type(mesh_type), intent(in)    :: mesh
-    real(kind=DOUBLE), dimension(4,6,mesh%n_elems), intent(in) :: qpw
+    real(kind=DOUBLE), dimension(:,:,:), intent(in) :: qpw
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(out) :: sol
     integer, intent(in) :: num_procs
 
@@ -1952,7 +1952,7 @@ end subroutine quad_simpson
 subroutine compute_vol_qpw(mesh, qpw)
   use quadrature_module
   type(mesh_type), intent(in) :: mesh
-  real(kind=DOUBLE), dimension(4,6,mesh%n_elems), intent(inout) :: qpw
+  real(kind=DOUBLE), dimension(:,:,:), intent(inout) :: qpw
   integer(kind=ENTIER) :: i, j, nv
   real(kind=DOUBLE), dimension(:,:), allocatable :: coord, pts
   real(kind=DOUBLE), dimension(:), allocatable :: wts
@@ -1961,18 +1961,17 @@ subroutine compute_vol_qpw(mesh, qpw)
     qpw(:,:,i) = 0.0_DOUBLE
     if (order>=3) then
       nv = mesh%elem(i)%n_vert
-      if (nv /= 6) then
-        error stop 'compute_vol_qpw: expected 6-node prism cells'
+      if (nv /= 6 .and. nv /= 8) then
+        error stop 'compute_vol_qpw: expected prism or hexahedron cells'
       end if
       allocate(coord(3,nv))
       do j=1,nv
         coord(:,j) = mesh%vert(mesh%elem(i)%vert(j))%coord
       end do
-      ! order=2 means degree-2 exactness, not 12 points.  The prism
-      ! rule is 3 triangle points x 2 line points = 6 points.
+      ! The degree-2 prism rule has 6 points and the hexahedron rule 8.
       call volume_quad_pts(nv, coord, 2_ENTIER, pts, wts)
-      if (size(wts) /= size(qpw,2)) then
-        error stop 'compute_vol_qpw: expected exactly 6 prism quadrature points'
+      if (size(wts) > size(qpw,2)) then
+        error stop 'compute_vol_qpw: quadrature workspace is too small'
       end if
       do j=1,size(wts)
         qpw(1:3,j,i)=pts(:,j)

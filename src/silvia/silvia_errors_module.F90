@@ -12,7 +12,7 @@ contains
 
 	subroutine compute_error_test(mesh, qpw, sol, t, mach, volume, h_err, l2_err)
 		type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(4,6,mesh%n_elems), intent(in) :: qpw
+    real(kind=DOUBLE), dimension(:,:,:), intent(in) :: qpw
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
     real(kind=DOUBLE), intent(in) :: t
 		real(kind=DOUBLE), intent(in) :: mach
@@ -33,7 +33,7 @@ contains
 
   subroutine compute_error_isentropic(mesh, qpw, sol, t, volume, diam, error)
     type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(4,6,mesh%n_elems), intent(in) :: qpw
+    real(kind=DOUBLE), dimension(:,:,:), intent(in) :: qpw
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
     real(kind=DOUBLE), intent(in) :: t
     real(kind=DOUBLE), dimension(5), intent(inout) :: error
@@ -79,7 +79,7 @@ contains
 
   subroutine compute_error_gresho(mesh, qpw, sol, mach, volume, diam, error)
     type(mesh_type), intent(in) :: mesh
-    real(kind=DOUBLE), dimension(4,6,mesh%n_elems), intent(in) :: qpw
+    real(kind=DOUBLE), dimension(:,:,:), intent(in) :: qpw
     real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
 		real(kind=DOUBLE), intent(in) :: mach
 		real(kind=DOUBLE), dimension(5), intent(inout) :: error

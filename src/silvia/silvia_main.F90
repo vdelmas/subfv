@@ -66,7 +66,9 @@ program main
     allocate(sum_lambda(mesh%n_elems))
 
     allocate(qpw_face(4,9,mesh%n_faces))
-    allocate(qpw_vol (4,6,mesh%n_elems))
+    ! Reserve enough points for both prism (6-pt) and hexahedron (8-pt)
+    ! degree-2 volume rules used by the order>=3 finite-volume averages.
+    allocate(qpw_vol (4,8,mesh%n_elems))
     call compute_sub_face_qpw(mesh, qpw)
     if (.not. subface_quad) call compute_face_qpw(mesh, qpw_face)
     call compute_vol_qpw(mesh,qpw_vol)
