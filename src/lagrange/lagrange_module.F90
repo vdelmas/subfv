@@ -251,6 +251,196 @@ module lagrange_module
   ! RESERVE : en DETENTE (p_p < p_c) on a eps* < eps_c, le schema refroidit. A
   ! verifier du cote de la production d'entropie.
   logical, public :: pi_pp_epv = .false.
+  ! (pv)*_c = Pi_c (v_p.n) : pression de sous-face CLASSIQUE et vitesse NODALE
+  ! dans le flux d ENERGIE, alors que le flux de QUANTITE DE MOUVEMENT garde la
+  ! pression NODALE p_p. INCOHERENT PAR CONSTRUCTION, et volontairement :
+  !  - eps* devient dependant du REFERENTIEL, au taux (Pi_c - p_p)/lam_c ;
+  !  - l energie n est plus conservee, car l equilibre nodal porte sur p_p et
+  !    non sur Pi_c, donc somme A Pi_c n n est pas nul.
+  ! A MESURER, PAS A CROIRE : les deux diagnostics vpps_* ci-dessous sont
+  ! obligatoires avec ce schema.
+  logical, public :: pi_pp_vpps = .false.
+  ! (pv)*_c = p_p (v_p.n) : pression NODALE et vitesse NODALE dans le flux
+  ! d energie. Seule combinaison qui ait a la fois
+  !   - la vitesse NODALE dans le flux d energie (structure de dissipation de
+  !     classic, celle qui donne le bon flux de chaleur),
+  !   - la MEME pression que le flux de quantite de mouvement, donc invariance
+  !     galileenne et, dans eps*, aucun terme lineaire en la vitesse de maille,
+  !   - F_l = F_r identiquement, donc telescopage et conservation triviaux.
+  logical, public :: pi_pp_ppvn = .false.
+  ! pi_pp_wdiv : dans la pression nodale, PONDERER les sauts de vitesse par
+  ! 1/lambda comme le sont deja les pressions. Aujourd hui
+  !   p_p = [somme A (p_l/lam_l + p_r/lam_r) - somme A (v_r - v_l)] / somme A invlam
+  ! et le second terme, a poids UNIFORME, est exactement la divergence nodale
+  ! discrete : il s annule sur un champ solenoidal, d ou un vortex de Gresho
+  ! preserve EXACTEMENT -- et aucune dissipation au choc.
+  ! La formule actuelle annule la MOYENNE du desaccord de vitesse etoile,
+  ! somme A (u*_r - u*_l) = 0. Les MOINDRES CARRES ferment le meme systeme
+  ! sur-determine en MINIMISANT somme A (u*_r - u*_l)^2 : la stationnarite donne
+  ! somme A invlam (u*_r - u*_l) = 0, donc p_p = somme A invlam (S - dv) /
+  ! somme A invlam^2. La ponderation en 1/lambda TOMBE de la minimisation, elle
+  ! n est pas inseree, et la somme en dv n est alors plus une divergence des que
+  ! les impedances varient d une sous-face a l autre. Or cette dispersion est elle-meme en O(Ma^2) dans un ecoulement
+  ! bas Mach (rho et p y fluctuent en Ma^2) et d ordre UN au choc (lambda y
+  ! capte les sauts). L ecart a la divergence est donc en O(Ma^2) a bas Mach et
+  ! O(1) au choc, SANS aucun coefficient : mesure, le rapport ecart/Ma^2 vaut
+  ! 0,21 constant de Ma = 1e-4 a 1e-1, et l ecart monte a 0,14 / 0,33 / 0,47
+  ! aux Mach 1 / 3 / 10.
+  ! La normalisation par <invlam> garantit la NON-REGRESSION : a impedances
+  ! uniformes le poids vaut 1 et on retrouve la formule actuelle au bit pres.
+  logical, public :: pi_pp_wdiv = .false.
+  ! pi_pp_veps : la pression nodale fermee par une condition sur l ENERGIE
+  ! INTERNE intermediaire, somme_f A (eps*_r - eps*_l) = 0, proposee par Vincent.
+  ! Avec mu = lambda le facteur de relaxation vaut 1, donc e*_s = e_p des DEUX
+  ! cotes et eps*_r - eps*_l = (u*_l^2 - u*_r^2)/2 : e_p s ELIMINE identiquement
+  ! (verifie a 6e-14). La condition porte donc sur les VITESSES etoile,
+  !   somme A (u*_r^2 - u*_l^2) = 0,
+  ! et comme u*_r^2 - u*_l^2 = (u*_r - u*_l)(u*_r + u*_l), c est le desaccord de
+  ! vitesse PONDERE PAR LA VITESSE ETOILE MOYENNE -- une ponderation DERIVEE d une
+  ! exigence physique au noeud, et non d une minimisation.
+  ! L equation est quadratique en p_p. Son terme quadratique a pour coefficient
+  ! somme A (1/lam_r^2 - 1/lam_l^2), une DIFFERENCE qui s annule par symetrie, et
+  ! son terme lineaire 2 somme A (u*_r/lam_r + u*_l/lam_l), une SOMME qui ne s
+  ! annule pas (0,336 de son echelle). On resout donc la quadratique quand elle
+  ! est franche et la lineaire sinon, et on retient la racine la plus proche de
+  ! la fermeture de moyenne -- qui reste la valeur de repli si rien ne convient.
+  logical, public :: pi_pp_veps = .false.
+  ! pi_conv_stab : IMPEDANCE DE STABILISATION CONVECTIVE dans la pression de
+  ! sous-face de `classic`. La force exercee sur une maille par ses sous-faces
+  ! au noeud vaut EXACTEMENT (identite verifiee a 1e-17)
+  !     somme_f A Pi_{c,f} n_f = p_c N_pc - lambda_c M_pc (v_p - v_c),
+  ! avec N_pc la normale de coin et M_pc = somme_f A n(x)n. Le second terme est
+  ! une TRAINEE lineaire vers la vitesse nodale, de coefficient lambda = rho a,
+  ! donc a la vitesse du SON. Dans un vortex v_p - v_c = O(h grad v) ne s annule
+  ! jamais : la trainee relative est O(Ma) et, rapportee a la fluctuation
+  ! physique de pression O(Ma^2), elle DIVERGE en 1/Ma. C est ce qui mange le
+  ! vortex de Gresho, et `vp_pp` ne l a pas du tout puisque sa force vaut
+  ! p_p N_pc tout court.
+  ! Remplacer l impedance de STABILISATION par le taux CONVECTIF
+  !     mu_c = rho_c |v_p.n - v_c.n|
+  ! rend la trainee O(Ma^2), soit l ordre de la fluctuation physique (mesure :
+  ! 1,24e-5 / 1,24e-7 / 1,24e-9 aux Mach 1e-1 / 1e-2 / 1e-3, contre
+  ! 3,5e-3 / 3,5e-4 / 3,5e-5 au taux acoustique). Au choc |dv| ~ a et on
+  ! retrouve exactement la dissipation de `classic`. Aucun coefficient libre :
+  ! c est une difference de vitesses.
+  ! Les VITESSES D ONDE et le pas de temps gardent rho a : on separe les deux
+  ! roles de lambda, on n affaiblit pas la borne de positivite.
+  ! L equation nodale devient non lineaire en v_p ; on utilise la vitesse nodale
+  ! du PAS PRECEDENT (point fixe retarde d une iteration), ce que Vincent a
+  ! explicitement autorise.
+  logical, public :: pi_conv_stab = .false.
+  ! pi_pivp : flux d energie = Pi_c (v_p.n) + relaxation nodale, avec Pi_c la
+  ! pression de sous-face CLASSIQUE et p_p dans le flux de QUANTITE DE MOUVEMENT.
+  !   (pv)*_l = Pi_l (v_p.n) - mu_l (e_p - e_l)
+  !   (pv)*_r = Pi_r (v_p.n) + mu_r (e_p - e_r)
+  ! Le telescopage somme A[(pv)*_r - (pv)*_l] = 0 donne
+  !   e_p somme A(mu_l+mu_r) = somme A[mu_l e_l + mu_r e_r] - v_p.somme A(Pi_r-Pi_l) n
+  ! et le dernier terme est NUL par l equation meme de la vitesse nodale. Donc
+  !   **e_p = somme A[mu_l e_l + mu_r e_r] / somme A(mu_l + mu_r)**,
+  ! une COMBINAISON CONVEXE des energies de maille, bornee quel que soit mu.
+  ! La singularite en mu de la version `p_c v_c` -- ou le travail de pression
+  ! n avait aucun facteur mu, d ou e_p -> inf et l effondrement du maillage --
+  ! DISPARAIT. Le taux convectif redevient donc utilisable.
+  ! pi_pp_ppus : LE flux d energie invariant par changement de referentiel.
+  !   (pv)*_c = p_p (u*_c . n) -/+ mu_c (eps_p - eps_c)
+  ! avec u*_c.n = v_c + ds_c la vitesse etoile de SON PROPRE cote
+  ! (ds_l = (p_l-p_p)/lam_l, ds_r = (p_p-p_r)/lam_r), celle que donne la ligne de
+  ! QUANTITE DE MOUVEMENT du saut, et eps l energie INTERNE.
+  ! Mesure (jouet a 4 mailles, boost de 1, 5 et 20) : l ecart sur eps*_l vaut
+  ! 4e-16 pour cette forme contre 1,4e-1 / 6,8e-1 / 2,7e+0 pour pivp, ep, ppvn et
+  ! ppus en energie TOTALE -- lineaire en la vitesse du repere, et eps* devient
+  ! NEGATIF a grande vitesse depuis un etat au repos parfaitement sain.
+  ! Les TROIS conditions sont necessaires ensemble :
+  !   (a) la pression du travail = p_p, la meme que celle de la QdM ;
+  !   (b) la vitesse du travail = u*_c de son cote, pas v_p.n ;
+  !   (c) la quantite relaxee = eps, pas e (une energie TOTALE n est pas invariante).
+  ! Conservation EXACTE et gratuite : le travail p_p (u*_c.n) telescope seul, car
+  ! somme A [(v_r+ds_r) - (v_l+ds_l)] = 0 EST la definition de p_p. Donc
+  !   eps_p = somme A (mu_l eps_l + mu_r eps_r) / somme A (mu_l + mu_r),
+  ! combinaison convexe des energies INTERNES.
+  ! vp_gcorr : REDRESSEMENT GEOMETRIQUE de la reponse en pression de la vitesse
+  ! nodale. Le systeme nodal donne
+  !     v_p = Mp^-1 somme A(lam_l v_l + lam_r v_r) n  +  Mp^-1 Sp,
+  ! avec Sp = somme_f A (p_l - p_r) n. Pour un champ de pression LINEAIRE
+  ! p = p_p + g.(x - x_p) on a Sp = -Gp g avec le tenseur de moments
+  !     Gp = somme_f A n (x) (x_r - x_l),
+  ! donc la reponse vaut -Mp^-1 Gp g : elle n'est correcte que si Mp^-1 Gp est
+  ! ISOTROPE. Mesure sur un maillage triangulaire structure : anisotropie 2,414
+  ! (= 1 + racine(2)) meme sans perturbation, et jusqu'a 11 a 30 % de
+  ! perturbation ; un gradient de pression produit alors une vitesse nodale
+  ! deviee de ~21 degres et de module variable d'un facteur 2.
+  ! Correctif : remplacer Mp^-1 Sp par s_p Gp^-1 Sp avec s_p = tr(Mp^-1 Gp)/d,
+  ! qui rend la reponse exactement parallele a g et de module independant de sa
+  ! direction. La MOYENNE DE VITESSE est inchangee. Gp est PUREMENT GEOMETRIQUE
+  ! (aucun lambda) : y mettre les lambda reintroduit une anisotropie (mesure :
+  ! 2,52 degres au lieu de 0 sur 6 triangles reguliers a lambda variable).
+  ! Redonne le schema actuel au bit pres partout ou Mp^-1 Gp est deja isotrope
+  ! (1D, cartesien, polygones reguliers a lambda uniforme).
+  logical, public :: vp_gcorr = .false.
+  integer(kind=ENTIER), public :: gcorr_n = 0, gcorr_nfall = 0
+  logical, public :: pi_pp_ppus = .false.
+  logical, public :: pi_pivp = .false.
+  ! pi_tang : DISSIPATION SUR LA VITESSE TANGENTIELLE. Dans toutes les
+  ! fermetures precedentes le tangentiel est INCHANGE -- la relation de quantite
+  ! de mouvement -lam_l(u*_l - u_l) = (p_p - p_l) n est purement normale -- donc
+  ! |u*_s|^2 = (u*_n)^2 + |u_t,s|^2 avec le tangentiel intact.
+  ! En imposant un tangentiel etoile COMMUN, la convexite donne
+  ! |u*_t|^2 <= <|u_t,s|^2> : l energie cinetique de cisaillement DIMINUE, donc
+  ! l energie interne AUGMENTE, donc la marge eps* = e_p - |u*|^2/2 s OUVRE.
+  ! C est exactement ce qui manque aux ecoulements FROIDS ET EN MOUVEMENT, ou la
+  ! marge vaut ~eps_0 (Noh : 11 % des sous-faces en violation).
+  ! Estimation sur Noh : pour h/r >= 1e-2 le gain vaut 5 a 500 fois la marge
+  ! manquante, donc ca peut fermer le trou.
+  ! CONSERVATION GRATUITE : imposer nu_l(u*_t - u_t,l) + nu_r(u*_t - u_t,r) = 0
+  ! rend le flux tangentiel UNIVALUE, donc il telescope exactement, et definit
+  !     u*_t = (nu_l u_t,l + nu_r u_t,r)/(nu_l + nu_r).
+  ! Deux taux :
+  !   tang_mode 1 : nu_s = lambda_s (ACOUSTIQUE). C est le modified_three_wave de
+  !     la these : positivite plus facile, mais la dissipation de shear est
+  !     active partout et POURRIT LE FLUX DE CHALEUR dans la couche limite.
+  !   tang_mode 2 : nu_s = rho_s |u_t,r - u_t,l| (CONVECTIF). La dissipation vaut
+  !     alors rho|du_t|^3 au lieu de lambda|du_t|^2, donc elle s eteint bien plus
+  !     vite dans un cisaillement lisse. Le |du_t| se simplifie dans la moyenne,
+  !     qui vaut (rho_l u_t,l + rho_r u_t,r)/(rho_l+rho_r) : pas de 0/0.
+  ! pi_bord_psw : traitement de BORD unilateral, porte depuis le correctif `psw`
+  ! valide cote Euler. A une sous-face de BORD il n y a pas de second etat, donc
+  ! le glissement (p_l - p_p)/lam_l impose par la pression nodale n est borne
+  ! par rien. Mesure sur Noh : au pas 2, eps_min passe de +2,51e-6 (classic) a
+  ! -2,24e-4 avec 768 NaN, et les mailles fautives sont les BORDS et les COINS
+  ! (1-4 et 342-400 sur 400), pas l interieur -- une extraction valant 90 fois
+  ! l energie interne disponible. rho_min y est IDENTIQUE a 16 chiffres entre
+  ! les deux schemas, donc seule l energie differe.
+  ! Correctif : sous-faces de bord hors de la moyenne de p_p, et flux
+  ! unilateral classique (Pi n, Pi v_p.n) au bord.
+  logical, public :: pi_bord_psw = .false.
+  integer(kind=ENTIER), public :: tang_mode = 0
+  integer(kind=ENTIER), public :: tang_n = 0, tang_nact = 0
+  ! Plancher PUREMENT NUMERIQUE, en fraction de rho a, pour que M_p ne soit pas
+  ! identiquement nulle dans un ecoulement exactement uniforme ou v_p = v_c.
+  ! Ce n est pas un parametre physique : on COMPTE les sous-faces ou il mord.
+  real(kind=DOUBLE), public :: conv_floor = 1.0e-10_DOUBLE
+  integer(kind=ENTIER), public :: conv_n = 0, conv_nfloor = 0
+  ! Diagnostic PASSIF de la MARGE DE POSITIVITE de l energie interne
+  ! intermediaire. Avec mu = lambda le facteur de relaxation vaut 1, donc
+  ! e*_s = e_p des DEUX cotes et
+  !      eps*_s = e_p - |u*_s|^2/2,
+  ! si bien que la positivite equivaut EXACTEMENT a e_p > |u*_s|^2/2 sur chaque
+  ! sous-face. e_p etant fixe par la conservation, la marge
+  !      r = (e_p - |u*_s|^2/2) / max(|e_p|, tiny)
+  ! se mesure directement. Cases : r <= 0 (VIOLATION), < 1e-3, < 1e-2, < 1e-1, >= 1e-1.
+  integer(kind=ENTIER), public :: pos_hist(5) = 0
+  integer(kind=ENTIER), public :: pos_tot = 0
+  real(kind=DOUBLE), public :: pos_worst = 1.0e300_DOUBLE
+  ! Diagnostic PASSIF : de combien la fermeture par MOINDRES CARRES deplace-t-elle
+  ! la pression nodale par rapport a la condition de MOYENNE ? Si l ecart relatif
+  ! est negligeable, ce n est pas l idee qui echoue mais l amplitude du levier.
+  ! Cases de |p_mc - p_moy| / max(|p_moy|, tiny) : <1e-6, <1e-4, <1e-2, <1e-1, >=1e-1.
+  integer(kind=ENTIER), public :: ppmc_hist(5) = 0
+  integer(kind=ENTIER), public :: ppmc_tot = 0
+  ! Defaut de telescopage INTERIEUR : somme A (flux_l(5) - flux_r(5)). Pour tous
+  ! les autres schemas les deux expressions sont identiques et ceci vaut 0.
+  real(kind=DOUBLE), public :: vpps_tel = 0.0_DOUBLE
+  real(kind=DOUBLE), public :: vpps_tel_abs = 0.0_DOUBLE
   ! Diagnostic du terme ci-dessus. On sort un COMPTE et une somme, jamais le seul
   ! extremum : un max mesure la sous-population extreme et pas la population.
   ! psvp_ref cumule la dissipation de classic somme A lam delta^2, pour que le
@@ -281,6 +471,15 @@ module lagrange_module
   integer(kind=ENTIER), public :: psvp_n_sf = 0, psvp_n_neg = 0
   real(kind=DOUBLE), public :: psvp_sum = 0.0_DOUBLE, psvp_sum_neg = 0.0_DOUBLE
   real(kind=DOUBLE), public :: psvp_ref = 0.0_DOUBLE, psvp_worst = 0.0_DOUBLE
+  ! Diagnostic S : production TOTALE ponderee d energie interne de la fermeture
+  ! (pv)*_c = p_p v*_c, S = 1/2[(1/lam_l+1/lam_r) p_p^2 - p_l^2/lam_l - p_r^2/lam_r].
+  ! S ne depend PAS du partage de l energie entre les deux cotes : une case
+  ! NEGATIVE signifie p_p sous la moyenne QUADRATIQUE des p ponderee en 1/lam,
+  ! donc une fermeture qui PREND de l energie interne sur cette sous-face.
+  ! Comptes par case, pas de max : le max ne mesurerait que l extreme.
+  ! Cases : < -1e-1, < -1e-2, < -1e-3, < -1e-6, < 0, >= 0.
+  integer(kind=ENTIER), public :: sdiag_n(6) = 0
+  integer(kind=ENTIER), public :: sdiag_tot = 0
   ! 'vp_pp_pos_sv' : la variante UNIVALUEE de l'ecretage (construction de Vincent).
   ! L'ecretage existant ci-dessus prend min(t_f, cap_l) a gauche et max(t_f, flo_r)
   ! a droite, donc DEUX valeurs par sous-face, donc une perte de conservation qu'il
@@ -4181,6 +4380,7 @@ contains
     real(kind=DOUBLE), dimension(3, 3) :: Mp, Mp_inv
     real(kind=DOUBLE), dimension(3) :: Rp, Bp
     real(kind=DOUBLE) :: vl, vr, pl, pr, v_bar, pl_et, pr_et, v_et, Pp
+    real(kind=DOUBLE) :: vn_cv, al_cv, ar_cv, mu_cv
     real(kind=DOUBLE) :: gl, gr, al, ar, taul, taur
     logical :: is_corner, have_first_wall_norm
     real(kind=DOUBLE), dimension(3) :: first_wall_norm, dx
@@ -4283,6 +4483,29 @@ contains
             sqrt(max(0.0_DOUBLE, pr-pl)/sol_lr(1,1,j)), -(vr-vl)/sol_lr(1,1,j))
           lambda(2, j) = max(sqrt(gr*pr*sol_lr(1,2,j))/sol_lr(1,2,j), &
             sqrt(max(0.0_DOUBLE, pl-pr)/sol_lr(1,2,j)), -(vr-vl)/sol_lr(1,2,j))
+          if (pi_conv_stab) then
+            ! Taux CONVECTIF EXPLICITE : le saut de MAILLE A MAILLE |v_r - v_l|,
+            ! et non l ecart au noeud |v_p - v_c|. Les deux sont O(h grad v) donc
+            ! donnent le meme O(Ma^2), mais celui-ci est connu AVANT de resoudre.
+            ! La version au noeud fait diverger le point fixe : mu depend de v_p
+            ! et v_p depend de 1/mu par l inverse de M_p, d ou petit mu -> v_p
+            ! enorme -> mu enorme. Mesure : 46 % des sous-faces au plancher et
+            ! max|v_p| a 1e28 sur Gresho.
+            ! Ce terme n est pas neuf : c est le troisieme du max deja present
+            ! dans lambda = max(rho a, sqrt(rho dp), -rho dv), pris SEUL au lieu
+            ! d etre plafonne par rho a.
+            vn_cv = vr - vl
+            al_cv = sqrt(max(0.0_DOUBLE, gl*pl*sol_lr(1,1,j)))/sol_lr(1,1,j)
+            ar_cv = sqrt(max(0.0_DOUBLE, gr*pr*sol_lr(1,2,j)))/sol_lr(1,2,j)
+            mu_cv = abs(vn_cv)/sol_lr(1,1,j)
+            conv_n = conv_n + 1
+            if (mu_cv < conv_floor*al_cv) conv_nfloor = conv_nfloor + 1
+            lambda(1, j) = max(mu_cv, conv_floor*al_cv)
+            mu_cv = abs(vn_cv)/sol_lr(1,2,j)
+            conv_n = conv_n + 1
+            if (mu_cv < conv_floor*ar_cv) conv_nfloor = conv_nfloor + 1
+            lambda(2, j) = max(mu_cv, conv_floor*ar_cv)
+          end if
         end if
         ! Distribution de lambda_schema / (rho a) PAR SOUS-FACE. `compute_dt` met
         ! `lambda = rho*c` sans condition, alors que la fermeture utilise le max a
@@ -5913,6 +6136,10 @@ contains
     real(kind=DOUBLE) :: pp, s_num, s_den, v_et, Pw, cross_z, area, v_target
     real(kind=DOUBLE) :: ppvp, q_num, q_den, q_bar, ql, qr, v_node, xjump
     real(kind=DOUBLE) :: psvp_pil, psvp_pir, psvp_t
+    real(kind=DOUBLE), dimension(3,3) :: Gp, Gp_inv, MinvG
+    real(kind=DOUBLE), dimension(3) :: Sp, dxc
+    real(kind=DOUBLE) :: s_gc, detG
+    integer(kind=ENTIER) :: nd_gc
     integer(kind=ENTIER) :: psvp_it, psvp_nit
     real(kind=DOUBLE) :: psvp_epss, psvp_lreq
     real(kind=DOUBLE), dimension(:), allocatable :: ppvp_face
@@ -5971,6 +6198,8 @@ contains
       ! ---- pass 1: nodal velocity system ----------------------------------
       Mp = 0.0_DOUBLE
       Rp = 0.0_DOUBLE
+      Gp = 0.0_DOUBLE
+      Sp = 0.0_DOUBLE
       Bp = 0.0_DOUBLE
       is_corner = .false.
       have_first_wall_norm = .false.
@@ -6011,6 +6240,13 @@ contains
             Mp = Mp + area*(lam_l + lam_r) &
               * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
             Rp = Rp + area*(lam_l + lam_r)*mesh%face(id_face)%norm*v_bar
+            if (vp_gcorr) then
+              ! Sp = somme A (p_l - p_r) n  : la part de pression de Rp.
+              ! Gp = somme A n (x) (x_r - x_l)  : purement geometrique.
+              Sp = Sp + area*(pl - pr)*mesh%face(id_face)%norm
+              dxc = mesh%elem(idr)%coord - mesh%elem(idl)%coord
+              Gp = Gp + area*tensor_product(mesh%face(id_face)%norm, dxc)
+            end if
           end if
         else
           lam_l = sqrt(gl*pl*taul)/taul
@@ -6051,6 +6287,34 @@ contains
         else
           call inverse_3_by_3(Mp, Mp_inv)
           vp(:, i) = matmul(Mp_inv, Rp)
+          if (vp_gcorr) then
+            ! en boundary_2d le probleme est plan : on force la 3e direction a
+            ! l'identite pour que Gp soit inversible et que v_p,z reste nul.
+            nd_gc = 3
+            if (b2d) then
+              Gp(3,:) = 0.0_DOUBLE; Gp(:,3) = 0.0_DOUBLE; Gp(3,3) = 1.0_DOUBLE
+              nd_gc = 2
+            end if
+            detG = Gp(1,1)*(Gp(2,2)*Gp(3,3)-Gp(2,3)*Gp(3,2)) &
+                 - Gp(1,2)*(Gp(2,1)*Gp(3,3)-Gp(2,3)*Gp(3,1)) &
+                 + Gp(1,3)*(Gp(2,1)*Gp(3,2)-Gp(2,2)*Gp(3,1))
+            gcorr_n = gcorr_n + 1
+            if (abs(detG) > 1.0e-30_DOUBLE) then
+              call inverse_3_by_3(Gp, Gp_inv)
+              MinvG = matmul(Mp_inv, Gp)
+              s_gc = 0.0_DOUBLE
+              do j = 1, nd_gc
+                s_gc = s_gc + MinvG(j,j)
+              end do
+              s_gc = s_gc / real(nd_gc, DOUBLE)
+              ! on retire la reponse en pression actuelle et on remet la redressee
+              vp(:, i) = matmul(Mp_inv, Rp - Sp) + s_gc*matmul(Gp_inv, Sp)
+              if (b2d) vp(3, i) = 0.0_DOUBLE
+            else
+              ! Gp singulier (noeud de bord, mailles d un seul cote) : repli
+              gcorr_nfall = gcorr_nfall + 1
+            end if
+          end if
         end if
       end if
 
@@ -6904,6 +7168,9 @@ contains
     real(kind=DOUBLE) :: lam_l, lam_r, v_bar, Pw, cross_z, area, v_target, v_et
     logical :: is_corner, have_first_wall_norm, is_zface
     real(kind=DOUBLE) :: pp_ep, s_num, s_den, p_bar, invlam
+    real(kind=DOUBLE) :: s_presw, s_divw, s_den2
+    real(kind=DOUBLE) :: q_a, q_b, q_c, disc, r1, r2, pp_lin
+    real(kind=DOUBLE) :: mbar
 
     rhs = 0.0_DOUBLE
     if (.not. allocated(ep_node)) allocate(ep_node(mesh%n_vert))
@@ -7007,6 +7274,8 @@ contains
       pp_ep = 0.0_DOUBLE
       if (pi_pp_ep) then
         s_num = 0.0_DOUBLE; s_den = 0.0_DOUBLE
+        s_presw = 0.0_DOUBLE; s_divw = 0.0_DOUBLE; s_den2 = 0.0_DOUBLE
+        q_a = 0.0_DOUBLE; q_b = 0.0_DOUBLE; q_c = 0.0_DOUBLE
         do j = 1, nsfn
           id_sub_face = mesh%vert(i)%sub_face_neigh(j)
           id_face = mesh%sub_face(id_sub_face)%mesh_face
@@ -7014,6 +7283,9 @@ contains
           idr = mesh%face(id_face)%right_neigh
           area = mesh%sub_face(id_sub_face)%area
           if (b2d .and. abs(mesh%face(id_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE) cycle
+          ! correctif psw : les sous-faces de BORD sortent de la moyenne de p_p,
+          ! comme les faces z, et pour la meme raison -- pas de second etat.
+          if (pi_bord_psw .and. mesh%face(id_face)%right_neigh <= 0) cycle
           gl = gamma_arr(idl); taul = sol(1, idl)
           pl = pressure(sol(:, idl), gl)
           vl = dot_product(sol(2:4, idl), mesh%face(id_face)%norm)
@@ -7044,8 +7316,69 @@ contains
           p_bar = (pl/lam_l + pr/lam_r - (vr - vl))/invlam
           s_num = s_num + area*invlam*p_bar
           s_den = s_den + area*invlam
+          ! parts separees, pour la variante ponderee (voir pi_pp_wdiv)
+          ! coefficients de somme A (u*_r^2 - u*_l^2) = 0, developpee en p_p
+          ! avec u*_l = vl + (pl - p_p)/lam_l et u*_r = vr + (p_p - pr)/lam_r.
+          q_a = q_a + area*(1.0_DOUBLE/(lam_r*lam_r) - 1.0_DOUBLE/(lam_l*lam_l))
+          q_b = q_b + area*2.0_DOUBLE*( vr/lam_r - pr/(lam_r*lam_r) &
+                                      + vl/lam_l + pl/(lam_l*lam_l) )
+          q_c = q_c + area*( vr*vr - 2.0_DOUBLE*vr*pr/lam_r + pr*pr/(lam_r*lam_r) &
+                           - vl*vl - 2.0_DOUBLE*vl*pl/lam_l - pl*pl/(lam_l*lam_l) )
+          ! sommes des MOINDRES CARRES (voir pi_pp_wdiv)
+          s_presw = s_presw + area*invlam*(pl/lam_l + pr/lam_r)
+          s_divw  = s_divw  + area*invlam*(vr - vl)
+          s_den2  = s_den2  + area*invlam*invlam
         end do
         if (s_den > 0.0_DOUBLE) pp_ep = s_num/s_den
+        ! diagnostic passif : ecart entre les deux fermetures, TOUJOURS calcule
+        if (s_den > 0.0_DOUBLE .and. s_den2 > 0.0_DOUBLE) then
+          mbar = abs((s_presw - s_divw)/s_den2 - s_num/s_den) &
+                 / max(abs(s_num/s_den), 1.0e-300_DOUBLE)
+          ppmc_tot = ppmc_tot + 1
+          if (mbar < 1.0e-6_DOUBLE) then
+            ppmc_hist(1) = ppmc_hist(1) + 1
+          else if (mbar < 1.0e-4_DOUBLE) then
+            ppmc_hist(2) = ppmc_hist(2) + 1
+          else if (mbar < 1.0e-2_DOUBLE) then
+            ppmc_hist(3) = ppmc_hist(3) + 1
+          else if (mbar < 1.0e-1_DOUBLE) then
+            ppmc_hist(4) = ppmc_hist(4) + 1
+          else
+            ppmc_hist(5) = ppmc_hist(5) + 1
+          end if
+        end if
+        if (pi_pp_veps .and. abs(q_b) > 0.0_DOUBLE) then
+          ! quadratique franche ? on compare le terme en p_p^2 au terme lineaire
+          ! a l echelle de la pression de repli.
+          if (abs(q_a)*abs(pp_ep) > 1.0e-8_DOUBLE*abs(q_b)) then
+            disc = q_b*q_b - 4.0_DOUBLE*q_a*q_c
+            if (disc >= 0.0_DOUBLE) then
+              r1 = (-q_b + sqrt(disc))/(2.0_DOUBLE*q_a)
+              r2 = (-q_b - sqrt(disc))/(2.0_DOUBLE*q_a)
+              ! racine la plus proche de la fermeture de moyenne, et POSITIVE
+              if (r1 > 0.0_DOUBLE .and. &
+                  (r2 <= 0.0_DOUBLE .or. abs(r1-pp_ep) <= abs(r2-pp_ep))) then
+                pp_ep = r1
+              else if (r2 > 0.0_DOUBLE) then
+                pp_ep = r2
+              end if
+            end if
+          else
+            pp_lin = -q_c/q_b
+            if (pp_lin > 0.0_DOUBLE) pp_ep = pp_lin
+          end if
+        end if
+        if (pi_pp_wdiv .and. s_den2 > 0.0_DOUBLE) then
+          ! MOINDRES CARRES : p_p minimise somme A (u*_r - u*_l)^2, alors que la
+          ! formule ci-dessus annule la MOYENNE somme A (u*_r - u*_l). Les deux
+          ! ferment le meme systeme sur-determine, aucune n'a de parametre, et
+          ! elles COINCIDENT EXACTEMENT a impedances uniformes.
+          ! La stationnarite donne somme A invlam (u*_r - u*_l) = 0, d ou
+          !   p_p = somme A invlam (S - dv) / somme A invlam^2,  S = p_l/lam_l + p_r/lam_r.
+          ! C est la ponderation par invlam -- et non une insertion a la main --
+          ! qui fait que le terme en dv n est plus une divergence exacte.
+          pp_ep = (s_presw - s_divw)/s_den2
+        end if
       end if
 
       ! ---- PASSE 2 : energie nodale ------------------------------------------
@@ -7280,6 +7613,24 @@ contains
         end if
         cycle
       end if
+      if (pi_pp_ppus) then
+        ! eps_p : combinaison convexe des energies INTERNES. Le travail de
+        ! pression p_p (u*_c.n) telescope seul, il ne doit donc PAS figurer ici.
+        num = num + area*(mu_l*(sol(5, idl) &
+                   - 0.5_DOUBLE*dot_product(sol(2:4, idl), sol(2:4, idl))) &
+                   + mu_r*(solr(5) &
+                   - 0.5_DOUBLE*dot_product(solr(2:4), solr(2:4))))
+        den = den + area*(mu_l + mu_r)
+        cycle
+      end if
+      if (pi_pivp) then
+        ! e_p = somme A[mu_l e_l + mu_r e_r] / somme A(mu_l+mu_r) : le travail de
+        ! pression a disparu du numerateur (il telescope seul), donc e_p est une
+        ! combinaison convexe et ne peut pas diverger quand mu devient petit.
+        num = num + area*(mu_l*sol(5,idl) + mu_r*solr(5))
+        den = den + area*(mu_l + mu_r)
+        cycle
+      end if
       if (pi_pp_epsp .and. present(pp_in)) then
         ! X_c = eps_c - v_c delta_c - delta_c^2/2, le meme signe des deux cotes.
         ! Le glissement porte lam (relation de quantite de mouvement) et non mu.
@@ -7350,7 +7701,14 @@ contains
     real(kind=DOUBLE) :: pl, pr, taul, taur, vl, vr, lam_l, lam_r, pi_l, pi_r
     real(kind=DOUBLE) :: pvl, pvr, el, er, mu_l, mu_r, cl, cr, cap
     real(kind=DOUBLE) :: dsl, dsr
+    real(kind=DOUBLE) :: s_prod, s_ref
+    real(kind=DOUBLE) :: pm_l, pm_r, pm_rel
+    real(kind=DOUBLE), dimension(3) :: utl, utr, ust, ft
+    real(kind=DOUBLE) :: dut, nu_l, nu_r
+    logical :: bord_psw_actif
+    logical :: bord_loc
 
+    bord_psw_actif = .false.
     taul = sol_w_l(1)
     taur = sol_w_r(1)
     pl = pressure(sol_w_l, g_l)
@@ -7394,7 +7752,27 @@ contains
 
     mu_l = lam_l*wip_phi(vn_nodal, vl, taul, pl, g_l, pr - pl)
     mu_r = lam_r*wip_phi(vn_nodal, vr, taur, pr, g_r, pr - pl)
-    if (pi_pp_epv .and. present(pp_nodal)) then
+    if (pi_pp_ppus .and. present(pp_nodal)) then
+      ! pvl = p_p (v_l + ds_l) - mu_l (eps_p - eps_l). el/er portent deja
+      ! l energie INTERNE (branche pi_ep_interne plus haut), e_nodal aussi.
+      dsl = (pl - pp_nodal)/lam_l
+      dsr = (pp_nodal - pr)/lam_r
+      cl = (pl - pp_nodal)*vl - pp_nodal*dsl + mu_l*(e_nodal - el)
+      cr = (pp_nodal - pr)*vr + pp_nodal*dsr + mu_r*(e_nodal - er)
+    else if (pi_pivp .and. present(pp_nodal)) then
+      ! pvl = Pi_l (v_p.n) - mu_l (e_p - e_l), avec pvl = pl*vl - cl
+      cl = pl*vl - pi_l*vn_nodal + mu_l*(e_nodal - el)
+      cr = pi_r*vn_nodal - pr*vr + mu_r*(e_nodal - er)
+    else if (pi_pp_ppvn .and. present(pp_nodal)) then
+      ! pvl = pvr = p_p (v_p.n)
+      cl = pl*vl - pp_nodal*vn_nodal
+      cr = pp_nodal*vn_nodal - pr*vr
+    else if (pi_pp_vpps .and. present(pp_nodal)) then
+      ! pvl = Pi_l (v_p.n) et pvr = Pi_r (v_p.n), avec pvl = pl*vl - cl et
+      ! pvr = pr*vr + cr.
+      cl = pl*vl - pi_l*vn_nodal
+      cr = pi_r*vn_nodal - pr*vr
+    else if (pi_pp_epv .and. present(pp_nodal)) then
       ! (pv)*_c = p_p v*_c, avec v*_c la vitesse etoile ACOUSTIQUE de la maille.
       ! Aucune energie nodale n'intervient : e_nodal n'est pas utilise.
       dsl = (pl - pp_nodal)/lam_l
@@ -7428,17 +7806,43 @@ contains
     pvl = pl*vl - cl
     pvr = pr*vr + cr
 
+    ! --- dissipation tangentielle (voir tang_mode) -----------------------
+    if (tang_mode > 0) then
+      utl = sol_w_l(2:4) - dot_product(sol_w_l(2:4), n)*n
+      utr = sol_w_r(2:4) - dot_product(sol_w_r(2:4), n)*n
+      dut = sqrt(dot_product(utr - utl, utr - utl))
+      if (tang_mode == 1) then
+        nu_l = lam_l ; nu_r = lam_r
+      else
+        nu_l = dut/taul ; nu_r = dut/taur
+      end if
+      tang_n = tang_n + 1
+      if (nu_l + nu_r > 0.0_DOUBLE) then
+        ust = (nu_l*utl + nu_r*utr)/(nu_l + nu_r)
+        ft  = nu_l*(ust - utl)          ! = -nu_r*(ust - utr), donc UNIVALUE
+        if (dot_product(ft, ft) > 0.0_DOUBLE) tang_nact = tang_nact + 1
+      else
+        ust = 0.5_DOUBLE*(utl + utr) ; ft = 0.0_DOUBLE
+      end if
+    else
+      ft = 0.0_DOUBLE ; ust = 0.0_DOUBLE
+    end if
+
     flux_l(1)   = -vn_nodal
-    flux_l(2:4) = pi_l*n
-    flux_l(5)   = pvl
+    flux_l(2:4) = pi_l*n - ft
+    flux_l(5)   = pvl - dot_product(ft, ust)
 
     flux_r(1)   = -vn_nodal
-    flux_r(2:4) = pi_r*n
-    flux_r(5)   = pvr
+    flux_r(2:4) = pi_r*n - ft
+    flux_r(5)   = pvr - dot_product(ft, ust)
 
     if (present(bord)) then
       if (bord) then
-        if (present(pp_nodal)) then
+        if (pi_bord_psw) then
+          flux_l(5) = pi_l*vn_nodal
+          flux_r(5) = pi_r*vn_nodal
+          bord_psw_actif = .true.
+        else if (present(pp_nodal)) then
           flux_l(5) = pp_nodal*vn_nodal
           flux_r(5) = pp_nodal*vn_nodal
         else
@@ -7448,9 +7852,32 @@ contains
       end if
     end if
 
+    ! --- marge de positivite (passif, voir pos_hist) ---------------------
     if (present(pp_nodal)) then
-      flux_l(2:4) = pp_nodal*n
-      flux_r(2:4) = pp_nodal*n
+      dsl = (pl - pp_nodal)/lam_l
+      dsr = (pp_nodal - pr)/lam_r
+      pm_l = e_nodal - 0.5_DOUBLE*(vl + dsl)**2
+      pm_r = e_nodal - 0.5_DOUBLE*(vr + dsr)**2
+      pm_rel = min(pm_l, pm_r)/max(abs(e_nodal), 1.0e-300_DOUBLE)
+      pos_tot = pos_tot + 1
+      pos_worst = min(pos_worst, pm_rel)
+      if (pm_rel <= 0.0_DOUBLE) then
+        pos_hist(1) = pos_hist(1) + 1
+      else if (pm_rel < 1.0e-3_DOUBLE) then
+        pos_hist(2) = pos_hist(2) + 1
+      else if (pm_rel < 1.0e-2_DOUBLE) then
+        pos_hist(3) = pos_hist(3) + 1
+      else if (pm_rel < 1.0e-1_DOUBLE) then
+        pos_hist(4) = pos_hist(4) + 1
+      else
+        pos_hist(5) = pos_hist(5) + 1
+      end if
+    end if
+    if (present(pp_nodal)) then
+      if (.not. bord_psw_actif) then
+        flux_l(2:4) = pp_nodal*n - ft
+        flux_r(2:4) = pp_nodal*n - ft
+      end if
       ! Le terme qui separe ce bilan d'energie interne de celui de vp_ep :
       ! somme_f A (p_p - Pi_c) u_c, nul au repos et sans signe sinon.
       psvp_n_sf = psvp_n_sf + 2
@@ -7458,6 +7885,38 @@ contains
       if ((pp_nodal - pi_l)*vl < 0.0_DOUBLE) psvp_n_neg = psvp_n_neg + 1
       if (-(pp_nodal - pi_r)*vr < 0.0_DOUBLE) psvp_n_neg = psvp_n_neg + 1
       psvp_ref = psvp_ref + lam_l*(vn_nodal - vl)**2 + lam_r*(vn_nodal - vr)**2
+      ! Defaut de telescopage interieur. Nul pour toute fermeture ou les deux
+      ! flux d energie sont la meme expression ; non nul pour pi_pp_vpps.
+      vpps_tel = vpps_tel + (flux_l(5) - flux_r(5))
+      vpps_tel_abs = vpps_tel_abs + abs(flux_l(5)) + abs(flux_r(5))
+      ! --- diagnostic S, sous-faces INTERIEURES seulement : sur une paroi ou une
+      ! face z, v* = 0 et S serait negatif mecaniquement sans rien mesurer.
+      bord_loc = .false.
+      if (present(bord)) bord_loc = bord
+      if (.not. bord_loc) then
+        sdiag_tot = sdiag_tot + 1
+        s_prod = 0.5_DOUBLE*((1.0_DOUBLE/lam_l + 1.0_DOUBLE/lam_r)*pp_nodal**2 &
+                 - pl*pl/lam_l - pr*pr/lam_r)
+        s_ref = max(pl, pr)*0.5_DOUBLE*(lam_l*taul + lam_r*taur)
+        if (s_ref > 0.0_DOUBLE) then
+          s_prod = s_prod/s_ref
+        else
+          s_prod = 0.0_DOUBLE
+        end if
+        if (s_prod < -1.0e-1_DOUBLE) then
+          sdiag_n(1) = sdiag_n(1) + 1
+        else if (s_prod < -1.0e-2_DOUBLE) then
+          sdiag_n(2) = sdiag_n(2) + 1
+        else if (s_prod < -1.0e-3_DOUBLE) then
+          sdiag_n(3) = sdiag_n(3) + 1
+        else if (s_prod < -1.0e-6_DOUBLE) then
+          sdiag_n(4) = sdiag_n(4) + 1
+        else if (s_prod < 0.0_DOUBLE) then
+          sdiag_n(5) = sdiag_n(5) + 1
+        else
+          sdiag_n(6) = sdiag_n(6) + 1
+        end if
+      end if
     end if
   end subroutine rs_vp_ep
 

@@ -113,12 +113,13 @@ program main
     divd_coef, divd_mode, divd_theta, divd_nl, &
     divd_wdbg, divd_wnode, divd_wmax, &
     sedov_nodal_deposit, sedov_energy, &
+    tang_mode, pi_bord_psw, &
     scheme, method_length, b2d_h, &
     n_bc, bc_name, bc_type, bc_val, &
     sol_uniform, boundary_2d, &
     n_sol_vtu, second_order, iso_weight_mode, compute_error, grad_weno, grad_gg_corrected, grad_eps_weno, &
     gresho_mach, gamma_uniform, vac_vortex, vac_wave, dt_at_step_start, dt_n_iter, trace_every, time_scheme, grad_weight_v, &
-    wall_mode, grad_eps_vol
+    wall_mode, grad_eps_vol, vp_gcorr
 
   call MPI_INIT(mpi_ierr)
   call MPI_COMM_SIZE(MPI_COMM_WORLD, num_procs, mpi_ierr)
@@ -171,6 +172,67 @@ program main
   if (scheme == "vp_pp_epv") then
     pi_pp_ep = .true.
     pi_pp_epv = .true.
+  end if
+  ! 'vp_pp_vpps' : flux d energie = pression de sous-face CLASSIQUE Pi_c x
+  ! vitesse NODALE, alors que le flux de quantite de mouvement garde p_p.
+  ! Combinaison volontairement INCOHERENTE : la pression du flux d energie
+  ! differe de celle du flux de QdM, donc eps* depend du REFERENTIEL (au taux
+  ! (Pi_c - p_p)/lam_c) et l energie n est PLUS CONSERVEE, puisque l equilibre
+  ! nodal porte sur p_p et non sur Pi_c. Le diagnostic VPPSTEL et la derive
+  ! d energie totale sont obligatoires pour l interpreter.
+  if (scheme == "vp_pp_vpps") then
+    pi_pp_ep = .true.
+    pi_pp_vpps = .true.
+  end if
+  ! 'vp_pp_ppvn' : flux d energie = p_p (v_p.n). Pression NODALE des deux cotes
+  ! et vitesse NODALE : conservatif trivialement (F_l = F_r), galileen, et sans
+  ! terme lineaire en la vitesse de maille dans eps*.
+  if (scheme == "vp_pp_ppvn") then
+    pi_pp_ep = .true.
+    pi_pp_ppvn = .true.
+  end if
+  ! 'vp_pp_ep_wdiv' : vp_pp_ep dont la pression nodale pondere les sauts de
+  ! vitesse en 1/lambda. Voir pi_pp_wdiv dans le module.
+  if (scheme == "vp_pp_ep_wdiv") then
+    pi_pp_ep = .true.
+    pi_pp_wdiv = .true.
+  end if
+  ! 'vp_pp_ppvn_wdiv' : flux d energie p_p (v_p.n), AUCUNE energie nodale, et
+  ! pression nodale fermee par MOINDRES CARRES. Avec vp_pp_ep la relaxation
+  ! d energie est bien plus grosse que l effet de la ponderation et le masque ;
+  ! ici elle est absente, donc la ponderation est la SEULE source de dissipation.
+  if (scheme == "vp_pp_ppvn_wdiv") then
+    pi_pp_ep = .true.
+    pi_pp_ppvn = .true.
+    pi_pp_wdiv = .true.
+  end if
+  ! 'vp_pp_wdiv' : le schema a pression nodale NU, avec la fermeture par
+  ! moindres carres. vp_pp meurt sur tous les Sedov ; si la ponderation le
+  ! sauve, c est qu elle cree bien la dissipation manquante.
+  if (scheme == "vp_pp_wdiv") then
+    pi_pp_wdiv = .true.
+  end if
+  ! 'classic_conv' : `classic` dont l IMPEDANCE DE STABILISATION est convective,
+  ! mu_c = rho_c |v_p.n - v_c.n|, au lieu de rho_c a_c. Voir pi_conv_stab.
+  if (scheme == "classic_conv") pi_conv_stab = .true.
+  ! 'vp_pp_pivp' : QdM en p_p (bas Mach, aucune trainee), energie en
+  ! Pi_c (v_p.n) + relaxation nodale (dissipation de classic). Voir pi_pivp.
+  if (scheme == "vp_pp_pivp") then
+    pi_pp_ep = .true.
+    pi_pivp = .true.
+  end if
+  ! 'vp_pp_ppus' : le flux d energie INVARIANT par changement de referentiel,
+  ! (pv)*_c = p_p (u*_c.n) -/+ mu_c (eps_p - eps_c). Voir pi_pp_ppus.
+  if (scheme == "vp_pp_ppus") then
+    pi_pp_ep = .true.
+    pi_ep_interne = .true.
+    pi_pp_ppus = .true.
+  end if
+  ! 'vp_pp_ep_veps' : vp_pp_ep dont la pression nodale est fermee par
+  ! somme A (eps*_r - eps*_l) = 0. Voir pi_pp_veps dans le module.
+  if (scheme == "vp_pp_ep_veps") then
+    pi_pp_ep = .true.
+    pi_pp_veps = .true.
   end if
   ! 'vp_hat' : vp dont la pression de sous-face est mixee avec la pression nodale,
   ! LE MEME objet dans les deux flux. theta_pi = 0 doit redonner vp au bit pres.
@@ -628,6 +690,7 @@ program main
       call compute_rhs_lagrange_meandiv(mesh, sol, vp, dt, rhs, n_bc, bc_type, bc_val, &
         boundary_2d, mass, gamma_arr, vp_is_imposed, grad_v, grad_p, div_v)
     else if( scheme == "classic" .or. scheme == "classic_rhoa" .or. scheme == "vp_hat" &
+        .or. scheme == "classic_conv" &
         .or. scheme == "vp_hat_md" .or. scheme == "vp_facebar" &
         .or. scheme == "vp_mp" .or. scheme == "vp_kappa" &
         .or. scheme == "vp_fbd" .or. scheme == "vp_fbw" &
@@ -659,6 +722,13 @@ program main
         .or. scheme == "vp_pp_ep" .or. scheme == "vp_pp_ep_i" &
         .or. scheme == "vp_pp_epsp" .or. scheme == "vp_pp_eps2" &
         .or. scheme == "vp_pp_eps2m" .or. scheme == "vp_pp_epv" &
+        .or. scheme == "vp_pp_vpps" &
+        .or. scheme == "vp_pp_ppvn" &
+        .or. scheme == "vp_pp_ep_wdiv" &
+        .or. scheme == "vp_pp_ppvn_wdiv" &
+        .or. scheme == "vp_pp_ep_veps" &
+        .or. scheme == "vp_pp_pivp" &
+        .or. scheme == "vp_pp_ppus" &
         .or. scheme == "vp_ep_i" ) then
       ! vitesse nodale + energie nodale, puis solveur 1D par sous-face.
       call compute_rhs_lagrange_vp_ep(mesh, sol, vp, &
@@ -741,6 +811,11 @@ program main
                 " delta2min", sv_st_d2min, " corrigees", 0
       end if
     end if
+
+    ! Taylor-Green needs an energy source to close the total energy equation
+    ! (Vilar eq. 4.103). Added here, on the PRE-move mesh, because that is the
+    ! geometry rhs was just assembled on.
+    if (init == 10) call add_taylor_green_source(mesh, mass, rhs)
 
     if (.not. dt_at_step_start) &
       call compute_dt(mesh, sol, dt, cfl, vp, me, num_procs, gamma_arr, bc_p=bc_p)
@@ -1060,6 +1135,18 @@ program main
       call write_sol_lag(mesh, fln, new_sol, vp, pp, gamma_arr, grad_v, grad_p, div_v, alpha_p_arr, p_limited, h_p_arr)
       call write_sol_dat_lag(mesh, fln, new_sol, gamma_arr)
       i_sol_vtu = i_sol_vtu + 1
+      ! Diagnostic S PAR FENETRE, puis remise a zero. Cumule sur tout le run il
+      ! n est PAS comparable entre deux schemas : un run qui meurt tot
+      ! n echantillonne que les premiers instants (facteur 76 mesure entre un run
+      ! de 3 pas et un run complet). C est la fenetre qui se compare.
+      if (sdiag_tot > 0 .and. me == 0) then
+        print*, "SDIAGW t", t, " sous-faces", sdiag_tot, &
+                " ]-inf,-1e-1[", sdiag_n(1), " [-1e-1,-1e-2[", sdiag_n(2), &
+                " [-1e-2,-1e-3[", sdiag_n(3), " [-1e-3,-1e-6[", sdiag_n(4), &
+                " [-1e-6,0[", sdiag_n(5), " >=0", sdiag_n(6)
+      end if
+      sdiag_n = 0
+      sdiag_tot = 0
     end if
 
     ! CONTROLE DE PRODUCTION de `vp_mdiv`. Les sous-faces sont visitees (mdv_n)
@@ -1256,6 +1343,45 @@ program main
             psvp_n_infeas, " soit", 100.0_DOUBLE*real(psvp_n_infeas, DOUBLE) &
                      /max(1.0_DOUBLE, real(psvp_n_sf, DOUBLE)), &
             "% -- la ou AUCUN lambda ne convenait" 
+  end if
+  ! Diagnostic S : production ponderee d energie interne, sous-faces INTERIEURES.
+  ! Une case negative = p_p sous la moyenne QUADRATIQUE des p ponderee en 1/lam.
+  ! Comptes, pas de max.
+  if (pi_pp_vpps .and. me == 0) then
+    print*, "VPPSTEL defaut de telescopage interieur somme A (F_l - F_r) =", &
+            vpps_tel, " somme des |F| =", vpps_tel_abs, &
+            " rapport =", vpps_tel/max(1.0e-300_DOUBLE, vpps_tel_abs)
+  end if
+  if (tang_n > 0 .and. me == 0) then
+    print*, "TANG sous-faces", tang_n, " dont flux tangentiel NON NUL", tang_nact, &
+            " soit", 100.0_DOUBLE*real(tang_nact, DOUBLE)/real(tang_n, DOUBLE), "%"
+  end if
+  if (conv_n > 0 .and. me == 0) then
+    print*, "CONVSTAB sous-faces", conv_n, " dont au PLANCHER", conv_nfloor, &
+            " soit", 100.0_DOUBLE*real(conv_nfloor, DOUBLE)/real(conv_n, DOUBLE), "%"
+  end if
+  if (pos_tot > 0 .and. me == 0) then
+    print*, "POSMARG e_p - |u*|^2/2 relatif : sous-faces", pos_tot, &
+            " <=0", pos_hist(1), " <1e-3", pos_hist(2), " <1e-2", pos_hist(3), &
+            " <1e-1", pos_hist(4), " >=1e-1", pos_hist(5), " pire", pos_worst
+  end if
+  if (ppmc_tot > 0 .and. me == 0) then
+    print*, "PPMC ecart |p_mc - p_moy|/p : noeuds", ppmc_tot, &
+            " <1e-6", ppmc_hist(1), " <1e-4", ppmc_hist(2), &
+            " <1e-2", ppmc_hist(3), " <1e-1", ppmc_hist(4), " >=1e-1", ppmc_hist(5)
+  end if
+  if (sdiag_tot > 0 .and. me == 0) then
+    print*, "SDIAG sous-faces interieures", sdiag_tot, &
+            " | S/(p.a) : <-1e-1", sdiag_n(1), " <-1e-2", sdiag_n(2), &
+            " <-1e-3", sdiag_n(3), " <-1e-6", sdiag_n(4), &
+            " <0", sdiag_n(5), " >=0", sdiag_n(6)
+    print*, "SDIAG part de S < 0 :", &
+            100.0_DOUBLE*real(sdiag_n(1)+sdiag_n(2)+sdiag_n(3) &
+                              +sdiag_n(4)+sdiag_n(5), DOUBLE) &
+            /max(1.0_DOUBLE, real(sdiag_tot, DOUBLE)), &
+            "%  dont |S| > 1e-2 :", &
+            100.0_DOUBLE*real(sdiag_n(1)+sdiag_n(2), DOUBLE) &
+            /max(1.0_DOUBLE, real(sdiag_tot, DOUBLE)), "%"
   end if
   if (pvp_pos .and. me == 0) then
     print*, "POS cumul run : sous-faces ecretees", pos_n_clip, " sur", pos_n_sf, &
