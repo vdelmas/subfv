@@ -206,12 +206,6 @@ program main
     pi_pp_ppvn = .true.
     pi_pp_wdiv = .true.
   end if
-  ! 'vp_pp_wdiv' : le schema a pression nodale NU, avec la fermeture par
-  ! moindres carres. vp_pp meurt sur tous les Sedov ; si la ponderation le
-  ! sauve, c est qu elle cree bien la dissipation manquante.
-  if (scheme == "vp_pp_wdiv") then
-    pi_pp_wdiv = .true.
-  end if
   ! 'classic_conv' : `classic` dont l IMPEDANCE DE STABILISATION est convective,
   ! mu_c = rho_c |v_p.n - v_c.n|, au lieu de rho_c a_c. Voir pi_conv_stab.
   if (scheme == "classic_conv") pi_conv_stab = .true.
