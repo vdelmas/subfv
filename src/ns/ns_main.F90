@@ -130,7 +130,8 @@ contains
     use precision_module
     use mpi_module
     use mesh_module
-    use ns_global_data_module, only: second_order, activate_diffusion, cfl, method
+    use ns_global_data_module, only: second_order, activate_diffusion, cfl, method, &
+      wip_diss, grad_filled, zb_pdiv
     use ns_euler_module, only: compute_euler_flux, compute_cell_grad_from_nodal_grad, &
       flux_limiting
     use ns_vectorial_diffusion_module, only: compute_mu, &
@@ -157,6 +158,19 @@ contains
     rhs = 0.0_DOUBLE; sum_lambda = 0.0_DOUBLE
     mat_diag = 0.0_DOUBLE; cell_grad = 0.0_DOUBLE; nodal_grad = 0.0_DOUBLE
 
+    ! wip_diss == 2 tire sa dissipation d'une divergence, donc des gradients de
+    ! maille. On les remplit AVANT la passe d'ordre 1 pour que la variante
+    ! existe a l'ordre 1 aussi : second_order est passe separement a
+    ! compute_euler_flux et c'est lui seul qui pilote la reconstruction des
+    ! etats, donc remplir cell_grad ici ne change RIEN pour les autres schemas
+    ! (grad n'est lu par reconstruct_lr_w que si second_order est vrai).
+    grad_filled = .false.
+    if (wip_diss == 2 .or. zb_pdiv == 1) then
+      call compute_cell_grad_from_nodal_grad(mesh, sol, cell_grad, nodal_grad, method)
+      if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 3*5, cell_grad)
+      grad_filled = .true.
+    end if
+
     call compute_euler_flux(mesh, sol, rhs, cell_grad, sum_lambda, &
       .false., vp, h_p, mat_h_p)
     if (second_order) then
@@ -164,6 +178,7 @@ contains
       rhs_o2 = 0.0_DOUBLE; sum_lambda_o2 = 0.0_DOUBLE
       call compute_cell_grad_from_nodal_grad(mesh, sol, cell_grad, nodal_grad, method)
       if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 3*5, cell_grad)
+      grad_filled = .true.
       call compute_euler_flux(mesh, sol, rhs_o2, cell_grad, sum_lambda_o2, &
         .true., vp, h_p, mat_h_p)
       call flux_limiting(mesh, sol, rhs, rhs_o2, sum_lambda, cfl)

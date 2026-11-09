@@ -21,6 +21,9 @@ program gresho_convergence
   integer(kind=ENTIER) :: me, num_procs, mpi_ierr
   integer(kind=ENTIER) :: iter, i, im, fn_conv
   real(kind=DOUBLE) :: res, l2_rho
+  ! energie cinetique : l'ordre en Mach seul ne dit rien si le tourbillon
+  ! a disparu. ec0 est mesuree sur la condition initiale, ec a la fin.
+  real(kind=DOUBLE) :: ec, ec0, rho_c
   real(kind=DOUBLE), dimension(5) :: res_vect, w
 
   integer, parameter :: n_machs = 4
@@ -71,7 +74,7 @@ program gresho_convergence
 
   if (me == 0) then
     open(newunit=fn_conv, file="convergence.dat")
-    write(fn_conv, '(A)') "# Mach  L2_rho  t_final  n_iter"
+    write(fn_conv, '(A)') "# Mach  L2_rho  t_final  n_iter  Ec/Ec0"
   end if
 
   do im = 1, n_machs
@@ -85,6 +88,18 @@ program gresho_convergence
       sol(:, i) = primit_to_conserv(w)
     end do
     if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 5, sol)
+
+    ! energie cinetique de la condition initiale
+    ec0 = 0.0_DOUBLE
+    do i = 1, mesh%n_elems
+      if (.not. mesh%elem(i)%is_ghost) then
+        rho_c = sol(1, i)
+        ec0 = ec0 + mesh%elem(i)%volume &
+          *0.5_DOUBLE*dot_product(sol(2:4, i), sol(2:4, i))/rho_c
+      end if
+    end do
+    if (num_procs > 1) &
+      call MPI_ALLREDUCE(MPI_IN_PLACE, ec0, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
 
     ! Time integration until t = tmax
     do while (t < tmax .and. iter < n_max_iter)
@@ -120,10 +135,29 @@ program gresho_convergence
       call MPI_ALLREDUCE(MPI_IN_PLACE, l2_rho, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
     l2_rho = sqrt(l2_rho)
 
+    ! energie cinetique finale
+    ec = 0.0_DOUBLE
+    do i = 1, mesh%n_elems
+      if (.not. mesh%elem(i)%is_ghost) then
+        rho_c = sol(1, i)
+        ec = ec + mesh%elem(i)%volume &
+          *0.5_DOUBLE*dot_product(sol(2:4, i), sol(2:4, i))/rho_c
+      end if
+    end do
+    if (num_procs > 1) &
+      call MPI_ALLREDUCE(MPI_IN_PLACE, ec, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+    if (ec0 > 0.0_DOUBLE) then
+      ec = ec/ec0
+    else
+      ec = -1.0_DOUBLE
+    end if
+
     if (me == 0) then
-      write(*, '(A,ES10.3,A,ES12.5,A,ES12.5,A,I6)') &
-        "  Ma=", machs(im), "  L2_rho=", l2_rho, "  t_final=", t, "  iter=", iter
-      write(fn_conv, '(ES10.3,2X,ES12.5,2X,ES12.5,2X,I6)') machs(im), l2_rho, t, iter
+      write(*, '(A,ES10.3,A,ES12.5,A,ES12.5,A,I6,A,ES12.5)') &
+        "  Ma=", machs(im), "  L2_rho=", l2_rho, "  t_final=", t, "  iter=", iter, &
+        "  Ec/Ec0=", ec
+      write(fn_conv, '(ES10.3,2X,ES12.5,2X,ES12.5,2X,I6,2X,ES12.5)') &
+        machs(im), l2_rho, t, iter, ec
     end if
   end do
 
@@ -136,7 +170,8 @@ contains
     use precision_module
     use mpi_module
     use mesh_module
-    use ns_global_data_module, only: second_order, activate_diffusion, cfl, method
+    use ns_global_data_module, only: second_order, activate_diffusion, cfl, method, &
+      wip_diss, grad_filled, zb_pdiv
     use ns_euler_module, only: compute_euler_flux, compute_cell_grad_from_nodal_grad, &
       flux_limiting
     use ns_vectorial_diffusion_module, only: compute_mu, &
@@ -163,6 +198,19 @@ contains
     rhs = 0.0_DOUBLE; sum_lambda = 0.0_DOUBLE
     mat_diag = 0.0_DOUBLE; cell_grad = 0.0_DOUBLE; nodal_grad = 0.0_DOUBLE
 
+    ! wip_diss == 2 tire sa dissipation d'une divergence, donc des gradients de
+    ! maille. On les remplit AVANT la passe d'ordre 1 pour que la variante
+    ! existe a l'ordre 1 aussi : second_order est passe separement a
+    ! compute_euler_flux et c'est lui seul qui pilote la reconstruction des
+    ! etats, donc remplir cell_grad ici ne change RIEN pour les autres schemas
+    ! (grad n'est lu par reconstruct_lr_w que si second_order est vrai).
+    grad_filled = .false.
+    if (wip_diss == 2 .or. zb_pdiv == 1) then
+      call compute_cell_grad_from_nodal_grad(mesh, sol, cell_grad, nodal_grad, method)
+      if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 3*5, cell_grad)
+      grad_filled = .true.
+    end if
+
     call compute_euler_flux(mesh, sol, rhs, cell_grad, sum_lambda, &
       .false., vp, h_p, mat_h_p)
     if (second_order) then
@@ -170,6 +218,7 @@ contains
       rhs_o2 = 0.0_DOUBLE; sum_lambda_o2 = 0.0_DOUBLE
       call compute_cell_grad_from_nodal_grad(mesh, sol, cell_grad, nodal_grad, method)
       if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 3*5, cell_grad)
+      grad_filled = .true.
       call compute_euler_flux(mesh, sol, rhs_o2, cell_grad, sum_lambda_o2, &
         .true., vp, h_p, mat_h_p)
       call flux_limiting(mesh, sol, rhs, rhs_o2, sum_lambda, cfl)

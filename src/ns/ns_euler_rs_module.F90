@@ -810,6 +810,7 @@ contains
   subroutine compute_lambdas_and_solve_nodal_velocity(mesh, id_vert, sol_w_lr, lambda, v_bars, v_node, p_bound)
     use ns_global_data_module, only: bc_style, boundary_2d
     use linear_solver_module
+    use ns_global_data_module, only: vp_gcorr
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -829,6 +830,10 @@ contains
     real(kind=DOUBLE) :: rhor, vn_r, pr, ar, lambda_r
     real(kind=DOUBLE) :: v_et
     real(kind=DOUBLE), dimension(3) :: Rp, Bp
+    real(kind=DOUBLE), dimension(3,3) :: Gp, matG
+    real(kind=DOUBLE), dimension(3) :: Sp, dxc, vg
+    real(kind=DOUBLE) :: s_gc, detG
+    integer(kind=ENTIER) :: kg, ndg
     real(kind=DOUBLE), dimension(3, 3) :: mat
 
     Bp = wall_normal(mesh, id_vert)
@@ -839,6 +844,8 @@ contains
 
       mat(:, :) = 0.0_DOUBLE
       Rp(:) = 0.0_DOUBLE
+      Gp(:,:) = 0.0_DOUBLE
+      Sp(:) = 0.0_DOUBLE
 
       do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
         id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
@@ -924,6 +931,16 @@ contains
             mesh%sub_face(id_sub_face)%norm)
           Rp = Rp + mesh%sub_face(id_sub_face)%area* &
             (lambda_r + lambda_l)*v_bars(j)*mesh%sub_face(id_sub_face)%norm
+          if (vp_gcorr) then
+            ! Sp : part de PRESSION de Rp.  Gp : tenseur de moments, purement
+            ! geometrique (aucun lambda). Voir vp_gcorr dans lagrange_module.
+            Sp = Sp + mesh%sub_face(id_sub_face)%area &
+              *(sol_w_lr(5, 1, j) - sol_w_lr(5, 2, j))*mesh%sub_face(id_sub_face)%norm
+            dxc = mesh%elem(mesh%face(mesh%sub_face(id_sub_face)%mesh_face)%right_neigh)%coord &
+                - mesh%elem(mesh%face(mesh%sub_face(id_sub_face)%mesh_face)%left_neigh)%coord
+            Gp = Gp + mesh%sub_face(id_sub_face)%area &
+              *tensor_product_3(mesh%sub_face(id_sub_face)%norm, dxc)
+          end if
         end if
       end do
 
@@ -939,6 +956,27 @@ contains
       else
         call pseudo_inverse_inplace_lapack(3, mat)
         v_node = matmul(mat, Rp)
+        if (vp_gcorr) then
+          ndg = 3
+          if (boundary_2d) then
+            Gp(3,:) = 0.0_DOUBLE; Gp(:,3) = 0.0_DOUBLE; Gp(3,3) = 1.0_DOUBLE
+            ndg = 2
+          end if
+          detG = Gp(1,1)*(Gp(2,2)*Gp(3,3)-Gp(2,3)*Gp(3,2)) &
+               - Gp(1,2)*(Gp(2,1)*Gp(3,3)-Gp(2,3)*Gp(3,1)) &
+               + Gp(1,3)*(Gp(2,1)*Gp(3,2)-Gp(2,2)*Gp(3,1))
+          if (abs(detG) > 1.0e-30_DOUBLE) then
+            matG = matmul(mat, Gp)
+            s_gc = 0.0_DOUBLE
+            do kg = 1, ndg
+              s_gc = s_gc + matG(kg,kg)
+            end do
+            s_gc = s_gc / real(ndg, DOUBLE)
+            call lu_solve_inplace_lapack(3, Gp, vg, Sp)
+            v_node = matmul(mat, Rp - Sp) + s_gc*vg
+            if (boundary_2d) v_node(3) = 0.0_DOUBLE
+          end if
+        end if
       end if
     end do
   end subroutine compute_lambdas_and_solve_nodal_velocity

@@ -5,7 +5,6 @@ module ns_euler_zb_module
   use ns_euler_recon_module
   implicit none
 
-
 contains
   subroutine compute_nodal_velocity_LS(mesh, id_vert, sol, grad, vp, h_p, second_order)
     use ns_global_data_module, only : boundary_2d, scheme
@@ -1139,7 +1138,11 @@ contains
       le = mesh%sub_face(id_sub_face)%left_elem_neigh
       re = mesh%sub_face(id_sub_face)%right_elem_neigh
       if( re > 0 ) then
-        min_apf = min(min_apf, mesh%sub_face(id_sub_face)%area)
+        ! Une sous-face z de maillage faux-2D est inerte : si elle fixait le minimum
+        ! d'aire, wpcf vaudrait h/t au lieu de 1 et iso cesserait d'egaler multi_point.
+        if (.not. (boundary_2d .and. &
+            abs(mesh%sub_face(id_sub_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE)) &
+          min_apf = min(min_apf, mesh%sub_face(id_sub_face)%area)
       end if
     end do
 
@@ -2679,7 +2682,7 @@ contains
       nsen, flux_sum_vert, sum_lambda_vert, &
       id_vert, vp, h_p, second_order)
     use ns_global_data_module, only: bc_style, scheme, &
-      exclude_bound_vert, boundary_2d
+      exclude_bound_vert, boundary_2d, wip_diss, grad_filled
     use linear_solver_module
     use mpi
     implicit none
@@ -2700,6 +2703,10 @@ contains
     integer(kind=ENTIER) :: j, id_sub_face, id_face
     integer(kind=ENTIER) :: le, re, lse, rse, lse_loc, rse_loc
     real(kind=DOUBLE), dimension(3) :: norm
+
+    ! wip_diss : forme de la dissipation de pression (voir ns_global_data_module)
+    real(kind=DOUBLE) :: zface, dlen, divf, divl, divr
+    real(kind=DOUBLE) :: afa, dlen_l, dlen_r
 
     real(kind=DOUBLE) :: pp
     real(kind=DOUBLE), dimension(5) :: fminus, fplus
@@ -2840,8 +2847,66 @@ contains
       vbar = (lambda_l*vnl + lambda_r*vnr - (pr-pl))/(lambda_l+lambda_r)
       !pbar = (lambda_r * pl + lambda_l * pr - lambda_l*lambda_r*(vnr-vnl))/(lambda_l+lambda_r)
       !pbar = (lambda_r * pl + lambda_l * pr - lambda_l*lambda_r*(vnr-vnl))/(lambda_l+lambda_r)
-      !pbar = (lambda_r*pl+lambda_l*pr)/(lambda_l+lambda_r) - divv_p
-      pbar = (lambda_r*pl+lambda_l*pr)/(lambda_l+lambda_r) - divv_p
+      ! --- dissipation de pression : les trois cas sont exclusifs ---
+      select case (wip_diss)
+      case (1)
+        ! saut normal par face (forme three_wave)
+        zface = lambda_l*lambda_r/(lambda_l+lambda_r)
+        pbar = (lambda_r*pl+lambda_l*pr)/(lambda_l+lambda_r) &
+          - zface*(vnr - vnl)
+      case (2)
+        ! vraie divergence par face. Les gradients de maille valent d_i w_k,
+        ! donc div v = grad(1,2) + grad(2,3) + grad(3,4). Le terme en z est
+        ! exclu sur un maillage extrude (boundary_2d) : la divergence physique
+        ! y est celle du plan.
+        !
+        ! LONGUEUR. Surtout PAS |x_r - x_l| : stitch_periodic_faces recolle une
+        ! face periodique en posant face%right_neigh = la maille de l'AUTRE BOUT
+        ! du domaine, sans translation de coordonnees. La distance des deux
+        ! centroides y vaut donc la largeur du domaine (facteur ~49 sur le
+        ! Gresho 50x50), et les mailles de coin en portent deux. On prend a la
+        ! place l'extension normale INTRINSEQUE de chaque maille a cette face,
+        ! d_c = V_c / A_face, qui ne fait intervenir aucune difference de
+        ! coordonnees : exacte pour un cube (d = h), symetrique sous
+        ! retournement de face, et insensible a la connectivite.
+        zface = lambda_l*lambda_r/(lambda_l+lambda_r)
+        ! id_face n'est pas affecte ailleurs dans cette routine : le faire ici.
+        id_face = mesh%sub_face(id_sub_face)%mesh_face
+        afa = mesh%face(id_face)%area
+        if( .not. (second_order .or. grad_filled) ) then
+          ! gradients absents (passe d'ordre 1 sans grad_filled) : on retombe
+          ! sur le saut. Pas compte : ce n'est pas un fait de maillage.
+          pbar = (lambda_r*pl+lambda_l*pr)/(lambda_l+lambda_r) &
+            - zface*(vnr - vnl)
+        else
+          divl = grad(1, 2, le) + grad(2, 3, le)
+          if( .not. boundary_2d ) divl = divl + grad(3, 4, le)
+          dlen_l = mesh%elem(le)%volume/max(afa, 1e-300_DOUBLE)
+          if( re > 0 ) then
+            divr = grad(1, 2, re) + grad(2, 3, re)
+            if( .not. boundary_2d ) divr = divr + grad(3, 4, re)
+            dlen_r = mesh%elem(re)%volume/max(afa, 1e-300_DOUBLE)
+            divf = 0.5_DOUBLE*(divl + divr)
+            dlen = 0.5_DOUBLE*(dlen_l + dlen_r)
+          else
+            ! BORD REEL (pas de maille droite). On n'utilise PAS le saut ici :
+            ! melanger une dissipation en saut au bord et une dissipation en
+            ! divergence a l'interieur laisse une couronne de forcage parasite
+            ! tout autour du domaine, qui ne s'annule pas sur un champ
+            ! solenoidal alors que l'interieur s'annule. On prend la divergence
+            ! de la seule maille gauche, avec sa propre extension : la propriete
+            ! << nul sur un champ a divergence nulle >> reste alors UNIFORME
+            ! jusqu'au bord.
+            divf = divl
+            dlen = dlen_l
+          end if
+          pbar = (lambda_r*pl+lambda_l*pr)/(lambda_l+lambda_r) &
+            - zface*dlen*divf
+        end if
+      case default
+        ! 0 : dissipation nodale, comportement existant
+        pbar = (lambda_r*pl+lambda_l*pr)/(lambda_l+lambda_r) - divv_p
+      end select
       !if( abs(pbar - pbar2)/pbar > 0.1_DOUBLE) then
       !  print*, pbar, pbar2
       !end if
@@ -2928,7 +2993,8 @@ contains
       nsen, flux_sum_vert, sum_lambda_vert, &
       id_vert, second_order, low_mach, adv_mode, eps_mode, enth_fix, tp_fix, ep_mode, lag_mode)
     use linear_solver_module
-    use ns_global_data_module, only: boundary_2d, zb_eps_coef
+    use ns_global_data_module, only: boundary_2d, zb_eps_coef, zb_pivp, zb_ppus, zb_tang, zb_lag, &
+      grad_filled, zb_pdiv
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -3072,6 +3138,9 @@ contains
     real(kind=DOUBLE), dimension(3) :: norm, v_p
 
     real(kind=DOUBLE) :: pp, pbar_f, denomsum, weight, invlamb
+    ! zb_lag 4 et 5 : pression de face et son argument dissipatif
+    ! zb_pdiv : argument dissipatif de la pression etoile par sous-face
+    real(kind=DOUBLE) :: pdis, pdfa, pddl, pddr, pdel, pder
     real(kind=DOUBLE) :: lambda_l, lambda_r, lambda_lts
     real(kind=DOUBLE) :: rhol, rhor, pl, pr, vnl, vnr, al, ar
     real(kind=DOUBLE) :: a_p, ma_node, theta, corr, vstar
@@ -3085,6 +3154,8 @@ contains
     ! shock-sensor blend workspace
     logical :: need_amiso, need_ducros
     real(kind=DOUBLE) :: corr_a, w_shock, eps_face
+    real(kind=DOUBLE), dimension(3) :: utl_t, utr_t, ust_t, ft_t
+    real(kind=DOUBLE) :: dut_t, nul_t, nur_t
     real(kind=DOUBLE) :: min_apf_md, sum_area_md, h_node, w_md
     real(kind=DOUBLE), dimension(3) :: v_md
     real(kind=DOUBLE), dimension(5) :: sol_p_md
@@ -3122,7 +3193,7 @@ contains
     ! nodal velocity + its Mach, needed by the Tallois multidimensional correction
     theta_n = 0.0_DOUBLE
     u_node = 0.0_DOUBLE
-    if (tp_fix .or. lag_mode == 1 .or. lag_mode == 3) then
+    if (tp_fix .or. lag_mode == 1 .or. lag_mode == 3 .or. zb_pivp .or. zb_lag > 0) then
       call compute_nodal_velocity_LVP(mesh, id_vert, sol, grad, u_node, second_order)
       if (tp_fix) theta_n = min(1.0_DOUBLE, norm2(u_node)/a_p)
     end if
@@ -3196,7 +3267,11 @@ contains
         id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
         re = mesh%sub_face(id_sub_face)%right_elem_neigh
         if (re > 0) then
-          min_apf = min(min_apf, mesh%sub_face(id_sub_face)%area)
+          ! Une sous-face z de maillage faux-2D est inerte : si elle fixait le minimum
+          ! d'aire, wpcf vaudrait h/t au lieu de 1 et iso cesserait d'egaler multi_point.
+          if (.not. (boundary_2d .and. &
+              abs(mesh%sub_face(id_sub_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE)) &
+            min_apf = min(min_apf, mesh%sub_face(id_sub_face)%area)
         end if
       end do
 
@@ -3255,7 +3330,41 @@ contains
       lambda_r = max(ar*rhor, sqrt(rhor*max(0.0_DOUBLE, pl - pr)), -rhor*(vnr - vnl))
 
       invlamb = 1.0_DOUBLE/lambda_l + 1.0_DOUBLE/lambda_r
-      pbar_f = (pl/lambda_l + pr/lambda_r - theta*(vnr - vnl))/invlamb
+      ! zb_pdiv : argument dissipatif de la pression etoile PAR SOUS-FACE.
+      !   0 : (v_nr - v_nl), le SAUT normal (existant, bit pour bit)
+      !   1 : ell_pf * D_pf, une VRAIE DIVERGENCE
+      ! Le saut vaut ell * d_n u_n : un seul terme de la trace. Il ne s'annule
+      ! donc PAS sur un champ a divergence nulle, alors que la trace complete
+      ! d_n u_n + d_t u_t s'annule. Seul cet argument change : la structure du
+      ! flux, le poids en 1/lambda et la moyenne nodale sont intacts.
+      ! ell = 1/2 (V_l + V_r)/A_face, extension normale intrinseque, JAMAIS une
+      ! difference de centroides (le recollement periodique renvoie la maille de
+      ! l'autre bout du domaine sans translation).
+      pdis = vnr - vnl
+      ! BUG EVITE : la boucle qui construit p_p n'exclut PAS les sous-faces z de
+      ! l'extrusion (celle de e_p, elle, les exclut). Avec le saut leur
+      ! contribution vaut (v_zr - v_zl) ~ 0 et c'est benin ; avec la divergence
+      ! du PLAN elle ne l'est pas, et polluerait chaque pression nodale. On y
+      ! garde donc le saut, de sorte que zb_pdiv ne differe que sur les faces
+      ! DANS le plan.
+      if (zb_pdiv == 1 .and. (second_order .or. grad_filled) &
+          .and. .not. (boundary_2d .and. abs(norm(3)) > 1e-3)) then
+        pdfa = mesh%face(mesh%sub_face(id_sub_face)%mesh_face)%area
+        pddl = grad(1, 2, le) + grad(2, 3, le)
+        if (.not. boundary_2d) pddl = pddl + grad(3, 4, le)
+        pdel = mesh%elem(le)%volume/max(pdfa, 1e-300_DOUBLE)
+        if (re > 0) then
+          pddr = grad(1, 2, re) + grad(2, 3, re)
+          if (.not. boundary_2d) pddr = pddr + grad(3, 4, re)
+          pder = mesh%elem(re)%volume/max(pdfa, 1e-300_DOUBLE)
+          pdis = 0.5_DOUBLE*(pdel + pder)*0.5_DOUBLE*(pddl + pddr)
+        else
+          ! bord reel : divergence de la seule maille gauche, pour que
+          ! << nul sur un champ solenoidal >> reste UNIFORME jusqu'au bord
+          pdis = pdel*pddl
+        end if
+      end if
+      pbar_f = (pl/lambda_l + pr/lambda_r - theta*pdis)/invlamb
 
       weight = mesh%sub_face(id_sub_face)%area*invlamb
       if (re <= 0) weight = 0.5_DOUBLE*weight
@@ -3308,8 +3417,14 @@ contains
           mu_r = lambda_r
         end if
 
-        ep_num = ep_num + mesh%sub_face(id_sub_face)%area &
-          *(mu_l*e_l + mu_r*e_r + (pl*vnl - pr*vnr))
+        if (zb_pivp .or. zb_ppus) then
+          ! le travail de pression telescope SEUL : X_p devient une combinaison
+          ! convexe, bornee quel que soit mu. Voir zb_pivp / zb_ppus.
+          ep_num = ep_num + mesh%sub_face(id_sub_face)%area*(mu_l*e_l + mu_r*e_r)
+        else
+          ep_num = ep_num + mesh%sub_face(id_sub_face)%area &
+            *(mu_l*e_l + mu_r*e_r + (pl*vnl - pr*vnr))
+        end if
         ep_den = ep_den + mesh%sub_face(id_sub_face)%area*(mu_l + mu_r)
       end do
       if (ep_den > 0.0_DOUBLE) e_p = ep_num/ep_den
@@ -3413,6 +3528,25 @@ contains
         ff_lag(5) = pp * vstar
       end if
 
+      ! --- dissipation tangentielle (voir zb_tang) -------------------------
+      ft_t = 0.0_DOUBLE ; ust_t = 0.0_DOUBLE
+      if (zb_tang > 0 .and. re > 0) then
+        utl_t = sol_w_l(2:4) - dot_product(sol_w_l(2:4), norm)*norm
+        utr_t = sol_w_r(2:4) - dot_product(sol_w_r(2:4), norm)*norm
+        dut_t = sqrt(dot_product(utr_t - utl_t, utr_t - utl_t))
+        if (zb_tang == 1) then
+          nul_t = lambda_l ; nur_t = lambda_r
+        else
+          nul_t = rhol*dut_t ; nur_t = rhor*dut_t
+        end if
+        if (nul_t + nur_t > 0.0_DOUBLE) then
+          ust_t = (nul_t*utl_t + nur_t*utr_t)/(nul_t + nur_t)
+          ft_t  = nul_t*(ust_t - utl_t)   ! = -nur_t*(ust_t - utr_t) : UNIVALUE
+          ff_lag(2:4) = ff_lag(2:4) - ft_t
+          ff_lag(5)   = ff_lag(5) - dot_product(ft_t, ust_t)
+        end if
+      end if
+
       ! jump used by the advection dissipation
       djump = sol_r - sol_l
       if (enth_fix) then
@@ -3504,8 +3638,47 @@ contains
           mu_l = lambda_l
           mu_r = lambda_r
         end if
-        ff_lag_l(5) = pl*vnl - mu_l*(e_p - e_l)
-        ff_lag_r(5) = pr*vnr + mu_r*(e_p - e_r)
+        if (zb_ppus) then
+          ! (pv)*_s = p_p (v_s + ds_s) -/+ mu_s (X_p - X_s) : la pression du
+          ! travail est celle de la QdM et la vitesse est l etoile de son cote.
+          ff_lag_l(5) = pp*(vnl + (pl - pp)/lambda_l) - mu_l*(e_p - e_l)
+          ff_lag_r(5) = pp*(vnr + (pp - pr)/lambda_r) + mu_r*(e_p - e_r)
+        else if (zb_pivp) then
+          vn_node = dot_product(u_node, norm)
+          ff_lag_l(5) = (pl - lambda_l*(vn_node - vnl))*vn_node - mu_l*(e_p - e_l)
+          ff_lag_r(5) = (pr + lambda_r*(vn_node - vnr))*vn_node + mu_r*(e_p - e_r)
+        else
+          ff_lag_l(5) = pl*vnl - mu_l*(e_p - e_l)
+          ff_lag_r(5) = pr*vnr + mu_r*(e_p - e_r)
+        end if
+      end if
+
+      ! --- SELECTEUR COMPLET de la partie lagrangienne (voir zb_lag) --------
+      ! Surcharge TOUT ce qui precede : les trois composantes sont posees ici
+      ! ensemble, donc aucun melange avec lag_mode, ep_mode ou tp_fix.
+      if (zb_lag > 0) then
+        vn_node = dot_product(u_node, norm)
+        select case (zb_lag)
+        case (1)   ! vp : pressions de sous-face UNILATERALES
+          ff_lag_l(1) = 0.0_DOUBLE
+          ff_lag_l(2:4) = (pl - lambda_l*(vn_node - vnl))*norm
+          ff_lag_l(5) = (pl - lambda_l*(vn_node - vnl))*vn_node
+          ff_lag_r(1) = 0.0_DOUBLE
+          ff_lag_r(2:4) = (pr + lambda_r*(vn_node - vnr))*norm
+          ff_lag_r(5) = (pr + lambda_r*(vn_node - vnr))*vn_node
+        case (2)   ! vp_pp : pression NODALE, travail a la vitesse nodale
+          ff_lag_l(1) = 0.0_DOUBLE
+          ff_lag_l(2:4) = pp*norm
+          ff_lag_l(5) = pp*vn_node
+          ff_lag_r = ff_lag_l
+        case (3)   ! epv : pression nodale, travail a la vitesse etoile du cote
+          ff_lag_l(1) = 0.0_DOUBLE
+          ff_lag_l(2:4) = pp*norm
+          ff_lag_l(5) = pp*(vnl + (pl - pp)/lambda_l)
+          ff_lag_r(1) = 0.0_DOUBLE
+          ff_lag_r(2:4) = pp*norm
+          ff_lag_r(5) = pp*(vnr + (pp - pr)/lambda_r)
+        end select
       end if
 
       if (adv_mode == 3 .or. adv_mode == 4 .or. adv_mode == 5) then

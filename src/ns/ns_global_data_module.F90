@@ -161,6 +161,82 @@ module ns_global_data_module
   !   Le mode 8 n a AUCUN capteur : la stabilisation de l advection est la
   !   VITESSE seule, |vstar|, plus eps = zb_eps_coef * a_p. zb_eps_coef = 0
   !   donne le decentrement pur a vstar, sans aucune dissipation ajoutee.
+  ! zb_pivp : dans WIP2, flux d energie = Pi_s (v_p.n) + relaxation nodale, au
+  ! lieu de p_s v_s + relaxation. La partie Pi_s (v_p.n) TELESCOPE SEULE, car
+  ! somme A (Pi_r - Pi_l)(v_p.n) = v_p . somme A (Pi_r - Pi_l) n = 0 par
+  ! l equation meme de la vitesse nodale. Le terme de travail de pression
+  ! disparait donc du numerateur de e_p, qui devient
+  !   e_p = somme A (mu_l e_l + mu_r e_r) / somme A (mu_l + mu_r),
+  ! une COMBINAISON CONVEXE bornee quel que soit mu. La singularite en mu -- qui
+  ! faisait diverger e_p et effondrer le maillage en lagrangien des que mu
+  ! devenait petit -- disparait, et le taux convectif (ep_mode >= 3) redevient
+  ! utilisable. La quantite de mouvement reste en p_p, donc sans trainee, donc
+  ! bas Mach preserve.
+  ! zb_tang : DISSIPATION SUR LA VITESSE TANGENTIELLE, portee du lagrangien.
+  ! Le tangentiel est sinon INCHANGE (la relation de QdM est purement normale),
+  ! donc |u*|^2 garde |u_t|^2 intact. Un tangentiel etoile COMMUN donne
+  ! |u*_t|^2 <= <|u_t,s|^2> par convexite : l energie cinetique de cisaillement
+  ! baisse, l energie interne monte, la marge eps* = e_p - |u*|^2/2 s ouvre.
+  ! CONSERVATION GRATUITE : nu_l(u*_t - u_t,l) + nu_r(u*_t - u_t,r) = 0 rend le
+  ! flux tangentiel UNIVALUE, donc il telescope exactement.
+  !   1 : nu = lambda (acoustique). 2 : nu = rho|du_t| (convectif, dissipation
+  !   en rho|du_t|^3 au lieu de lambda|du_t|^2, s eteint dans un cisaillement
+  !   lisse -- c est ce qui doit epargner la couche limite et le flux de chaleur).
+  ! Mesure en lagrangien : rho_min de Gresho tri passe de 0,906 a 0,99987 et de
+  ! Gresho quad a 1,0000, et le Sedov 3D tetra s ameliore (0,115 -> 0,0888).
+  ! zb_ppus : LE flux d energie invariant par changement de referentiel, porte
+  ! du lagrangien `vp_pp_ppus`. (pv)*_s = p_p (v_s + ds_s) -/+ mu_s (X_p - X_s)
+  ! avec ds_l = (p_l-p_p)/lam_l, ds_r = (p_p-p_r)/lam_r, et X = eps INTERNE
+  ! (donc a utiliser avec ep_mode 2 ou 4). Les trois conditions de l invariance :
+  ! pression du travail = p_p (celle de la QdM), vitesse = u*_s de son cote,
+  ! quantite relaxee = eps. Mesure sur un jouet : ecart 4e-16 sous boost contre
+  ! 2,7e-1 pour zb_pivp. Le travail telescope seul, donc X_p est une combinaison
+  ! convexe (meme branche ep_num que zb_pivp).
+  ! vp_gcorr : redressement geometrique de la reponse en pression de la vitesse
+  ! nodale, porte du lagrangien. Voir vp_gcorr dans lagrange_module.
+  ! zb_lag : SELECTEUR COMPLET de la partie lagrangienne du flux. Chaque cas
+  ! fixe les TROIS composantes ensemble -- masse, quantite de mouvement et
+  ! energie -- sans melange ni recouvrement avec lag_mode / ep_mode / tp_fix.
+  !   0 : comportement existant (defaut, bit pour bit)
+  !   1 : 'vp'     QdM Pi_c n              energie Pi_c (v_p.n)
+  !   2 : 'vp_pp'  QdM p_p n               energie p_p (v_p.n)
+  !   3 : 'epv'    QdM p_p n               energie p_p (v_c + ds_c)
+  integer :: zb_lag = 0
+  ! wip_diss : FORME DE LA DISSIPATION DE PRESSION dans compute_rhs_around_vert_WIP.
+  ! La pression d'interface vaut toujours pbar = (lam_r p_l + lam_l p_r)/(lam_l+lam_r)
+  ! - X, seul X change, et les trois cas sont exclusifs.
+  !   0 : X = divv_p            dissipation NODALE (comportement existant, defaut
+  !                             bit pour bit) : somme sur toutes les sous-faces du
+  !                             noeud de A (v_nr - v_nl), divisee par sum A (1/lam).
+  !   1 : X = Z (v_nr - v_nl)   dissipation PAR FACE sur le SAUT normal, forme
+  !                             three_wave, avec Z = lam_l lam_r/(lam_l+lam_r).
+  !                             Ne s'annule PAS sur un champ a divergence nulle.
+  !   2 : X = Z |x_r-x_l| D_f   dissipation PAR FACE sur une VRAIE DIVERGENCE,
+  !                             D_f = 1/2 (div v|_l + div v|_r) pris des gradients
+  !                             de maille. Identique au cas 1 a l'ordre 2 sur un
+  !                             ecoulement 1D normal a la face, et s'annule a
+  !                             l'ordre du gradient sur un champ solenoidal.
+  !                             Exige second_order (les gradients sont nuls sinon) :
+  !                             a l'ordre 1 le cas 1 est utilise et COMPTE.
+  integer :: wip_diss = 0
+  ! zb_pdiv : ARGUMENT DISSIPATIF DE LA PRESSION ETOILE par sous-face, dans
+  !   Pi_pf = (p_l/lam_pf,l + p_r/lam_pf,r - theta * X_pf)/(1/lam_pf,l + 1/lam_pf,r)
+  !   0 : X_pf = v_nr - v_nl        le SAUT normal (existant, bit pour bit)
+  !   1 : X_pf = ell_pf * D_pf      une VRAIE DIVERGENCE
+  ! Le saut vaut ell * d_n u_n, un seul terme de la trace, donc il ne s'annule
+  ! PAS sur un champ a divergence nulle ; la trace complete si. Seul cet
+  ! argument change : la structure du flux, la ponderation en 1/lambda et la
+  ! moyenne nodale qui en fait p_p restent intactes. Exige method >= 2.
+  integer :: zb_pdiv = 0
+  ! grad_filled : les gradients de maille ont ete remplis pour la passe en
+  ! cours. Pose par le driver, PAS dans la namelist. Permet a wip_diss == 2
+  ! d'exister a l'ordre 1, qui est le regime de toutes les mesures de la
+  ! campagne, sans toucher la reconstruction des etats.
+  logical :: grad_filled = .false.
+  logical :: vp_gcorr = .false.
+  logical :: zb_ppus = .false.
+  integer :: zb_tang = 0
+  logical :: zb_pivp = .false.
   integer :: zb_eps_mode = -1
   real(kind=DOUBLE) :: zb_eps_coef = 0.0_DOUBLE
   integer :: scheme_adv_id = 0
@@ -278,6 +354,8 @@ contains
       scheme, exclude_bound_vert, &
       activate_diffusion, &
       zb_lag_mode, zb_adv_mode, zb_eps_mode, zb_eps_coef, &
+      zb_pivp, zb_ppus, zb_tang, vp_gcorr, zb_lag, &
+      wip_diss, zb_pdiv, &
       local_time_step, ener_lambda_pos, ener_dump_sides, ener_theta, ener_internal, ener_pstar, &
       bc_style, boundary_2d, &
       write_residual, n_iter_residual, &
@@ -490,6 +568,17 @@ contains
       end if
     else
       print *, "ERROR: scheme unrecognized: '", trim(t), "'"
+      error stop
+    end if
+
+    ! wip_diss == 2 construit la dissipation sur la divergence tiree des
+    ! gradients de maille. Avec method 0 ou 1, compute_cell_grad_from_nodal_grad
+    ! met grad = 0 identiquement : la dissipation de pression serait alors
+    ! RIGOUREUSEMENT NULLE et le calcul partirait en NaN sans que rien ne le
+    ! dise. On refuse la configuration au lieu de la laisser passer.
+    if ((wip_diss == 2 .or. zb_pdiv == 1) .and. (method == 0 .or. method == 1)) then
+      print *, "ERROR: wip_diss=2 / zb_pdiv=1 exigent method >= 2 (method=", &
+        method, "donne grad = 0 et donc une dissipation de pression nulle)"
       error stop
     end if
   end subroutine init_flags
