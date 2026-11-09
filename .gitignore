@@ -1,5 +1,8 @@
 # Build
 build/
+# ...and the build_<variant>/ directories: build/ alone did not cover them, and the
+# five that exist hold 2080 files that git would otherwise offer to add.
+build_*/
 
 # Fortran compiled artifacts
 *.mod
@@ -66,6 +69,7 @@ residual.dat
 # Generated animations (same rationale as *.png above)
 *.gif
 *.jpg
+*.mp4
 
 # Generated polyhedral meshes (same rationale as *.msh above: rebuilt by
 # tools/voronoi/*.py, and a single Voronoi mesh is ~1-3 MB)
@@ -91,3 +95,9 @@ residual.dat
 # written down here because tex_all_mach_number_scheme was briefly added in
 # 077ab25 and removed again -- the convention was invisible until someone broke it.
 tex_*/
+
+# Result and report archives (several hundred MB each).
+*.zip
+
+# notes/ is a session logbook, not repository documentation.
+notes/
