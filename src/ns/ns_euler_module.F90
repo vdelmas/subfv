@@ -540,7 +540,6 @@ contains
     integer(kind=ENTIER) :: ener_pass, k_side
     real(kind=DOUBLE) :: eps_s, d_s, b_s, ratio, lam_req, lam_ratio
     real(kind=DOUBLE), dimension(2, nsfn) :: lam_cl, lam_wave
-    integer(kind=ENTIER) :: regime
     real(kind=DOUBLE) :: w_ener, ustar_l, ustar_r
     real(kind=DOUBLE), dimension(5) :: u_tmp
     rse_loc = 0
@@ -1579,52 +1578,5 @@ contains
 
     sol = sol + a2*omega*delta_sol
   end subroutine add_timedisc_and_solve
-  ! Admissible lambda for one side so that its star internal energy is >= 0, at fixed p_p,
-  ! E_p and v*.  side k (1 left, 2 right); u = normal velocity of the cell counted TOWARD the
-  ! face (+u_n on the left, -u_n on the right); D = p_s - p_p.
-  !  mu = lambda (multi_point_ener*):  lam^2 eps* = A lam^2 - D u lam - D^2/2,  A = E_p - |u_s|^2/2
-  !     A > 0 : half-line lam >= the positive root                     -> regime 1, lam_req
-  !     A < 0 : roots D/(S-u), -D/(S+u), S = sqrt(2E_p - |u_t|^2); interval iff D u < 0:
-  !             lam below it -> regime 1 with lam_req = lam_min ; above it -> regime 2
-  !             (lambdas only increase) ; D u >= 0 -> regime 3, no admissible lambda
-  !  mu = rho|v - v*| (_v): B = p_p u_n - pv_l (left) or pv_r - p_p u_n (right) does not depend
-  !     on lambda at fixed v*: lam^2 eps* = eps lam^2 + B lam - D^2/2, eps > 0 -> regime 1.
-  subroutine ener_lambda_target(mu_v, k, eps, d, un, b, ep, es, vel, lam, lam_req, regime)
-    implicit none
-    logical, intent(in) :: mu_v
-    integer(kind=ENTIER), intent(in) :: k
-    real(kind=DOUBLE), intent(in) :: eps, d, un, b, ep, es, lam
-    real(kind=DOUBLE), dimension(3), intent(in) :: vel
-    real(kind=DOUBLE), intent(out) :: lam_req
-    integer(kind=ENTIER), intent(out) :: regime
-    real(kind=DOUBLE) :: a, u, s2, s, r1, r2
-    if (mu_v) then
-      lam_req = (-b + sqrt(b**2 + 2.0_DOUBLE*eps*d**2))/(2.0_DOUBLE*eps)
-      regime = 1
-      return
-    end if
-    u = un
-    if (k == 2) u = -un
-    a = ep - 0.5_DOUBLE*dot_product(vel, vel)
-    if (a > 0.0_DOUBLE) then
-      lam_req = (d*u + sqrt((d*u)**2 + 2.0_DOUBLE*a*d**2))/(2.0_DOUBLE*a)
-      regime = 1
-    else if (d*u < 0.0_DOUBLE) then
-      s2 = 2.0_DOUBLE*ep - (dot_product(vel, vel) - un**2)
-      s = sqrt(max(s2, 0.0_DOUBLE))
-      r1 = d/(s - u); r2 = -d/(s + u)
-      lam_req = min(r1, r2)
-      if (lam > max(r1, r2)) then
-        regime = 2
-      else
-        regime = 1
-      end if
-    else
-      lam_req = lam
-      regime = 3
-    end if
-  end subroutine ener_lambda_target
-
-  ! one line per call of the ener lambda-bound diagnostics (all ranks summed)
 
 end module ns_euler_module
