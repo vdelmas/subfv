@@ -5,6 +5,14 @@ module ns_euler_zb_module
   use ns_euler_recon_module
   implicit none
 
+  ! Diagnostic of the PPEPV/PPEPVI nodal-energy denominator (ep_mode >= 3), filled by
+  ! compute_rhs_around_vert_WIP2 and printed/reset by compute_euler_flux. Bins of
+  ! r = sum A(mu_l+mu_r) / sum A(lam_l+lam_r) per node (interior sub-faces only):
+  !   0: r == 0 (degenerate node, WIP2 fallback)   1: r < 1e-9   2: [1e-9, 1e-6)
+  !   3: [1e-6, 1e-3)                               4: r >= 1e-3
+  ! Vertices shared between MPI ranks are counted once per rank.
+  integer(kind=8), dimension(0:4) :: ep_den_hist = 0_8
+
 contains
   subroutine compute_nodal_velocity_LS(mesh, id_vert, sol, grad, vp, h_p, second_order)
     use ns_global_data_module, only : boundary_2d, scheme
@@ -2925,9 +2933,9 @@ contains
   ! pressure/velocity coupling that the low-Mach limit needs.
   subroutine compute_rhs_around_vert_WIP2(mesh, sol, grad, &
       nsen, flux_sum_vert, sum_lambda_vert, &
-      id_vert, second_order, low_mach, adv_mode, eps_mode, enth_fix, tp_fix)
+      id_vert, second_order, low_mach, adv_mode, eps_mode, enth_fix, tp_fix, ep_mode, lag_mode)
     use linear_solver_module
-    use ns_global_data_module, only: boundary_2d
+    use ns_global_data_module, only: boundary_2d, zb_eps_coef
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -2983,6 +2991,7 @@ contains
     !      terms are ~0, while a shock has strong compression and a large dp.
     !      Note this eps is per-face, unlike modes 0-3 whose sensor is nodal and
     !      is applied identically to every sub-face around the node.
+    !   8 -> AUCUN capteur : vitesse seule plus eps = zb_eps_coef*a_p (namelist).
     integer(kind=ENTIER), intent(in) :: eps_mode
     ! Haenel / MGallice enthalpy preservation (Tallois, papers/talois.pdf, eq 22-23):
     ! the energy dissipation of the flux must equal the total enthalpy times the
@@ -3001,6 +3010,69 @@ contains
     ! nodal, so unlike a convex blend with the 1D flux the multidimensional
     ! character is never lost -- that is the thesis's stated reason for this form.
     logical, intent(in) :: tp_fix
+    ! Eulerian port of the Lagrangian 'vp_pp_ep' scheme (src/lagrange, pi_pp_ep):
+    ! momentum keeps the nodal pressure pp, but the Lagrange ENERGY flux of every
+    ! interior sub-face becomes the one-sided flux built on a NODAL total energy
+    !     (pv)*_l = p_l v_l - lambda_l (e_p - e_l)
+    !     (pv)*_r = p_r v_r + lambda_r (e_p - e_r)
+    ! with e = rho*E/rho the specific total energy and mu = lambda (phi = 1, no free
+    ! coefficient). e_p is DEFINED by the telescoping sum_f A[(pv)*_r - (pv)*_l] = 0,
+    !     e_p = sum A[lam_l e_l + lam_r e_r + (p_l v_l - p_r v_r)] / sum A (lam_l + lam_r)
+    ! so the node conserves energy exactly; it involves no momentum flux, which is
+    ! why swapping the one-sided Pi for pp costs nothing in energy conservation.
+    !
+    ! Departure from the Lagrangian code, deliberate: there the boundary sub-faces
+    ! enter e_p through a mirror state, and their flux lambda (e_p - e) carries no
+    ! velocity factor, so on a wall it is an INVISCID energy flux through an
+    ! impermeable surface -- on the hypersonic cylinder that is a spurious wall heat
+    ! flux, exactly the quantity being measured. Here boundary sub-faces (re <= 0)
+    ! and the boundary_2d z-faces (zeroed below anyway) are excluded from e_p and
+    ! keep the WIP2 energy flux pp*vstar, which vanishes at a wall. Telescoping over
+    ! the interior sub-faces of the node is unaffected, hence still exact.
+    !
+    ! ep_mode: 0 -> off (plain WIP2 energy flux)
+    !          1 -> WIP2_PPEP,  X = E   the specific TOTAL energy (the Lagrangian vp_pp_ep)
+    !          2 -> WIP2_PPEPI, X = eps = E - |u|^2/2, the specific INTERNAL energy
+    ! The telescoping only needs the form +-lambda (X_p - X_s) with one X_p shared by both
+    ! sides, so total energy is conserved exactly for ANY per-cell scalar X. Mode 2 exists
+    ! because mode 1 overheats the M17.6 cylinder wall 6x (wall cell 1027 K vs 626 K for
+    ! WIP2_NOLM at equal Cp): across a boundary layer the jump in E is dominated by the
+    ! kinetic part (~87x the internal one at M17.6), and relaxing it turns that shear into
+    ! heat. Mode 2 removes exactly that part, hence tests the mechanism.
+    !          3 -> WIP2_PPEPV, X = E,   mu_s = rho_s |(v_s - v*).n|
+    !          4 -> WIP2_PPEPVI, X = eps, mu_s = rho_s |(v_s - v*).n|
+    ! Modes 1/2 dissipate X with mu = lambda = rho*a, i.e. at ACOUSTIC speed. A thermal
+    ! boundary layer is an entropy (contact) wave, which Godunov dissipates with the wave's
+    ! own speed; mode 1/2 instead act as an artificial heat conduction rho*a*c_v
+    ! (~3.6e4 W/m2/K on the M17.6 cylinder, ~7x the physical first-cell conductance) and
+    ! overheat the wall cell. Modes 3/4 take the impedance of the cell's normal velocity
+    ! RELATIVE to the interface, rho_s |(v_s - v*).n|: derived, no min/switch/coefficient,
+    ! it vanishes at a wall (v* = 0, v.n -> 0) and across an exact Lagrangian contact.
+    ! Degenerate node: sum A(mu_l+mu_r) = 0 means v_l.n = v_r.n = v* on every interior
+    ! sub-face, which forces p_l = p_r there, so the one-sided p v fluxes already telescope;
+    ! e_p is then irrelevant and the node falls back to the plain WIP2 energy flux, which
+    ! is also conservative. The guard is "den > 0", no threshold. Note the mu -> 0 LIMIT is
+    ! not that fallback: mu_l e_p -> (mu_l/sum mu) * sum A(p_l v_l - p_r v_r), a
+    ! redistribution of the nodal imbalance of the one-sided p v fluxes.
+    integer(kind=ENTIER), intent(in) :: ep_mode
+    ! lag_mode : forme du flux d ENERGIE de la partie Lagrange. La partie
+    ! QUANTITE DE MOUVEMENT reste pp*norm dans tous les cas ; seul le flux
+    ! d energie change, et 0 reproduit l existant AU BIT PRES.
+    !   0 : pp * vstar      -- l existant. vstar est la vitesse etoile 1D DE
+    !       FACE, PAS la vitesse nodale : c est une difference structurelle
+    !       avec le schema lagrangien, qui est bati sur des quantites nodales.
+    !   1 : pp * (v_p.n)    -- tout nodal : la forme lagrangienne telle quelle.
+    !   2 : pp * u*_s       -- par cote, u*_l = vnl + (pl-pp)/lambda_l et
+    !       u*_r = vnr + (pp-pr)/lambda_r.
+    !   3 : Pi_s * (v_p.n)  -- par cote, pression de sous-face CLASSIQUE.
+    ! eps* de chacune, en variables specifiques, verifie a 2e-16 :
+    !   2 -> eps* = eps + (pp^2 - p^2)/(2 lambda^2), SANS AUCUNE VITESSE, donc
+    !        positivite automatique par Einfeldt-Menikoff-Plohr ;
+    !   1 -> eps* = eps + pp (u - v_p.n)/lambda - ...   terme de vitesse, non borne ;
+    !   3 -> eps* = eps + u (d_Pi - d) - ...            terme de vitesse ET non
+    !        galileen, puisque la pression du flux d energie (Pi_s) differe de
+    !        celle du flux de quantite de mouvement (pp).
+    integer(kind=ENTIER), intent(in) :: lag_mode
 
     integer(kind=ENTIER) :: j, id_sub_face, id_sub_elem, id_elem
     integer(kind=ENTIER) :: le, re, lse, rse, lse_loc, rse_loc
@@ -3029,6 +3101,8 @@ contains
     real(kind=DOUBLE) :: theta_n, pflux_l, pflux_r, vn_node
     real(kind=DOUBLE), dimension(3) :: u_node
     real(kind=DOUBLE), dimension(5) :: djump
+    real(kind=DOUBLE) :: e_p, ep_num, ep_den, e_l, e_r, mu_l, mu_r, vs_ep, ep_lam
+    logical :: ep_active
 
     rse_loc = 0
 
@@ -3055,9 +3129,9 @@ contains
     ! nodal velocity + its Mach, needed by the Tallois multidimensional correction
     theta_n = 0.0_DOUBLE
     u_node = 0.0_DOUBLE
-    if (tp_fix) then
+    if (tp_fix .or. lag_mode == 1 .or. lag_mode == 3) then
       call compute_nodal_velocity_LVP(mesh, id_vert, sol, grad, u_node, second_order)
-      theta_n = min(1.0_DOUBLE, norm2(u_node)/a_p)
+      if (tp_fix) theta_n = min(1.0_DOUBLE, norm2(u_node)/a_p)
     end if
 
     ! carbuncle / shock sensor: each advection variant keeps its own, so that
@@ -3066,7 +3140,7 @@ contains
 
     corr = 0.0_DOUBLE
     corr_a = 0.0_DOUBLE
-    if (need_ducros .and. eps_mode /= 4 .and. eps_mode /= 5) then
+    if (need_ducros .and. eps_mode /= 4 .and. eps_mode /= 5 .and. eps_mode /= 8) then
       select case (eps_mode)
       case (1)
         call compute_corr_pressure(mesh, id_vert, sol, grad, corr, second_order)
@@ -3088,6 +3162,14 @@ contains
       if (eps_mode == 7) corr = 0.5_DOUBLE*corr
     end if
 
+    ! eps_mode 8 : AUCUN capteur. La stabilisation de l advection est la VITESSE
+    ! SEULE, |vstar|, plus un petit coefficient constant eps = zb_eps_coef*a_p.
+    ! Ce n est donc ni un detecteur de choc ni un filtre : pas de seuil, pas de
+    ! porte en Mach, pas de rapport div/curl. zb_eps_coef = 0 donne exactement
+    ! le decentrement a vstar sans aucune dissipation ajoutee, ce qui est la
+    ! borne inferieure de la famille et sert de reference au balayage.
+    if (eps_mode == 8) corr = zb_eps_coef*a_p
+
     ! Blend weight: compute_corr_ducros returns corr = w * 4 * a_p, where w is
     ! its dimensionless [0,1] shock indicator (Ducros filter gated by Mach and
     ! by compression). Recover w by dividing out the 4*a_p it multiplied in,
@@ -3103,7 +3185,16 @@ contains
     ! it entirely (exactly equivalent, and it is the common case: the sensor
     ! only fires at shocks, leaving most of a mesh on the Ducros branch alone).
     need_amiso = (adv_mode == 1) .or. (adv_mode == 2 .and. w_shock > 0.0_DOUBLE)
-    if (need_amiso) call compute_corr2(mesh, id_vert, sol, grad, corr_a, second_order)
+    ! corr_a est le SECOND capteur, celui d AMISO (-div v), calcule
+    ! independamment de eps_mode. Le laisser actif sous eps_mode 8 garderait un
+    ! detecteur dans l advection de adv_mode 1 et 2 alors que le mode 8 est
+    ! justement defini comme "la vitesse seule" -- la contradiction serait
+    ! silencieuse. Il suit donc la meme regle que corr.
+    if (need_amiso .and. eps_mode /= 8) then
+      call compute_corr2(mesh, id_vert, sol, grad, corr_a, second_order)
+    else if (need_amiso) then
+      corr_a = zb_eps_coef*a_p
+    end if
 
     ! --- AMISO advection: nodal upwind state sol_p (first pass) ---
     if (need_amiso) then
@@ -3179,6 +3270,74 @@ contains
       denomsum = denomsum + weight
     end do
     pp = pp / denomsum
+
+    ! --- nodal total energy e_p ('vp_pp_ep' port), interior sub-faces only ---
+    e_p = 0.0_DOUBLE
+    if (ep_mode > 0) then
+      ep_num = 0.0_DOUBLE
+      ep_den = 0.0_DOUBLE
+      ep_lam = 0.0_DOUBLE
+      do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+        id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+        le = mesh%sub_face(id_sub_face)%left_elem_neigh
+        re = mesh%sub_face(id_sub_face)%right_elem_neigh
+        norm = mesh%sub_face(id_sub_face)%norm
+        if (re <= 0) cycle
+        if (boundary_2d .and. abs(norm(3)) > 1e-3) cycle
+
+        call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
+          second_order, sol_w_l, sol_w_r)
+
+        sol_l = primit_to_conserv(sol_w_l)
+        rhol = sol_w_l(1)
+        vnl = dot_product(sol_w_l(2:4), norm)
+        pl = sol_w_l(5)
+        al = sound_speed_w(sol_w_l)
+        e_l = sol_l(5)/rhol
+        if (ep_mode == 2 .or. ep_mode == 4) e_l = e_l - 0.5_DOUBLE*dot_product(sol_w_l(2:4), sol_w_l(2:4))
+
+        sol_r = primit_to_conserv(sol_w_r)
+        rhor = sol_w_r(1)
+        vnr = dot_product(sol_w_r(2:4), norm)
+        pr = sol_w_r(5)
+        ar = sound_speed_w(sol_w_r)
+        e_r = sol_r(5)/rhor
+        if (ep_mode == 2 .or. ep_mode == 4) e_r = e_r - 0.5_DOUBLE*dot_product(sol_w_r(2:4), sol_w_r(2:4))
+
+        lambda_l = max(al*rhol, sqrt(rhol*max(0.0_DOUBLE, pr - pl)), -rhol*(vnr - vnl))
+        lambda_r = max(ar*rhor, sqrt(rhor*max(0.0_DOUBLE, pl - pr)), -rhor*(vnr - vnl))
+
+        if (ep_mode >= 3) then
+          vs_ep = (lambda_l*vnl + lambda_r*vnr - (pr - pl))/(lambda_l + lambda_r)
+          mu_l = rhol*abs(vnl - vs_ep)
+          mu_r = rhor*abs(vnr - vs_ep)
+        else
+          mu_l = lambda_l
+          mu_r = lambda_r
+        end if
+
+        ep_num = ep_num + mesh%sub_face(id_sub_face)%area &
+          *(mu_l*e_l + mu_r*e_r + (pl*vnl - pr*vnr))
+        ep_den = ep_den + mesh%sub_face(id_sub_face)%area*(mu_l + mu_r)
+        ep_lam = ep_lam + mesh%sub_face(id_sub_face)%area*(lambda_l + lambda_r)
+      end do
+      if (ep_den > 0.0_DOUBLE) e_p = ep_num/ep_den
+      if (ep_mode >= 3) then
+        if (ep_den <= 0.0_DOUBLE) then
+          ep_den_hist(0) = ep_den_hist(0) + 1
+        else if (ep_den < 1e-9_DOUBLE*ep_lam) then
+          ep_den_hist(1) = ep_den_hist(1) + 1
+        else if (ep_den < 1e-6_DOUBLE*ep_lam) then
+          ep_den_hist(2) = ep_den_hist(2) + 1
+        else if (ep_den < 1e-3_DOUBLE*ep_lam) then
+          ep_den_hist(3) = ep_den_hist(3) + 1
+        else
+          ep_den_hist(4) = ep_den_hist(4) + 1
+        end if
+      end if
+    end if
+    ep_active = (ep_mode > 0)
+    if (ep_mode >= 3) ep_active = (ep_den > 0.0_DOUBLE)
 
     ! --- multi-d nodal advection flux (modes 3/4) ---
     if (adv_mode == 3 .or. adv_mode == 4 .or. adv_mode == 5) then
@@ -3342,6 +3501,35 @@ contains
         ff_lag_r = ff_lag
       end if
 
+      ! --- partie LAGRANGE du flux d energie, voir lagrange_energy_flux ------
+      ! Exclusif de ep_mode : si une energie nodale est active, c est elle qui
+      ! fixe le flux d energie et lag_mode ne doit pas la recouvrir.
+      if (lag_mode > 0 .and. .not. tp_fix .and. ep_mode == 0) then
+        call lagrange_energy_flux(lag_mode, pp, pl, pr, vnl, vnr, &
+          lambda_l, lambda_r, dot_product(u_node, norm), ff_lag_l(5), ff_lag_r(5))
+      end if
+
+      if (ep_active .and. re > 0 .and. &
+          .not. (boundary_2d .and. abs(norm(3)) > 1e-3)) then
+        ! one-sided energy flux on the nodal energy; same lambda_l/lambda_r and the
+        ! same scalar X as in the e_p pass, so the node telescopes exactly
+        e_l = sol_l(5)/rhol
+        e_r = sol_r(5)/rhor
+        if (ep_mode == 2 .or. ep_mode == 4) then
+          e_l = e_l - 0.5_DOUBLE*dot_product(sol_w_l(2:4), sol_w_l(2:4))
+          e_r = e_r - 0.5_DOUBLE*dot_product(sol_w_r(2:4), sol_w_r(2:4))
+        end if
+        if (ep_mode >= 3) then
+          mu_l = rhol*abs(vnl - vstar)
+          mu_r = rhor*abs(vnr - vstar)
+        else
+          mu_l = lambda_l
+          mu_r = lambda_r
+        end if
+        ff_lag_l(5) = pl*vnl - mu_l*(e_p - e_l)
+        ff_lag_r(5) = pr*vnr + mu_r*(e_p - e_r)
+      end if
+
       if (adv_mode == 3 .or. adv_mode == 4 .or. adv_mode == 5) then
         if ((adv_mode == 3 .or. adv_mode == 5) .and. re > 0) then
           w_md = min_apf_md/mesh%sub_face(id_sub_face)%area*(1.0_DOUBLE/3.0_DOUBLE)
@@ -3395,6 +3583,55 @@ contains
       end if
     end do
   end subroutine compute_rhs_around_vert_WIP2
+
+  ! Partie LAGRANGE du flux d ENERGIE, isolee pour pouvoir etre remplacee sans
+  ! toucher au reste de WIP2 : la partie ADVECTION et tous les selecteurs
+  ! existants de la famille ZB (adv_mode, eps_mode, enth_fix, tp_fix) sont
+  ! reutilises tels quels. La partie QUANTITE DE MOUVEMENT reste pp*norm dans
+  ! tous les cas ; seule l energie change ici.
+  !
+  !   lag_mode 1 : pp * (v_p.n)   tout nodal, la forme lagrangienne telle quelle
+  !   lag_mode 2 : pp * u*_s      par cote, u*_l = vnl + (pl-pp)/lambda_l
+  !   lag_mode 3 : Pi_s * (v_p.n) par cote, pression de sous-face CLASSIQUE
+  !
+  ! Les energies internes intermediaires correspondantes, en variables
+  ! specifiques (forme lagrangienne de Gallice), verifiees a 2e-16 :
+  !   2 -> eps* = eps + (pp^2 - p^2)/(2 lambda^2) : AUCUNE VITESSE n y entre,
+  !        donc positivite automatique par Einfeldt-Menikoff-Plohr. C est la
+  !        seule forme de la famille qui ait cette propriete.
+  !   1 -> eps* = eps + pp (u - v_p.n)/lambda - (p-pp)^2/(2 lambda^2) : le terme
+  !        de vitesse est invariant galileen mais n a ni signe ni borne.
+  !   3 -> eps* = eps + u (d_Pi - d) - ... : terme de vitesse ET non galileen,
+  !        puisque la pression du flux d energie (Pi_s) differe de celle du flux
+  !        de quantite de mouvement (pp). Ce terme est exactement l ecart a
+  !        l invariance, et il s annule quand Pi_s = pp.
+  ! Mesure en lagrangien : 1 et 3 tiennent Gresho et cassent Sedov (pas 14 et
+  ! pas 1023), 2 tient Sedov et Gresho sur quadrangles.
+  subroutine lagrange_energy_flux(lag_mode, pp, pl, pr, vnl, vnr, &
+      lambda_l, lambda_r, vn_node, fl5, fr5)
+    implicit none
+    integer(kind=ENTIER), intent(in) :: lag_mode
+    real(kind=DOUBLE), intent(in) :: pp, pl, pr, vnl, vnr
+    real(kind=DOUBLE), intent(in) :: lambda_l, lambda_r, vn_node
+    real(kind=DOUBLE), intent(out) :: fl5, fr5
+
+    select case (lag_mode)
+    case (1)
+      fl5 = pp*vn_node
+      fr5 = pp*vn_node
+    case (2)
+      fl5 = pp*(vnl + (pl - pp)/lambda_l)
+      fr5 = pp*(vnr + (pp - pr)/lambda_r)
+    case (3)
+      fl5 = (pl - lambda_l*(vn_node - vnl))*vn_node
+      fr5 = (pr + lambda_r*(vn_node - vnr))*vn_node
+    case default
+      ! lag_mode = 0 n appelle jamais cette routine ; si on arrive ici c est une
+      ! valeur non prevue, et rendre le flux inchange masquerait l erreur.
+      write(*, *) "lagrange_energy_flux : lag_mode non prevu =", lag_mode
+      stop 1
+    end select
+  end subroutine lagrange_energy_flux
 
   subroutine compute_rhs_around_vert_usi3d(mesh, sol, grad, &
       nsen, flux_sum_vert, sum_lambda_vert, &

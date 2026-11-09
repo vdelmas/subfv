@@ -5,6 +5,18 @@ module ns_euler_rs_module
   use ns_euler_recon_module
   implicit none
 
+  ! largest relative gap |eps*(star state) - eps*(closed form)| / eps seen by multi_point_ener
+  ! since the last print_ener_diag (ns_euler_module); checks the lambda bound's formula
+  real(kind=DOUBLE) :: ener_check_maxdiff = 0.0_DOUBLE
+  ! entropy of the multi_point_ener* star states: sides checked, sides with p*/rho*^gamma below
+  ! p/rho^gamma of their cell (relative 1e-10), and the smallest ratio (reset by print_ener_diag)
+  integer(kind=8) :: ener_ent_n = 0_8, ener_ent_neg = 0_8
+  real(kind=DOUBLE) :: ener_ent_min = 1.0_DOUBLE
+  ! set by the caller before each multi_point_ener call: only interior sub-faces enter the
+  ! entropy count (a boundary_2d z-face or a wall has v* = u = 0, rho* = rho and
+  ! eps* = eps - D^2/(2 lam^2): it would count as an entropy decrease wherever p_p /= p)
+  logical :: ener_ent_interior = .true.
+
 contains
   subroutine three_wave(sol_w_l, sol_w_r, n, lr_flux, sl, sr)
     implicit none
@@ -545,6 +557,134 @@ contains
 
     lr_flux(:, 2) = -lr_flux(:, 2)
   end subroutine multi_point
+
+  ! Eulerian port of the Lagrangian 'vp_pp_ep' scheme in the multi_point form (Vincent's
+  ! specification): the Euler flux in each star region is
+  !     F_s* = v* U_s* + L_s*,   v* = v_p.n,   L_s* = (0, p_p n, (pv)_s*)
+  ! where p_p is the NODAL pressure and (pv)_s* the one-sided sub-face energy flux built on
+  ! the NODAL energy e_p (both computed by the caller, compute_rhs_around_vert).
+  !
+  ! What multi_point actually does, derived from its own expression: with
+  ! L_s^cl = (0, pbar_s n, pbar_s v*), pbar_l = p_l - lambda_l (v* - v_l),
+  ! pbar_r = p_r + lambda_r (v* - v_r), its two fluxes are exactly F^- = A + L_l^cl and
+  ! F^+ = A + L_r^cl, with A the advective part upwinded on the region holding xi = 0:
+  !     s_l >= 0       : A = F(U_l) - L_l      s_l < 0 <= v* : A = v* U_l*
+  !     v* < 0 < s_r   : A = v* U_r*           s_r <= 0      : A = F(U_r) - L_r
+  ! Its "non-classical" term -/+ 1/2 (pbar_r - pbar_l)(0, n, v*) is nothing but
+  ! 1/2 (L_r - L_l). Each side thus receives the upwinded advection plus ITS OWN Lagrangian
+  ! part. This routine keeps A and the star states U_s* of multi_point unchanged (they carry
+  ! normal velocity v*, as the advection v* U_s* requires) and only swaps L_s. With
+  ! p_nodal = pbar and pv_s = pbar_s v* it reproduces multi_point.
+  ! Momentum: p_p is single-valued, so the non-classical momentum term vanishes and
+  ! sum_f A p_p n = 0 at the node. Energy: (pv)_r* - (pv)_l* telescopes by definition of e_p.
+  subroutine multi_point_ener(sol_w_l, sol_w_r, n, lr_flux, vn_nodal, &
+      lambda_l, lambda_r, sl, sr, p_nodal, pv_l, pv_r)
+    implicit none
+
+    real(kind=DOUBLE), intent(in) :: vn_nodal, p_nodal, pv_l, pv_r
+    real(kind=DOUBLE), dimension(5), intent(in) :: sol_w_l, sol_w_r
+    real(kind=DOUBLE), dimension(3), intent(in) :: n
+    real(kind=DOUBLE), intent(inout) :: lambda_l, lambda_r
+    real(kind=DOUBLE), dimension(5, 2), intent(inout) :: lr_flux
+    real(kind=DOUBLE), intent(inout) :: sl, sr
+
+    real(kind=DOUBLE) :: rhol, rhor, vn_l, vn_r, pl, pr
+    real(kind=DOUBLE) :: v_et
+    real(kind=DOUBLE), dimension(5) :: sol_l, sol_r, fl, fr
+    real(kind=DOUBLE), dimension(5) :: sol_l_et, sol_r_et, lag_l, lag_r, fm
+
+    rhol = sol_w_l(1)
+    vn_l = dot_product(sol_w_l(2:4), n)
+    pl = sol_w_l(5)
+    sol_l = primit_to_conserv(sol_w_l)
+
+    rhor = sol_w_r(1)
+    vn_r = dot_product(sol_w_r(2:4), n)
+    pr = sol_w_r(5)
+    sol_r = primit_to_conserv(sol_w_r)
+
+    fl(1)   = vn_l*sol_l(1)
+    fl(2:4) = vn_l*sol_l(2:4) + pl*n
+    fl(5)   = (sol_l(5) + pl)*vn_l
+
+    fr(1)   = vn_r*sol_r(1)
+    fr(2:4) = vn_r*sol_r(2:4) + pr*n
+    fr(5)   = (sol_r(5) + pr)*vn_r
+
+    v_et = vn_nodal
+
+    sl = vn_l - lambda_l/rhol
+    sr = vn_r + lambda_r/rhor
+
+    lag_l(1) = 0.0_DOUBLE
+    lag_l(2:4) = p_nodal*n
+    lag_l(5) = pv_l
+    lag_r(1) = 0.0_DOUBLE
+    lag_r(2:4) = p_nodal*n
+    lag_r(5) = pv_r
+
+    ! Star states DERIVED from the new Lagrangian flux (Vincent's option A): Rankine-Hugoniot
+    ! across s_l and s_r with the star-region flux F_s* = v* U_s* + L_s*,
+    !     v* U_l* + L_l - F(U_l) = s_l (U_l* - U_l)  ->  U_l* = (F(U_l) - s_l U_l - L_l)/(v* - s_l)
+    !     F(U_r) - v* U_r* - L_r = s_r (U_r - U_r*)  ->  U_r* = (s_r U_r - F(U_r) + L_r)/(s_r - v*)
+    ! The mass component is that of multi_point (L carries no mass). The normal velocity of
+    ! U_l* is u_l + (p_l - p_p)/lambda_l, which equals v* only for p_p = pbar_l: imposing both
+    ! u*.n = v* and RH on the momentum forces pbar_l on the left and pbar_r on the right, and
+    ! the non-classical term 1/2 (pbar_r - pbar_l) of multi_point measures exactly that
+    ! incompatibility. Keeping multi_point's star states with the new L (first version)
+    ! broke RH across s_l/s_r and lost positivity at the first strong shock. With
+    ! p_nodal = pbar_s and pv_s = pbar_s v* these ARE multi_point's star states.
+    if (v_et - sl <= 0.0_DOUBLE .or. sr - v_et <= 0.0_DOUBLE) then
+      print *, "Negative specific volume MPENER !", sl, v_et, sr
+      error stop
+    end if
+    sol_l_et = (fl - sl*sol_l - lag_l)/(v_et - sl)
+    sol_r_et = (sr*sol_r - fr + lag_r)/(sr - v_et)
+
+    ! check of the closed-form star internal energy used by the lambda bound (caller):
+    ! eps*_s computed from the star state vs eps_s + B_s/lambda_s - D_s^2/(2 lambda_s^2)
+    block
+      real(kind=DOUBLE) :: e_star, e_form, eps_c
+      eps_c = sol_l(5)/rhol - 0.5_DOUBLE*dot_product(sol_w_l(2:4), sol_w_l(2:4))
+      e_star = (sol_l_et(5) - 0.5_DOUBLE*dot_product(sol_l_et(2:4), sol_l_et(2:4))/sol_l_et(1))/sol_l_et(1)
+      e_form = eps_c + (p_nodal*vn_l - pv_l)/lambda_l - 0.5_DOUBLE*(pl - p_nodal)**2/lambda_l**2
+      ener_check_maxdiff = max(ener_check_maxdiff, abs(e_star - e_form)/max(abs(eps_c), 1e-300_DOUBLE))
+      eps_c = sol_r(5)/rhor - 0.5_DOUBLE*dot_product(sol_w_r(2:4), sol_w_r(2:4))
+      e_star = (sol_r_et(5) - 0.5_DOUBLE*dot_product(sol_r_et(2:4), sol_r_et(2:4))/sol_r_et(1))/sol_r_et(1)
+      e_form = eps_c + (pv_r - p_nodal*vn_r)/lambda_r - 0.5_DOUBLE*(pr - p_nodal)**2/lambda_r**2
+      ener_check_maxdiff = max(ener_check_maxdiff, abs(e_star - e_form)/max(abs(eps_c), 1e-300_DOUBLE))
+    end block
+    ! entropy of the two star states against their cell: s = p/rho^gamma = (gamma-1) eps rho^(1-gamma)
+    if (ener_ent_interior) then
+    block
+      use ns_global_data_module, only: gamma
+      real(kind=DOUBLE) :: e_star, r_ent
+      e_star = (sol_l_et(5) - 0.5_DOUBLE*dot_product(sol_l_et(2:4), sol_l_et(2:4))/sol_l_et(1))/sol_l_et(1)
+      r_ent = (gamma - 1.0_DOUBLE)*e_star*sol_l_et(1)**(1.0_DOUBLE - gamma)/(pl/rhol**gamma)
+      ener_ent_n = ener_ent_n + 1
+      if (r_ent < 1.0_DOUBLE - 1e-10_DOUBLE) ener_ent_neg = ener_ent_neg + 1
+      ener_ent_min = min(ener_ent_min, r_ent)
+      e_star = (sol_r_et(5) - 0.5_DOUBLE*dot_product(sol_r_et(2:4), sol_r_et(2:4))/sol_r_et(1))/sol_r_et(1)
+      r_ent = (gamma - 1.0_DOUBLE)*e_star*sol_r_et(1)**(1.0_DOUBLE - gamma)/(pr/rhor**gamma)
+      ener_ent_n = ener_ent_n + 1
+      if (r_ent < 1.0_DOUBLE - 1e-10_DOUBLE) ener_ent_neg = ener_ent_neg + 1
+      ener_ent_min = min(ener_ent_min, r_ent)
+    end block
+    end if
+
+    if (sl >= 0.0_DOUBLE) then
+      fm = fl
+    else if (v_et >= 0.0_DOUBLE) then
+      fm = v_et*sol_l_et + lag_l
+    else if (sr > 0.0_DOUBLE) then
+      fm = v_et*sol_r_et + lag_l
+    else
+      fm = fr - (lag_r - lag_l)
+    end if
+
+    lr_flux(:, 1) = fm
+    lr_flux(:, 2) = -(fm + (lag_r - lag_l))
+  end subroutine multi_point_ener
 
   ! Reference:
   !   L. Tallois, "Enthalpy preserving Simple Riemann solvers for steady hypersonic flows",

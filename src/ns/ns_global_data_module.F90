@@ -93,6 +93,10 @@ module ns_global_data_module
   integer, parameter :: SCHEME_WIP2_MD                  = 26 ! "WIP2_MD" multi-d nodal advection, AMISO hybridisation
   integer, parameter :: SCHEME_WIP2_MD5                 = 27 ! "WIP2_MD5" same, ARMD hybridisation w=0.5
   integer, parameter :: SCHEME_WIP2_MDH                 = 28 ! "WIP2_MDH" multi-d advection, enthalpy-consistent gradient
+  integer, parameter :: SCHEME_WIP2_PPEP                = 29 ! "WIP2_PPEP" Eulerian port of Lagrangian vp_pp_ep
+  integer, parameter :: SCHEME_WIP2_PPEPI               = 30 ! "WIP2_PPEPI" same, nodal INTERNAL energy in the relaxation
+  integer, parameter :: SCHEME_WIP2_PPEPV               = 31 ! "WIP2_PPEPV" mu = rho |(v - v*).n|
+  integer, parameter :: SCHEME_WIP2_PPEPVI              = 32 ! "WIP2_PPEPVI" same with internal energy
   ! 60-62: kept clear of the 1-21 block, which the WIP2 family keeps growing into. These three
   ! were 15/16/17 and silently collided with SCHEME_WIP2_EJUMP/EDIV/EMAX: the WIP2 if-chain in
   ! ns_euler_module fires before the flux select case, so the enthalpy schemes ran a WIP2
@@ -100,6 +104,28 @@ module ns_global_data_module
   integer, parameter :: SCHEME_THREE_WAVE_ENTHALPY     = 60 ! "three_wave_enthalpy" (enthalpy-preserving three_wave)
   integer, parameter :: SCHEME_MULTI_POINT_ENTHALPY    = 61 ! "multi_point_enthalpy" (enthalpy-preserving multi_point)
   integer, parameter :: SCHEME_THREE_WAVE_ENTHALPY2    = 62 ! "three_wave_enthalpy2" (HLL-consistent realisation; see solver header)
+  ! multi_point form of the Lagrangian vp_pp_ep (nodal pressure + nodal-energy energy flux)
+  integer, parameter :: SCHEME_MULTI_POINT_ENER        = 63 ! "multi_point_ener"       mu = lambda
+  integer, parameter :: SCHEME_MULTI_POINT_ENER_ISO    = 64 ! "multi_point_ener_iso"   + three_wave blend
+  integer, parameter :: SCHEME_MULTI_POINT_ENER_V      = 65 ! "multi_point_ener_v"     mu = rho |v - v*|
+  integer, parameter :: SCHEME_MULTI_POINT_ENER_V_ISO  = 66 ! "multi_point_ener_v_iso" + three_wave blend
+  ! nodal INTERNAL energy eps_p: eps*_l = eps*_r = eps_p on every sub-face (mu = lambda)
+  integer, parameter :: SCHEME_MULTI_POINT_EPS         = 67 ! "multi_point_eps"
+  integer, parameter :: SCHEME_MULTI_POINT_EPS_ISO     = 68 ! "multi_point_eps_iso"    + three_wave blend
+  ! two DIFFERENT star internal energies, no internal-energy exchange between the sides; one nodal
+  ! scalar kappa restores conservation: eps*_s = eps_s + kappa (eps2) or eps_s (1 + kappa) (eps2m)
+  integer, parameter :: SCHEME_MULTI_POINT_EPS2        = 69 ! "multi_point_eps2"
+  integer, parameter :: SCHEME_MULTI_POINT_EPS2M       = 70 ! "multi_point_eps2m"
+  ! (pv)*_s = p_p u*_s, u*_s the acoustic star velocity of side s: no nodal energy at all; nodal
+  ! energy conservation comes from p_p being the 1/lambda mean of the pbar (interior nodes)
+  integer, parameter :: SCHEME_MULTI_POINT_PS          = 71 ! "multi_point_ps"
+  ! multi_point_ps with p_p averaged over the INTERIOR sub-faces only and the classic multi_point
+  ! flux on boundary and boundary_2d z-face sub-faces (one-sided pbar_l, zero energy flux at a wall
+  ! or symmetry plane): the interior telescoping then closes exactly at boundary nodes too
+  integer, parameter :: SCHEME_MULTI_POINT_PSW         = 72 ! "multi_point_psw"
+  ! nodal p_p in the MOMENTUM flux, the classic Pi_s (v*.n) in the ENERGY flux (Vincent): conservative
+  ! because the nodal velocity solve is sum A (Pi_l - Pi_r) n = 0; boundary / z-faces as psw
+  integer, parameter :: SCHEME_MULTI_POINT_PV          = 73 ! "multi_point_pv"
   integer, parameter :: SCHEME_ZB                   = 42 ! "ZB_*_*"
   ! ZB advection sub-scheme IDs
   integer, parameter :: SCHEME_ADV_AR1D     = 1  ! "AR1D"
@@ -125,6 +151,18 @@ module ns_global_data_module
   integer, parameter :: SCHEME_LAG_LPF  = 8  ! "LPF"
   ! Runtime scheme selection (set by init_bc_flags)
   integer :: scheme_id = 0
+  ! Pilotage par namelist du balayage ZB/WIP2. -1 = laisser le scheme_id decider.
+  ! zb_lag_mode : forme du flux d energie de la partie Lagrange (0 a 3).
+  ! zb_adv_mode : flux d advection (0 a 5). Les deux se croisent librement.
+  integer :: zb_lag_mode = -1
+  integer :: zb_adv_mode = -1
+  ! zb_eps_mode : capteur de dissipation d advection (0 a 8). -1 = scheme_id.
+  ! zb_eps_coef : amplitude du mode 8, en fraction de la vitesse du son nodale.
+  !   Le mode 8 n a AUCUN capteur : la stabilisation de l advection est la
+  !   VITESSE seule, |vstar|, plus eps = zb_eps_coef * a_p. zb_eps_coef = 0
+  !   donne le decentrement pur a vstar, sans aucune dissipation ajoutee.
+  integer :: zb_eps_mode = -1
+  real(kind=DOUBLE) :: zb_eps_coef = 0.0_DOUBLE
   integer :: scheme_adv_id = 0
   integer :: scheme_lag_id = 0
 
@@ -139,6 +177,28 @@ module ns_global_data_module
   logical :: boundary_2d = .FALSE.
   logical :: activate_diffusion
   logical :: local_time_step = .TRUE.
+  ! multi_point_ener*: raise lambda_s to the root lambda_req,s that makes the star internal
+  ! energy non-negative (fixed point on the node, at most 5 passes, lambdas only increase)
+  logical :: ener_lambda_pos = .FALSE.
+  ! diagnostic: at the first flux call, write every interior sub-face side of the
+  ! multi_point_ener* node passes to ener_sides_<rank>.txt (no effect on the solution)
+  logical :: ener_dump_sides = .FALSE.
+  ! CFL number of the convex-combination argument in LOCAL time stepping: the point-implicit
+  ! update divides by V/dt + sum_lambda/ener_theta, so the weight kept on the cell's own
+  ! state is alpha_c = 1 - ener_theta (cfl = 1e5 makes V/dt negligible). 1 = historical
+  ! behaviour (alpha_c = 0).
+  real(kind=DOUBLE) :: ener_theta = 1.0_DOUBLE
+  ! multi_point_ener*: relax the specific INTERNAL energy eps = E - |u|^2/2 instead of the total
+  ! energy E in the one-sided energy flux (pv)_s = p_s u_s -/+ mu_s (X_p - X_s) and in X_p.
+  ! Conservation is unchanged (it comes from the telescoping of the jumps, whatever X is);
+  ! relaxing E removes total energy from a fast cell without removing momentum, i.e. drains
+  ! its internal energy.
+  logical :: ener_internal = .FALSE.
+  ! multi_point_ener*: pressure work at the STAR velocity, (pv)*_l = p_p u*_l - mu_l (X_p - X_l),
+  ! (pv)*_r = p_p u*_r + mu_r (X_p - X_r), u*_l = u_l + (p_l - p_p)/lambda_l,
+  ! u*_r = u_r + (p_p - p_r)/lambda_r (nodal lambdas). Makes eps* convex in p_l - p_p again
+  ! (as the classic pbar v*); X_p from the same telescoping balance.
+  logical :: ener_pstar = .FALSE.
 
   !Init
   logical :: init_uniform = .FALSE.
@@ -217,7 +277,8 @@ contains
       second_order, method, &
       scheme, exclude_bound_vert, &
       activate_diffusion, &
-      local_time_step, &
+      zb_lag_mode, zb_adv_mode, zb_eps_mode, zb_eps_coef, &
+      local_time_step, ener_lambda_pos, ener_dump_sides, ener_theta, ener_internal, ener_pstar, &
       bc_style, boundary_2d, &
       write_residual, n_iter_residual, &
       final_res, n_max_iter, &
@@ -319,6 +380,28 @@ contains
       scheme_id = SCHEME_MULTI_POINT_ENTHALPY
     else if (t == "three_wave_enthalpy2") then
       scheme_id = SCHEME_THREE_WAVE_ENTHALPY2
+    else if (t == "multi_point_ener") then
+      scheme_id = SCHEME_MULTI_POINT_ENER
+    else if (t == "multi_point_ener_iso") then
+      scheme_id = SCHEME_MULTI_POINT_ENER_ISO
+    else if (t == "multi_point_ener_v") then
+      scheme_id = SCHEME_MULTI_POINT_ENER_V
+    else if (t == "multi_point_ener_v_iso") then
+      scheme_id = SCHEME_MULTI_POINT_ENER_V_ISO
+    else if (t == "multi_point_eps") then
+      scheme_id = SCHEME_MULTI_POINT_EPS
+    else if (t == "multi_point_eps_iso") then
+      scheme_id = SCHEME_MULTI_POINT_EPS_ISO
+    else if (t == "multi_point_eps2") then
+      scheme_id = SCHEME_MULTI_POINT_EPS2
+    else if (t == "multi_point_eps2m") then
+      scheme_id = SCHEME_MULTI_POINT_EPS2M
+    else if (t == "multi_point_ps") then
+      scheme_id = SCHEME_MULTI_POINT_PS
+    else if (t == "multi_point_psw") then
+      scheme_id = SCHEME_MULTI_POINT_PSW
+    else if (t == "multi_point_pv") then
+      scheme_id = SCHEME_MULTI_POINT_PV
     else if (t == "multi_point_pressure") then
       scheme_id = SCHEME_MULTI_POINT_PRESSURE
     else if (t == "multi_point_pressure_ph") then
@@ -363,6 +446,14 @@ contains
       scheme_id = SCHEME_WIP2_MD5
     else if (t == "WIP2_MDH") then
       scheme_id = SCHEME_WIP2_MDH
+    else if (t == "WIP2_PPEP") then
+      scheme_id = SCHEME_WIP2_PPEP
+    else if (t == "WIP2_PPEPI") then
+      scheme_id = SCHEME_WIP2_PPEPI
+    else if (t == "WIP2_PPEPV") then
+      scheme_id = SCHEME_WIP2_PPEPV
+    else if (t == "WIP2_PPEPVI") then
+      scheme_id = SCHEME_WIP2_PPEPVI
     else if (t == "USI3D") then
       scheme_id = SCHEME_USI3D
     else if (t(1:2) == "ZB") then
