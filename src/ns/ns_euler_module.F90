@@ -8,51 +8,10 @@ module ns_euler_module
   use ns_euler_rs_module
   implicit none
 
-  ! Diagnostics of the multi_point_ener* lambda positivity bound (ener_lambda_pos), summed
-  ! over the vertex loop and printed/reset by compute_euler_flux. Per interior sub-face SIDE:
-  ! histogram of eps*/eps (specific internal energy of the star state over that of the cell)
-  ! with the classic lambdas (pre) and with the final ones (post), bins split at
-  !   -100 -10 -1 0 0.1 0.5 0.9 1.1 2 10 ; plus the number of sides whose lambda was raised,
-  ! the number of fixed-point passes per node, and the nodes still violating after 5 passes.
-  integer(kind=8), dimension(11) :: ener_hist_pre = 0_8, ener_hist_post = 0_8
-  integer(kind=8) :: ener_nside = 0_8, ener_nraised = 0_8, ener_nonconv = 0_8
-  integer(kind=8), dimension(5) :: ener_it_hist = 0_8
-  ! lambda_final/lambda_classic per side: 1 | (1,1.1] | (1.1,2] | (2,10] | (10,100] | >100
-  integer(kind=8), dimension(6) :: ener_lamhist = 0_8
-  ! sides still eps* < 0 after the bound: 1 not yet reached (fixed point) | 2 above the
-  ! admissible interval (lambda only increases) | 3 NO admissible lambda
-  integer(kind=8), dimension(3) :: ener_postneg = 0_8
-  ! largest lambda_wave/lambda_nodal of the call, and raised sides with B < 0 (the branch where
-  ! lambda_req ~ -B/eps diverges as eps -> 0)
-  real(kind=DOUBLE) :: ener_lamratio_max = 0.0_DOUBLE
-  ! unbounded sub-faces (boundary, z-faces): total sides, z-face sides with eps* < 0,
-  ! other boundary sides with eps* < 0
-  integer(kind=8), dimension(3) :: ener_bnd = 0_8
-  integer(kind=8) :: ener_nbneg = 0_8
-  ! multi_point_eps: nodes (owned, active) and those with eps_p <= 0 -- the positivity
-  ! condition of the scheme --, and max |eps*_s (closed form) - eps_p| / max(|eps_p|, eps_s)
-  integer(kind=8) :: ener_eps_nnode = 0_8, ener_eps_nneg = 0_8
-  real(kind=DOUBLE) :: ener_eps_gap = 0.0_DOUBLE
   ! multi_point_eps diag, per cell, rebuilt at every flux call: number of its nodes with
   ! eps_p <= 0, and number of its boundary_2d z-face sides with eps* < 0 (printed on the
-  ! [omega] culprit line); ener_eps_nodeprint caps the [epsneg] node prints at 20
+  ! [omega] culprit line)
   integer, allocatable, dimension(:) :: eps_cell_neg, eps_cell_zf
-  ! multi_point_eps diag: per cell, S_cl = sum_f A max(0, -s_l) with the CLASSIC lambdas (the
-  ! sum_lambda the cell would have had without the lambda bound); sum_lambda/S_cl is then
-  ! dt_local(classic)/dt_local(bound), the time-step cost of the bound
-  real(kind=DOUBLE), allocatable, dimension(:) :: eps_suml_cl
-  integer :: ener_eps_nodeprint = 0
-  ! multi_point_eps: sides raised by the lambda lower bound at raise 1, 2, 3 (3 = against frozen p_p)
-  integer(kind=8), dimension(3) :: ener_eps_raised = 0_8
-  ! multi_point_eps: nodes with at least one raised side, and with ALL their sides raised
-  integer(kind=8), dimension(2) :: ener_eps_nodes_raised = 0_8
-  ! all ener schemes: max relative nodal energy imbalance, interior nodes (1) and boundary nodes (2)
-  real(kind=DOUBLE), dimension(2) :: ener_cons = 0.0_DOUBLE
-  ! all ener schemes, interior sub-faces: S = 1/2 [(1/lam_l + 1/lam_r) p_p^2 - p_l^2/lam_l - p_r^2/lam_r]
-  ! (= lam_l (eps*_l - eps_l) + lam_r (eps*_r - eps_r) for ps, whatever the split q), normalised by
-  ! max(p_l, p_r) (lam_l/rho_l + lam_r/rho_r)/2. Bins: <-1e-1, <-1e-2, <-1e-3, <-1e-6, <0, >=0;
-  ! S < 0 <=> p_p below the 1/lambda-weighted quadratic mean of p_l, p_r
-  integer(kind=8), dimension(6) :: ener_shist = 0_8
   ! ener_dump_sides: unit of the per-rank side dump, open during the first flux call only
   ! (newunit returns NEGATIVE unit numbers in gfortran: track the open state explicitly)
   integer :: ener_dump_unit = -1
@@ -256,9 +215,6 @@ contains
     real(kind=DOUBLE), dimension(mesh%n_vert), intent(in) :: h_p
     real(kind=DOUBLE), dimension(3, 3, mesh%n_vert), intent(in) :: mat_h_p
     logical, intent(in) :: second_order
-    integer(kind=8), save :: ep_diag_calls = 0_8
-    integer(kind=8), dimension(0:4) :: ep_hist_tot
-    integer :: ep_rank, ep_ierr
 
     integer(kind=ENTIER) :: j, idse, ide, id_vert, nsfn, nsen, max_nsen
     integer(kind=ENTIER) :: adv_mode, eps_mode, ep_mode
@@ -462,17 +418,6 @@ contains
           sum_lambda(ide) = sum_lambda(ide) + sum_lambda_vert(j)
         end do
       end do
-      if (scheme_id == SCHEME_WIP2_PPEPV .or. scheme_id == SCHEME_WIP2_PPEPVI) then
-        ! node-count distribution of the e_p denominator, per window of 4000 calls
-        ep_diag_calls = ep_diag_calls + 1
-        if (mod(ep_diag_calls, 4000) == 0) then
-          ep_hist_tot = ep_den_hist
-          call MPI_COMM_RANK(MPI_COMM_WORLD, ep_rank, ep_ierr)
-          call MPI_ALLREDUCE(MPI_IN_PLACE, ep_hist_tot, 5, MPI_INTEGER8, MPI_SUM, &
-            MPI_COMM_WORLD, ep_ierr)
-          ep_den_hist = 0_8
-        end if
-      end if
     else if (scheme_id == SCHEME_USI3D) then
       do id_vert = 1, mesh%n_vert
         nsfn = mesh%vert(id_vert)%n_sub_faces_neigh
@@ -506,11 +451,9 @@ contains
           scheme_id == SCHEME_MULTI_POINT_EPS2 .or. scheme_id == SCHEME_MULTI_POINT_EPS2M .or. &
           scheme_id == SCHEME_MULTI_POINT_PS .or. scheme_id == SCHEME_MULTI_POINT_PSW .or. &
           scheme_id == SCHEME_MULTI_POINT_PV) then
-        if (.not. allocated(eps_cell_neg)) allocate(eps_cell_neg(mesh%n_elems), eps_cell_zf(mesh%n_elems), &
-          eps_suml_cl(mesh%n_elems))
+        if (.not. allocated(eps_cell_neg)) allocate(eps_cell_neg(mesh%n_elems), eps_cell_zf(mesh%n_elems))
         eps_cell_neg = 0
         eps_cell_zf = 0
-        eps_suml_cl = 0.0_DOUBLE
       end if
       do id_vert = 1, mesh%n_vert
         nsfn = mesh%vert(id_vert)%n_sub_faces_neigh
@@ -539,14 +482,6 @@ contains
           close(ener_dump_unit)
           ener_dumping = .false.
         end if
-        if (ener_calls <= 3 .or. mod(ener_calls, 1000) == 0 .or. &
-            (ener_calls < 10000 .and. mod(ener_calls, 100) == 0)) call print_ener_diag(ener_calls)
-        ener_hist_pre = 0_8; ener_hist_post = 0_8; ener_it_hist = 0_8
-        ener_lamhist = 0_8; ener_postneg = 0_8
-        ener_lamratio_max = 0.0_DOUBLE; ener_nbneg = 0_8; ener_bnd = 0_8
-        ener_nside = 0_8; ener_nraised = 0_8; ener_nonconv = 0_8
-        ener_eps_nnode = 0_8; ener_eps_nneg = 0_8; ener_eps_gap = 0.0_DOUBLE; ener_eps_raised = 0_8
-        ener_eps_nodes_raised = 0_8; ener_cons = 0.0_DOUBLE; ener_shist = 0_8
       end if
     end if
     deallocate(sum_lambda_vert, flux_sum_vert)
@@ -862,12 +797,9 @@ contains
                 if (lam_req > lambda(k_side, j)) then
                   lambda(k_side, j) = lam_req
                   eps_nr = eps_nr + 1
-                  if (.not. mesh%vert(id_vert)%is_ghost) &
-                    ener_lamratio_max = max(ener_lamratio_max, lam_req/lam_cl(k_side, j))
                 end if
               end do
             end do
-            if (.not. mesh%vert(id_vert)%is_ghost) ener_eps_raised(eps_it) = ener_eps_raised(eps_it) + eps_nr
             if (eps_nr == 0 .or. eps_it == 3) exit
             ! p_p with the raised lambdas (same sub-faces as above: all but the z-faces)
             p_ener = 0.0_DOUBLE
@@ -899,8 +831,6 @@ contains
                 if (lambda(k_side, j) > lam_cl(k_side, j)) eps_nr = eps_nr + 1
               end do
             end do
-            if (eps_nr > 0) ener_eps_nodes_raised(1) = ener_eps_nodes_raised(1) + 1
-            if (eps_nr == eps_ns .and. eps_ns > 0) ener_eps_nodes_raised(2) = ener_eps_nodes_raised(2) + 1
           end if
         end if
         ! ener_pstar: X_p from sum_f w [(pv)*_r - (pv)*_l] = 0 with the star-velocity pressure work,
@@ -994,16 +924,11 @@ contains
         if (eps_kind == 3) eps_tgt = -1.0_DOUBLE
         if (eps_kind >= 4) eps_tgt = -huge(1.0_DOUBLE)
         if (ener_eps .and. ener_pass == 1 .and. ener_active .and. .not. mesh%vert(id_vert)%is_ghost) then
-          ener_eps_nnode = ener_eps_nnode + 1
           if (e_ener <= eps_tgt) then
-            ener_eps_nneg = ener_eps_nneg + 1
             do j = 1, mesh%vert(id_vert)%n_sub_elems_neigh
               le = mesh%sub_elem(mesh%vert(id_vert)%sub_elem_neigh(j))%mesh_elem
               eps_cell_neg(le) = eps_cell_neg(le) + 1
             end do
-            if (ener_eps_nodeprint < 20) then
-              ener_eps_nodeprint = ener_eps_nodeprint + 1
-            end if
           end if
         end if
 
@@ -1089,16 +1014,12 @@ contains
             ratio = 0.5_DOUBLE*((1.0_DOUBLE/lambda(1, j) + 1.0_DOUBLE/lambda(2, j))*p_ener**2 &
               - p_l**2/lambda(1, j) - p_r**2/lambda(2, j)) &
               /(max(p_l, p_r)*0.5_DOUBLE*(lambda(1, j)/sol_w_lr(1, 1, j) + lambda(2, j)/sol_w_lr(1, 2, j)))
-            ener_shist(1 + count(ratio >= (/ -1e-1_DOUBLE, -1e-2_DOUBLE, -1e-3_DOUBLE, -1e-6_DOUBLE, &
-              0.0_DOUBLE /))) = ener_shist(1 + count(ratio >= (/ -1e-1_DOUBLE, -1e-2_DOUBLE, -1e-3_DOUBLE, &
-              -1e-6_DOUBLE, 0.0_DOUBLE /))) + 1
             ener_den = ener_den + mesh%sub_face(id_sub_face)%area*abs(p_ener) &
               *0.5_DOUBLE*(lambda(1, j)/sol_w_lr(1, 1, j) + lambda(2, j)/sol_w_lr(1, 2, j))
           end do
           if (ener_den > 0.0_DOUBLE) then
             k_side = 1
             if (mesh%vert(id_vert)%is_bound) k_side = 2
-            ener_cons(k_side) = max(ener_cons(k_side), abs(ener_num)/ener_den)
           end if
         end if
 
@@ -1122,16 +1043,13 @@ contains
               d_s = sol_w_lr(5, 1, j) - p_ener
               b_s = p_ener*vn_l - pv_l_ener(j)
               ratio = (eps_s + b_s/lambda(1, j) - 0.5_DOUBLE*d_s**2/lambda(1, j)**2)/eps_s
-              ener_bnd(1) = ener_bnd(1) + 1
               if (ratio < -1e-12_DOUBLE) then
                 if (is_zf) then
-                  ener_bnd(2) = ener_bnd(2) + 1
                   if (ener_eps) then
                     le = mesh%face(id_face)%left_neigh
                     eps_cell_zf(le) = eps_cell_zf(le) + 1
                   end if
                 else
-                  ener_bnd(3) = ener_bnd(3) + 1
                 end if
               end if
               ! bound the left wave of these sub-faces too. With v* = 0 (wall, z-face) the
@@ -1141,7 +1059,6 @@ contains
               if (ener_lambda_pos .and. ratio < 0.0_DOUBLE) then
                 lam_req = (-b_s + sqrt(b_s**2 + 2.0_DOUBLE*eps_s*d_s**2))/(2.0_DOUBLE*eps_s)
                 if (lam_req > lam_wave(1, j)) then
-                  ener_nraised = ener_nraised + 1
                   lam_wave(1, j) = lam_req
                 end if
               end if
@@ -1176,12 +1093,9 @@ contains
               if (eps_kind == 6) eps_tgt = eps_s*ratio
               if (eps_kind == 4 .or. eps_kind == 5) &
                 eps_tgt = eps_s + 0.5_DOUBLE*(p_ener**2 - (d_s + p_ener)**2)/lambda(k_side, j)**2
-              ener_eps_gap = max(ener_eps_gap, abs(eps_s*ratio - eps_tgt)/max(abs(eps_tgt), abs(eps_s)))
             end if
             if (ener_pass == 1) then
               if (.not. ener_eps) lam_cl(k_side, j) = lambda(k_side, j)
-              ener_nside = ener_nside + 1
-              ener_hist_pre(count(ratio >= ener_edges) + 1) = ener_hist_pre(count(ratio >= ener_edges) + 1) + 1
             end if
             ! DECOUPLED bound (Vincent): the nodal stage (p_p, v*, e_p, mu) keeps the classic
             ! lambda; only the WAVE lambda of the star states (s_l, s_r) is raised. With the nodal
@@ -1193,9 +1107,6 @@ contains
             if (ener_lambda_pos .and. ratio < 0.0_DOUBLE) then
               lam_req = (-b_s + sqrt(b_s**2 + 2.0_DOUBLE*eps_s*d_s**2))/(2.0_DOUBLE*eps_s)
               if (lam_req > lam_wave(k_side, j)) then
-                ener_nraised = ener_nraised + 1
-                if (b_s < 0.0_DOUBLE) ener_nbneg = ener_nbneg + 1
-                ener_lamratio_max = max(ener_lamratio_max, lam_req/lambda(k_side, j))
                 lam_wave(k_side, j) = lam_req
               end if
             end if
@@ -1204,8 +1115,6 @@ contains
         if (.not. ener_lambda_pos .or. .not. ener_raised .or. ener_pass == 5) exit
       end do
       if (.not. mesh%vert(id_vert)%is_ghost) then
-        ener_it_hist(ener_pass) = ener_it_hist(ener_pass) + 1
-        if (ener_lambda_pos .and. ener_raised) ener_nonconv = ener_nonconv + 1
       end if
       ! NB: when the 5th pass still raised a lambda, p_p/e_p/pv are those of the lambdas BEFORE
       ! that raise: recompute them once more so that fluxes and lambdas are consistent.
@@ -1366,7 +1275,7 @@ contains
         re = mesh%face(id_face)%right_neigh
         is_zf = boundary_2d .and. abs(mesh%sub_face(id_sub_face)%norm(3)) > 1.0_DOUBLE - 1e-8_DOUBLE
         if (re <= 0 .or. is_zf) then
-          ! boundary / z-face left star state after the bound (slot 2 of ener_postneg)
+          ! boundary / z-face left star state after the bound
           if ((ener_lambda_pos .or. ener_eps) .and. .not. mesh%vert(id_vert)%is_ghost) then
             rho_l = sol_w_lr(1, 1, j)
             vn_l = dot_product(sol_w_lr(2:4, 1, j), mesh%sub_face(id_sub_face)%norm)
@@ -1375,7 +1284,6 @@ contains
             d_s = sol_w_lr(5, 1, j) - p_ener
             b_s = p_ener*vn_l - pv_l_ener(j)
             ratio = (eps_s + b_s/lam_wave(1, j) - 0.5_DOUBLE*d_s**2/lam_wave(1, j)**2)/eps_s
-            if (ratio < -1e-12_DOUBLE) ener_postneg(2) = ener_postneg(2) + 1
           end if
           cycle
         end if
@@ -1392,18 +1300,13 @@ contains
           end if
           ratio = (eps_s + b_s/lam_wave(k_side, j) - 0.5_DOUBLE*d_s**2/lam_wave(k_side, j)**2)/eps_s
           if (mesh%vert(id_vert)%is_ghost) cycle
-          ener_hist_post(count(ratio >= ener_edges) + 1) = ener_hist_post(count(ratio >= ener_edges) + 1) + 1
           ! lambda_wave/lambda_nodal, bins 1 | (1,1.1] | (1.1,2] | (2,10] | (10,100] | >100
           lam_ratio = lam_wave(k_side, j)/lam_cl(k_side, j)
           if (lam_ratio <= 1.0_DOUBLE) then
-            ener_lamhist(1) = ener_lamhist(1) + 1
           else
-            ener_lamhist(2 + count(lam_ratio > (/ 1.1_DOUBLE, 2.0_DOUBLE, 10.0_DOUBLE, 100.0_DOUBLE /))) = &
-              ener_lamhist(2 + count(lam_ratio > (/ 1.1_DOUBLE, 2.0_DOUBLE, 10.0_DOUBLE, 100.0_DOUBLE /))) + 1
           end if
           ! sides still negative after the bound, by cause
           ! must stay 0 with the decoupled bound: a negative here is a wiring bug
-          if ((ener_lambda_pos .or. ener_eps) .and. ratio < -1e-12_DOUBLE) ener_postneg(1) = ener_postneg(1) + 1
         end do
       end do
     end if
@@ -1544,25 +1447,6 @@ contains
 
       ! multi_point_eps diag: the same wave sums with the classic lambdas (no effect on the solution).
       ! The _iso variants take sl, sr from three_wave, which never sees the bound: S_cl = S there.
-      if (ener_eps .and. allocated(eps_suml_cl)) then
-        if (ener_iso .or. (mesh%vert(id_vert)%is_bound .and. exclude_bound_vert)) then
-          ustar_l = sl
-          ustar_r = sr
-        else
-          ustar_l = dot_product(sol_w_lr(2:4, 1, j), mesh%sub_face(id_sub_face)%norm) - lam_cl(1, j)/sol_w_lr(1, 1, j)
-          ustar_r = dot_product(sol_w_lr(2:4, 2, j), mesh%sub_face(id_sub_face)%norm) + lam_cl(2, j)/sol_w_lr(1, 2, j)
-        end if
-        if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
-          le = mesh%sub_elem(lse)%mesh_elem
-          eps_suml_cl(le) = eps_suml_cl(le) + mesh%sub_face(id_sub_face)%area*max(0.0_DOUBLE, -ustar_l)
-        end if
-        if (rse > 0) then
-          if (mesh%sub_elem(rse)%mesh_vert == id_vert) then
-            le = mesh%sub_elem(rse)%mesh_elem
-            eps_suml_cl(le) = eps_suml_cl(le) + mesh%sub_face(id_sub_face)%area*max(0.0_DOUBLE, ustar_r)
-          end if
-        end if
-      end if
       if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
         sum_lambda_vert(lse_loc) = sum_lambda_vert(lse_loc) &
           + mesh%sub_face(id_sub_face)%area*max(0.0_DOUBLE, -sl)
@@ -1602,12 +1486,8 @@ contains
     real(kind=DOUBLE), intent(inout) :: dt
 
     integer(kind=ENTIER) :: i, mpi_ierr, k
-    real(kind=DOUBLE) :: omega, alpha_c, omega_i
+    real(kind=DOUBLE) :: omega, omega_i
     integer, save :: n_culprit = 0
-    integer(kind=8), save :: alpha_calls = 0_8
-    integer(kind=8), dimension(7) :: ahist
-    integer(kind=8), dimension(6) :: dhist
-    real(kind=DOUBLE) :: dmax
     real(kind=DOUBLE), dimension(5) :: new_sol
 
     dt = 1e10
@@ -1625,49 +1505,6 @@ contains
       dt = min(tmax - t + 1e-12_DOUBLE, dt)
     end if
 
-    ! weight alpha_c kept on the cell's own state in the first-order update (convex
-    ! combination of the cell, star and neighbour states): local step 1 - S/(V/dt + S/theta),
-    ! global step 1 - dt S/V, with S = sum_lambda = sum_f A Lambda_1^-. Histogram bins
-    ! <0 | [0,1e-6) | [1e-6,1e-3) | [1e-3,0.1) | [0.1,0.5) | [0.5,0.9) | [0.9,1]
-    alpha_calls = alpha_calls + 1
-    if (alpha_calls <= 3 .or. mod(alpha_calls, 1000) == 0 .or. &
-        (alpha_calls < 10000 .and. mod(alpha_calls, 100) == 0)) then
-      ahist = 0_8
-      do i = 1, mesh%n_elems
-        if (mesh%elem(i)%is_ghost) cycle
-        if (local_time_step) then
-          alpha_c = 1.0_DOUBLE - sum_lambda(i)/(mesh%elem(i)%volume/dt + sum_lambda(i)/ener_theta)
-        else
-          alpha_c = 1.0_DOUBLE - dt*sum_lambda(i)/mesh%elem(i)%volume
-        end if
-        ahist(1 + count(alpha_c >= (/ 0.0_DOUBLE, 1e-6_DOUBLE, 1e-3_DOUBLE, 0.1_DOUBLE, &
-          0.5_DOUBLE, 0.9_DOUBLE /))) = ahist(1 + count(alpha_c >= (/ 0.0_DOUBLE, 1e-6_DOUBLE, &
-          1e-3_DOUBLE, 0.1_DOUBLE, 0.5_DOUBLE, 0.9_DOUBLE /))) + 1
-      end do
-      call MPI_ALLREDUCE(MPI_IN_PLACE, ahist, 7, MPI_INTEGER8, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
-      ! multi_point_eps: dt_local(classic lambda)/dt_local(bound) = sum_lambda/S_cl per cell
-      if (allocated(eps_suml_cl)) then
-        dhist = 0_8
-        dmax = 1.0_DOUBLE
-        do i = 1, mesh%n_elems
-          if (mesh%elem(i)%is_ghost) cycle
-          if (eps_suml_cl(i) > 0.0_DOUBLE) then
-            alpha_c = sum_lambda(i)/eps_suml_cl(i)
-          else
-            alpha_c = 1.0_DOUBLE
-          end if
-          dmax = max(dmax, alpha_c)
-          if (alpha_c <= 1.0_DOUBLE + 1e-12_DOUBLE) then
-            dhist(1) = dhist(1) + 1
-          else
-            dhist(2 + count(alpha_c > (/ 1.1_DOUBLE, 2.0_DOUBLE, 10.0_DOUBLE, 100.0_DOUBLE /))) = &
-              dhist(2 + count(alpha_c > (/ 1.1_DOUBLE, 2.0_DOUBLE, 10.0_DOUBLE, 100.0_DOUBLE /))) + 1
-          end if
-        end do
-        call MPI_ALLREDUCE(MPI_IN_PLACE, dhist, 6, MPI_INTEGER8, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
-        call MPI_ALLREDUCE(MPI_IN_PLACE, dmax, 1, MPI_DOUBLE_PRECISION, MPI_MAX, MPI_COMM_WORLD, mpi_ierr)
-      end if
-    end if
 
     if( .not. local_time_step ) then
       sum_lambda = 0.0_DOUBLE
@@ -1789,60 +1626,5 @@ contains
   end subroutine ener_lambda_target
 
   ! one line per call of the ener lambda-bound diagnostics (all ranks summed)
-  subroutine print_ener_diag(ncall)
-    use mpi
-    implicit none
-    integer(kind=8), intent(in) :: ncall
-    integer(kind=8), dimension(11) :: hpre, hpost
-    integer(kind=8), dimension(5) :: hit
-    integer(kind=8), dimension(3) :: cnt, pn
-    integer(kind=8), dimension(6) :: lh
-    integer :: rank, ierr
-    real(kind=DOUBLE) :: chk, lrm
-    integer(kind=8) :: nbn
-    integer(kind=8), dimension(3) :: bnd
-    integer(kind=8), dimension(2) :: en, ent
-    real(kind=DOUBLE), dimension(2) :: cns
-    integer(kind=8), dimension(6) :: shh
-    real(kind=DOUBLE) :: entmin
-    integer(kind=8), dimension(3) :: er
-    integer(kind=8), dimension(2) :: enr
-    real(kind=DOUBLE) :: egap
-    en = (/ ener_eps_nnode, ener_eps_nneg /)
-    er = ener_eps_raised
-    call MPI_ALLREDUCE(MPI_IN_PLACE, er, 3, MPI_INTEGER8, MPI_SUM, MPI_COMM_WORLD, ierr)
-    enr = ener_eps_nodes_raised
-    call MPI_ALLREDUCE(MPI_IN_PLACE, enr, 2, MPI_INTEGER8, MPI_SUM, MPI_COMM_WORLD, ierr)
-    egap = ener_eps_gap
-    call MPI_ALLREDUCE(MPI_IN_PLACE, en, 2, MPI_INTEGER8, MPI_SUM, MPI_COMM_WORLD, ierr)
-    call MPI_ALLREDUCE(MPI_IN_PLACE, egap, 1, MPI_DOUBLE_PRECISION, MPI_MAX, MPI_COMM_WORLD, ierr)
-    cns = ener_cons
-    shh = ener_shist
-    call MPI_ALLREDUCE(MPI_IN_PLACE, shh, 6, MPI_INTEGER8, MPI_SUM, MPI_COMM_WORLD, ierr)
-    call MPI_ALLREDUCE(MPI_IN_PLACE, cns, 2, MPI_DOUBLE_PRECISION, MPI_MAX, MPI_COMM_WORLD, ierr)
-    ent = (/ ener_ent_n, ener_ent_neg /)
-    call MPI_ALLREDUCE(MPI_IN_PLACE, ent, 2, MPI_INTEGER8, MPI_SUM, MPI_COMM_WORLD, ierr)
-    entmin = ener_ent_min
-    call MPI_ALLREDUCE(MPI_IN_PLACE, entmin, 1, MPI_DOUBLE_PRECISION, MPI_MIN, MPI_COMM_WORLD, ierr)
-    ener_ent_n = 0_8; ener_ent_neg = 0_8; ener_ent_min = 1.0_DOUBLE
-    chk = ener_check_maxdiff
-    call MPI_ALLREDUCE(MPI_IN_PLACE, chk, 1, MPI_DOUBLE_PRECISION, MPI_MAX, MPI_COMM_WORLD, ierr)
-    ener_check_maxdiff = 0.0_DOUBLE
-    hpre = ener_hist_pre; hpost = ener_hist_post; hit = ener_it_hist
-    lh = ener_lamhist; pn = ener_postneg
-    lrm = ener_lamratio_max; nbn = ener_nbneg; bnd = ener_bnd
-    call MPI_ALLREDUCE(MPI_IN_PLACE, bnd, 3, MPI_INTEGER8, MPI_SUM, MPI_COMM_WORLD, ierr)
-    call MPI_ALLREDUCE(MPI_IN_PLACE, lrm, 1, MPI_DOUBLE_PRECISION, MPI_MAX, MPI_COMM_WORLD, ierr)
-    call MPI_ALLREDUCE(MPI_IN_PLACE, nbn, 1, MPI_INTEGER8, MPI_SUM, MPI_COMM_WORLD, ierr)
-    call MPI_ALLREDUCE(MPI_IN_PLACE, lh, 6, MPI_INTEGER8, MPI_SUM, MPI_COMM_WORLD, ierr)
-    call MPI_ALLREDUCE(MPI_IN_PLACE, pn, 3, MPI_INTEGER8, MPI_SUM, MPI_COMM_WORLD, ierr)
-    cnt = (/ ener_nside, ener_nraised, ener_nonconv /)
-    call MPI_ALLREDUCE(MPI_IN_PLACE, hpre, 11, MPI_INTEGER8, MPI_SUM, MPI_COMM_WORLD, ierr)
-    call MPI_ALLREDUCE(MPI_IN_PLACE, hpost, 11, MPI_INTEGER8, MPI_SUM, MPI_COMM_WORLD, ierr)
-    call MPI_ALLREDUCE(MPI_IN_PLACE, hit, 5, MPI_INTEGER8, MPI_SUM, MPI_COMM_WORLD, ierr)
-    call MPI_ALLREDUCE(MPI_IN_PLACE, cnt, 3, MPI_INTEGER8, MPI_SUM, MPI_COMM_WORLD, ierr)
-    call MPI_COMM_RANK(MPI_COMM_WORLD, rank, ierr)
-    if (rank /= 0) return
-  end subroutine print_ener_diag
 
 end module ns_euler_module

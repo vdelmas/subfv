@@ -5,13 +5,6 @@ module ns_euler_zb_module
   use ns_euler_recon_module
   implicit none
 
-  ! Diagnostic of the PPEPV/PPEPVI nodal-energy denominator (ep_mode >= 3), filled by
-  ! compute_rhs_around_vert_WIP2 and printed/reset by compute_euler_flux. Bins of
-  ! r = sum A(mu_l+mu_r) / sum A(lam_l+lam_r) per node (interior sub-faces only):
-  !   0: r == 0 (degenerate node, WIP2 fallback)   1: r < 1e-9   2: [1e-9, 1e-6)
-  !   3: [1e-6, 1e-3)                               4: r >= 1e-3
-  ! Vertices shared between MPI ranks are counted once per rank.
-  integer(kind=8), dimension(0:4) :: ep_den_hist = 0_8
 
 contains
   subroutine compute_nodal_velocity_LS(mesh, id_vert, sol, grad, vp, h_p, second_order)
@@ -3101,7 +3094,7 @@ contains
     real(kind=DOUBLE) :: theta_n, pflux_l, pflux_r, vn_node
     real(kind=DOUBLE), dimension(3) :: u_node
     real(kind=DOUBLE), dimension(5) :: djump
-    real(kind=DOUBLE) :: e_p, ep_num, ep_den, e_l, e_r, mu_l, mu_r, vs_ep, ep_lam
+    real(kind=DOUBLE) :: e_p, ep_num, ep_den, e_l, e_r, mu_l, mu_r, vs_ep
     logical :: ep_active
 
     rse_loc = 0
@@ -3276,7 +3269,6 @@ contains
     if (ep_mode > 0) then
       ep_num = 0.0_DOUBLE
       ep_den = 0.0_DOUBLE
-      ep_lam = 0.0_DOUBLE
       do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
         id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
         le = mesh%sub_face(id_sub_face)%left_elem_neigh
@@ -3319,22 +3311,8 @@ contains
         ep_num = ep_num + mesh%sub_face(id_sub_face)%area &
           *(mu_l*e_l + mu_r*e_r + (pl*vnl - pr*vnr))
         ep_den = ep_den + mesh%sub_face(id_sub_face)%area*(mu_l + mu_r)
-        ep_lam = ep_lam + mesh%sub_face(id_sub_face)%area*(lambda_l + lambda_r)
       end do
       if (ep_den > 0.0_DOUBLE) e_p = ep_num/ep_den
-      if (ep_mode >= 3) then
-        if (ep_den <= 0.0_DOUBLE) then
-          ep_den_hist(0) = ep_den_hist(0) + 1
-        else if (ep_den < 1e-9_DOUBLE*ep_lam) then
-          ep_den_hist(1) = ep_den_hist(1) + 1
-        else if (ep_den < 1e-6_DOUBLE*ep_lam) then
-          ep_den_hist(2) = ep_den_hist(2) + 1
-        else if (ep_den < 1e-3_DOUBLE*ep_lam) then
-          ep_den_hist(3) = ep_den_hist(3) + 1
-        else
-          ep_den_hist(4) = ep_den_hist(4) + 1
-        end if
-      end if
     end if
     ep_active = (ep_mode > 0)
     if (ep_mode >= 3) ep_active = (ep_den > 0.0_DOUBLE)
