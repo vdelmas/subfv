@@ -806,11 +806,6 @@ program main
       end if
     end if
 
-    ! Taylor-Green needs an energy source to close the total energy equation
-    ! (Vilar eq. 4.103). Added here, on the PRE-move mesh, because that is the
-    ! geometry rhs was just assembled on.
-    if (init == 10) call add_taylor_green_source(mesh, mass, rhs)
-
     if (.not. dt_at_step_start) &
       call compute_dt(mesh, sol, dt, cfl, vp, me, num_procs, gamma_arr, bc_p=bc_p)
     ! dt = NaN rend `t + dt < t_max` FAUX, donc la boucle se termine normalement
