@@ -66,7 +66,7 @@ contains
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(4, mesh%n_elems), intent(in) :: sol
 
-    integer :: i, id_elem
+    integer :: i
     real(kind=DOUBLE) :: r, theta, phi, error, exact_sol(4), tot_volume
 
     error = 0.0_DOUBLE
@@ -74,7 +74,7 @@ contains
     do i=1,mesh%n_elems
       r = norm2(mesh%elem(i)%coord)
       theta = atan2(norm2(mesh%elem(i)%coord(2:3)), mesh%elem(i)%coord(1))
-      phi = atan2(mesh%elem(id_elem)%coord(3), mesh%elem(id_elem)%coord(2))
+      phi = atan2(mesh%elem(i)%coord(3), mesh%elem(i)%coord(2))
       call exact_sphere(r,theta,phi,exact_sol)
       ! error = error + mesh%elem(i)%volume*norm2(sol(2:4,i)-exact_sol(2:4))**2
       error = error + mesh%elem(i)%volume*(norm2(sol(2:4,i))-norm2(exact_sol(2:4)))**2
