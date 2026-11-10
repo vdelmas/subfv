@@ -417,9 +417,9 @@ contains
             id_sub_face = mesh%sub_elem(id_sub_elem)%sub_face(k)
             id_face = mesh%sub_face(id_sub_face)%mesh_face
             if( mesh%sub_face(id_sub_face)%left_elem_neigh == id_elem ) then
-              Npcf = Npcf + mesh%sub_face(id_sub_face)%area*mesh%face(id_face)%norm
+              Npcf = Npcf + mesh%sub_face(id_sub_face)%area*mesh%sub_face(id_sub_face)%norm
             else
-              Npcf = Npcf - mesh%sub_face(id_sub_face)%area*mesh%face(id_face)%norm
+              Npcf = Npcf - mesh%sub_face(id_sub_face)%area*mesh%sub_face(id_sub_face)%norm
             end if
           end do
 

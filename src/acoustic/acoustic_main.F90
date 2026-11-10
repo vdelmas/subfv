@@ -190,24 +190,24 @@ program main
         else !Boundary conditions
           if( ir == 0 ) then
             if( mesh_was ) then
-              if( dot_product(mesh%face(id_face)%norm,mesh%elem(il)%coord) < 0.0_DOUBLE) then
+              if( dot_product(mesh%sub_face(id_sub_face)%norm,mesh%elem(il)%coord) < 0.0_DOUBLE) then
                 solr = bc_val(:,-ir)
-              else  if( dot_product(mesh%face(id_face)%norm,mesh%elem(il)%coord) > 0.0_DOUBLE) then
+              else  if( dot_product(mesh%sub_face(id_sub_face)%norm,mesh%elem(il)%coord) > 0.0_DOUBLE) then
                 solr(1) = soll(1)
                 solr(2:4) = soll(2:4) &
-                  - 2.0_DOUBLE*dot_product(soll(2:4), mesh%face(id_face)%norm)*mesh%face(id_face)%norm
+                  - 2.0_DOUBLE*dot_product(soll(2:4), mesh%sub_face(id_sub_face)%norm)*mesh%sub_face(id_sub_face)%norm
               end if
             else
               !Wall bc with oposite normal velocity
               solr(1) = soll(1)
               solr(2:4) = soll(2:4) &
-                - 2.0_DOUBLE*dot_product(soll(2:4), mesh%face(id_face)%norm)*mesh%face(id_face)%norm
+                - 2.0_DOUBLE*dot_product(soll(2:4), mesh%sub_face(id_sub_face)%norm)*mesh%sub_face(id_sub_face)%norm
             end if
           else
             if( bc_type(-ir) == "freestream" ) then
               solr = bc_val(:,-ir)
             else if (trim(adjustl(bc_type(-ir))) == "inflow_pond") then
-              if (dot_product(solr(2:4), mesh%face(id_face)%norm) > 0.0_DOUBLE) then
+              if (dot_product(solr(2:4), mesh%sub_face(id_sub_face)%norm) > 0.0_DOUBLE) then
                 solr = soll
               else
                 solr = bc_val(:, -ir)
@@ -229,7 +229,7 @@ program main
               !Wall bc with oposite normal velocity
               solr(1) = soll(1)
               solr(2:4) = soll(2:4) &
-                - 2.0_DOUBLE*dot_product(soll(2:4), mesh%face(id_face)%norm)*mesh%face(id_face)%norm
+                - 2.0_DOUBLE*dot_product(soll(2:4), mesh%sub_face(id_sub_face)%norm)*mesh%sub_face(id_sub_face)%norm
             else
               print*, "Unknown BC type!"
               error stop
@@ -238,8 +238,8 @@ program main
         end if
 
         !Rotate sol
-        call rotate(soll(2:4), mesh%face(id_face)%norm, .true.)
-        call rotate(solr(2:4), mesh%face(id_face)%norm, .true.)
+        call rotate(soll(2:4), mesh%sub_face(id_sub_face)%norm, .true.)
+        call rotate(solr(2:4), mesh%sub_face(id_sub_face)%norm, .true.)
 
         lr_states(:, 1, j) = soll
         lr_states(:, 2, j) = solr
@@ -268,8 +268,8 @@ program main
         ! call rusanov(lr_states(:, 1, j), lr_states(:, 2, j), fluxl, fluxr, smax)
 
         !Rotate back flux
-        call rotate(fluxl(2:4), mesh%face(id_face)%norm, .false.)
-        call rotate(fluxr(2:4), mesh%face(id_face)%norm, .false.)
+        call rotate(fluxl(2:4), mesh%sub_face(id_sub_face)%norm, .false.)
+        call rotate(fluxr(2:4), mesh%sub_face(id_sub_face)%norm, .false.)
 
         !Update flux
         do k=1, 4
