@@ -8489,11 +8489,11 @@ contains
         end if
       end do
     else if( init == 2) then
+      ! Moyenne de maille EXACTE par quadrature, et non la valeur au centroide : l ecart
+      ! au centroide est un O(h^2) FIGE DANS LA MASSE, qui apparaissait dans la norme des
+      ! le premier pas et valait deja 28 a 32 % de l erreur a t = 0,5.
       do i=1, mesh%n_elems
-        call sol_isentropic_vortex(mesh%elem(i)%coord, sol(:, i), 0.0_DOUBLE)
-        sol(5, i) = sol(5, i)/(sol(1, i)*(gamma_arr(i)-1.0_DOUBLE)) &
-          + 0.5_DOUBLE*norm2(sol(2:4, i))**2
-        sol(1, i) = 1.0_DOUBLE/sol(1, i)
+        call isentropic_vortex_cell_average(mesh, i, 0.0_DOUBLE, sol(:, i))
       end do
     else if( init == 10) then
       ! Taylor-Green. Initialised with the exact CELL AVERAGE of the conserved
@@ -9436,6 +9436,59 @@ contains
       *(cos(3.0_DOUBLE*PI*x)*cos(PI*y) - cos(3.0_DOUBLE*PI*y)*cos(PI*x))
   end function taylor_green_source
 
+  ! Moyenne de maille EXACTE de l etat conservatif lagrangien (tau, u, E) du vortex
+  ! isentropique. rho n y est PAS uniforme, contrairement a Taylor-Green, donc :
+  !   m    = integrale de rho sur la maille, par quadrature
+  !   tau  = V/m  -- et mass(i) = V/tau redonne alors m exactement (lagrange_main:493)
+  !   u, E = moyennes PONDEREES PAR LA MASSE, puisque les quantites conservees sont m u et m E
+  subroutine isentropic_vortex_cell_average(mesh, i, t, u_avg)
+    use quadrature_module, only: volume_quad_pts
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: i
+    real(kind=DOUBLE), intent(in) :: t
+    real(kind=DOUBLE), dimension(5), intent(out) :: u_avg
+
+    integer(kind=ENTIER) :: k, q, n_v
+    real(kind=DOUBLE) :: vol_q, m_q, e_tot, rho_q
+    real(kind=DOUBLE), dimension(5) :: w
+    real(kind=DOUBLE), dimension(:, :), allocatable :: vcoords, pts
+    real(kind=DOUBLE), dimension(:), allocatable :: wts
+
+    u_avg = 0.0_DOUBLE
+    n_v = mesh%elem(i)%n_vert
+    if (n_v == 4 .or. n_v == 5 .or. n_v == 6 .or. n_v == 8) then
+      allocate(vcoords(3, n_v))
+      do k = 1, n_v
+        vcoords(:, k) = mesh%vert(mesh%elem(i)%vert(k))%coord
+      end do
+      call volume_quad_pts(n_v, vcoords, 3_ENTIER, pts, wts)
+      deallocate(vcoords)
+      vol_q = 0.0_DOUBLE; m_q = 0.0_DOUBLE
+      do q = 1, size(wts)
+        call sol_isentropic_vortex(pts(:, q), w, t)
+        rho_q = w(1)
+        e_tot = w(5)/(w(1)*(gamma - 1.0_DOUBLE)) + 0.5_DOUBLE*norm2(w(2:4))**2
+        u_avg(2:4) = u_avg(2:4) + wts(q)*rho_q*w(2:4)
+        u_avg(5)   = u_avg(5)   + wts(q)*rho_q*e_tot
+        m_q   = m_q   + wts(q)*rho_q
+        vol_q = vol_q + wts(q)
+      end do
+      deallocate(pts, wts)
+      if (m_q > 0.0_DOUBLE) then
+        u_avg(2:5) = u_avg(2:5)/m_q
+        u_avg(1)   = vol_q/m_q
+      end if
+    else
+      ! Type de maille hors quadrature : on retombe sur la valeur ponctuelle.
+      call sol_isentropic_vortex(mesh%elem(i)%coord, w, t)
+      u_avg(2:4) = w(2:4)
+      u_avg(5)   = w(5)/(w(1)*(gamma - 1.0_DOUBLE)) + 0.5_DOUBLE*norm2(w(2:4))**2
+      u_avg(1)   = 1.0_DOUBLE/w(1)
+    end if
+  end subroutine isentropic_vortex_cell_average
+
   ! Exact cell average of the Lagrangian conserved state (tau, u, E) over cell i.
   subroutine taylor_green_cell_average(mesh, i, u_avg)
     use quadrature_module, only: volume_quad_pts
@@ -9524,7 +9577,6 @@ contains
   ! steady, so the exact solution is the initial one evaluated at the cell's
   ! current position.
   subroutine compute_error_taylor_green(mesh, sol, gamma_arr, h_extrude, h, l1err, l2err, linferr)
-    use quadrature_module, only: volume_quad_pts
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -9533,11 +9585,9 @@ contains
     real(kind=DOUBLE), intent(in) :: h_extrude
     real(kind=DOUBLE), intent(out) :: h, l1err, l2err, linferr
 
-    integer(kind=ENTIER) :: i, k, q, n_v, n_inner, mpi_ierr
-    real(kind=DOUBLE) :: err1, err2, errinf, area_tot, area_i, p_num, p_ex, vol_q
+    integer(kind=ENTIER) :: i, n_inner, mpi_ierr
+    real(kind=DOUBLE) :: err1, err2, errinf, area_tot, area_i, p_num, p_ex
     real(kind=DOUBLE), dimension(5) :: wq
-    real(kind=DOUBLE), dimension(:, :), allocatable :: vcoords, pts
-    real(kind=DOUBLE), dimension(:), allocatable :: wts
     real(kind=DOUBLE), dimension(4) :: buf
 
     err1 = 0.0_DOUBLE; err2 = 0.0_DOUBLE; errinf = 0.0_DOUBLE
@@ -9546,33 +9596,12 @@ contains
     do i = 1, mesh%n_elems
       if (mesh%elem(i)%is_ghost) cycle
 
-      n_v = mesh%elem(i)%n_vert
-      p_ex = 0.0_DOUBLE
-      if (n_v == 4 .or. n_v == 5 .or. n_v == 6 .or. n_v == 8) then
-        allocate(vcoords(3, n_v))
-        do k = 1, n_v
-          vcoords(:, k) = mesh%vert(mesh%elem(i)%vert(k))%coord
-        end do
-        call volume_quad_pts(n_v, vcoords, 3_ENTIER, pts, wts)
-        deallocate(vcoords)
-        vol_q = 0.0_DOUBLE
-        do q = 1, size(wts)
-          call sol_taylor_green(pts(:, q), wq)
-          p_ex  = p_ex + wts(q)*wq(5)
-          vol_q = vol_q + wts(q)
-        end do
-        deallocate(pts, wts)
-        if (vol_q > 0.0_DOUBLE) then
-          p_ex = p_ex/vol_q
-        else
-          call sol_taylor_green(mesh%elem(i)%coord, wq)
-          p_ex = wq(5)
-        end if
-      else
-        call sol_taylor_green(mesh%elem(i)%coord, wq)
-        p_ex = wq(5)
-      end if
-
+      ! COMPARER LES MEMES OBJETS. On comparait moy(p_exact) a p(U_num), or pressure() est
+      ! non lineaire : les deux differaient d un O(h^2) meme pour une solution exacte, ce qui
+      ! posait un plancher dans la norme. On prend donc p(U_exact), avec U_exact la moyenne
+      ! de maille exacte par quadrature -- la meme que celle qui sert a l initialisation.
+      call taylor_green_cell_average(mesh, i, wq)
+      p_ex   = pressure(wq, gamma_arr(i))
       p_num  = pressure(sol(:, i), gamma_arr(i))
       area_i = cell_area_2d(mesh, i, h_extrude)
 
