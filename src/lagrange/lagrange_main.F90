@@ -813,7 +813,7 @@ program main
     ! sont fait prendre. On le rend BRUYANT sans changer la semantique ; l'arret
     ! dur est derriere stop_on_nan_dt, parce que c'est un changement de
     ! comportement pour tous les schemas et qu'il appartient a Vincent.
-    if (dt /= dt) then
+    if (dt /= dt .or. dt_nan_detected) then
       if (me == 0) print*, "PANNE : dt = NaN au pas", iter, " t =", t, &
         " -- la boucle en temps va se terminer SILENCIEUSEMENT avec EXIT_CODE 0."
       if (stop_on_nan_dt) then

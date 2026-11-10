@@ -806,6 +806,9 @@ module lagrange_module
   ! c'est une decision de Vincent. Declare ici et non dans le bloc de la
   ! pseudo-inverse, qui a ete retire : ce diagnostic est GENERAL.
   logical, public :: stop_on_nan_dt = .false.
+  ! Pose par compute_dt quand une BORNE est NaN, et reduit sur tous les rangs. Necessaire
+  ! parce qu un NaN local defait le min sans rendre dt lui-meme NaN sur les autres rangs.
+  logical, public :: dt_nan_detected = .false.
   logical, public :: pi_pif = .false.
   ! TEST D'ATTRIBUTION : prendre v_p du solveur 'vp' existant pour deplacer le
   ! maillage, et garder (Pi_f, U_f) de la construction par sous-face pour les
@@ -7992,6 +7995,7 @@ contains
   ! `only` : 'A' = borne acoustique seule (sans v_p, calculable en tete de pas),
   ! 'V' = borne de volume seule, absent = les deux.
   subroutine compute_dt(mesh, sol, dt, cfl, vp, me, num_procs, gamma_arr, only, bc_p)
+    use, intrinsic :: ieee_arithmetic
     implicit none
 
     type(mesh_type), intent(in) :: mesh
@@ -8020,6 +8024,9 @@ contains
     ! en divisant encore le pas).
     real(kind=DOUBLE), parameter :: CV = 0.2_DOUBLE
     integer(kind=ENTIER) :: i, j, k, mpi_ierr
+    real(kind=DOUBLE) :: bnd, dt_nan_val
+    logical :: dt_nan_seen
+    integer :: inan
     integer(kind=ENTIER) :: id_sub_face, id_face
     integer(kind=ENTIER) :: id_vert, id_sub_elem
     real(kind=DOUBLE) :: dx, c, rho, lambda, mass_c, sum_al, sum_av
@@ -8034,6 +8041,7 @@ contains
       do_acou = (only /= 'V'); do_vol = (only /= 'A')
     end if
     dt = 1e6
+    dt_nan_seen = .false.; dt_nan_val = 0.0_DOUBLE
     if (diag_dtb) then
       dtb_acou = 1e300_DOUBLE; dtb_vol = 1e300_DOUBLE
       dtb_n_nan_acou = 0; dtb_n_nan_vol = 0; dtb_i_first_nan = -1
@@ -8131,8 +8139,24 @@ contains
             /= CV*abs(mesh%elem(i)%volume)/(1.0e-8_DOUBLE + sum_av)) &
           dtb_n_nan_vol = dtb_n_nan_vol + 1
       end if
-      if (do_acou) dt = min(dt, mass_c/max(sum_al, 1.0e-30_DOUBLE))
-      if (do_vol)  dt = min(dt, CV*abs(mesh%elem(i)%volume)/(1.0e-8_DOUBLE + sum_av))
+      ! min(dt, NaN) rend dt : une borne NaN etait donc SILENCIEUSEMENT ignoree et le
+      ! run continuait avec un dt faux. On la retient au lieu de la perdre.
+      if (do_acou) then
+        bnd = mass_c/max(sum_al, 1.0e-30_DOUBLE)
+        if (bnd /= bnd) then
+          dt_nan_seen = .true.; dt_nan_val = bnd
+        else
+          dt = min(dt, bnd)
+        end if
+      end if
+      if (do_vol) then
+        bnd = CV*abs(mesh%elem(i)%volume)/(1.0e-8_DOUBLE + sum_av)
+        if (bnd /= bnd) then
+          dt_nan_seen = .true.; dt_nan_val = bnd
+        else
+          dt = min(dt, bnd)
+        end if
+      end if
       if (diag_dtb .and. dt /= dt .and. dtb_i_first_nan < 0) dtb_i_first_nan = i
       if (diag_dtb) then
         if (mass_c/max(sum_al, 1.0e-30_DOUBLE) < dtb_acou) then
@@ -8188,6 +8212,21 @@ contains
 
     if( num_procs > 1 ) call MPI_ALLREDUCE(MPI_IN_PLACE, &
       dt, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
+
+    ! MPI_MIN ne transporte pas un NaN de facon fiable : on reduit le DRAPEAU, pour que
+    ! tous les rangs le sachent et s arretent ENSEMBLE plutot qu un seul.
+    inan = 0
+    if (dt_nan_seen) inan = 1
+    if( num_procs > 1 ) call MPI_ALLREDUCE(MPI_IN_PLACE, inan, 1, MPI_INTEGER, &
+      MPI_MAX, MPI_COMM_WORLD, mpi_ierr)
+    dt_nan_detected = (inan > 0)
+    if (dt_nan_detected) then
+      if (dt_nan_seen) then
+        dt = dt_nan_val
+      else
+        dt = ieee_value(dt, ieee_quiet_nan)
+      end if
+    end if
   end subroutine compute_dt
 
   subroutine init_sol(mesh, sol, sol_uniform, init, me, num_procs, gamma_arr, boundary_2d)
