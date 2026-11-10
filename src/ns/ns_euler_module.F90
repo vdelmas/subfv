@@ -1572,8 +1572,10 @@ contains
       if( me == 0 ) print*, "OMEGA", omega
     end if
 
+    ! dt renvoye au pilote, qui fait t = t + dt : c est l avance REELLEMENT faite. La
+    ! solution avance de omega*delta_sol, donc de omega*dt, pas de (1-omega)*dt.
     if( .not. local_time_step .and. omega < 1.0_DOUBLE ) then
-      dt = (1.0_DOUBLE-omega)*dt
+      dt = omega*dt
     end if
 
     sol = sol + a2*omega*delta_sol
