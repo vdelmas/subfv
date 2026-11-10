@@ -10,7 +10,9 @@ module mpi_module
   end type mpi_elems_type
 
   type mpi_send_recv_type
-    integer(kind=ENTIER) :: n_mpi_send_neigh, n_mpi_recv_neigh
+    ! Valeurs par defaut OBLIGATOIRES : en sequentiel personne ne les pose (elles ne le sont
+    ! que sous num_procs > 1) et mpi_waitall les lit. Sans ca, tout run sequentiel depend du zero de la .bss.
+    integer(kind=ENTIER) :: n_mpi_send_neigh = 0, n_mpi_recv_neigh = 0
     type(mpi_elems_type), dimension(:), allocatable :: mpi_send_neigh, mpi_recv_neigh
     integer, dimension(:), allocatable :: mpi_reqsend, mpi_reqrecv
     integer, dimension(:, :), allocatable :: mpi_sendstat, mpi_recvstat
