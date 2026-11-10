@@ -8394,18 +8394,21 @@ contains
         ! 0.02143 exactement, et l'ancien code tranchait l'egalite par l'ordre de boucle,
         ! ce qui deposait toute l'energie d'un seul cote et brisait la symetrie des le
         ! premier pas. La tolerance est relative au rayon minimal lui-meme.
+        ! Ce partage ne depend PAS de sedov_nodal_deposit, qui ne concerne que le cas
+        ! d un SOMMET sur l origine : le verrou etait mal place. Sans lui, vol_dep restait
+        ! nul au defaut et chaque rang a egalite deposait e_dep en entier, soit k e_dep.
         vol_dep = 0.0_DOUBLE
-        if (sedov_nodal_deposit) then
-          do i = 1, mesh%n_elems
-            if (mesh%elem(i)%is_ghost) cycle
-            if (boundary_2d) then
-              r = norm2(mesh%elem(i)%coord(:2))
-            else
-              r = norm2(mesh%elem(i)%coord)
-            end if
-            if (r <= rmin_share*(1.0_DOUBLE + 1.0e-8_DOUBLE) + 1.0e-14_DOUBLE) &
-              vol_dep = vol_dep + mesh%elem(i)%volume
-          end do
+        do i = 1, mesh%n_elems
+          if (mesh%elem(i)%is_ghost) cycle
+          if (boundary_2d) then
+            r = norm2(mesh%elem(i)%coord(:2))
+          else
+            r = norm2(mesh%elem(i)%coord)
+          end if
+          if (r <= rmin_share*(1.0_DOUBLE + 1.0e-8_DOUBLE) + 1.0e-14_DOUBLE) &
+            vol_dep = vol_dep + mesh%elem(i)%volume
+        end do
+        if (num_procs > 1) then
           call MPI_ALLREDUCE(MPI_IN_PLACE, vol_dep, 1, MPI_DOUBLE_PRECISION, MPI_SUM, &
             MPI_COMM_WORLD, mpi_ierr)
         end if
