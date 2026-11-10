@@ -413,6 +413,9 @@ module lagrange_module
   ! Correctif : sous-faces de bord hors de la moyenne de p_p, et flux
   ! unilateral classique (Pi n, Pi v_p.n) au bord.
   logical, public :: pi_bord_psw = .false.
+  ! convex_limiting : limitation de l ordre 2 par positivite de chaque SOUS-CELLULE,
+  ! dont la maille est une combinaison convexe. .false. laisse l ordre 2 pur.
+  logical, public :: convex_limiting = .true.
   integer(kind=ENTIER), public :: tang_mode = 0
   integer(kind=ENTIER), public :: tang_n = 0, tang_nact = 0
   ! Plancher PUREMENT NUMERIQUE, en fraction de rho a, pour que M_p ne soit pas
@@ -1321,19 +1324,21 @@ contains
           alpha_p = -0.01_DOUBLE
         else
           alpha_p = 1.0_DOUBLE
-          do k = 1, nsen
-            idse = mesh%vert(i)%sub_elem_neigh(k)
-            ide = mesh%sub_elem(idse)%mesh_elem
-            if (.not. mesh%elem(ide)%is_ghost) then
-              ! rhs est divise par la masse de la MAILLE : pour tester la mise a jour de la
-              ! SOUS-CELLULE, remettre a l'echelle par V_c/V_pc (densite uniforme dans la maille).
-              f_pc = mesh%elem(ide)%volume &
-                /max(mesh%sub_elem(idse)%volume, 1.0e-300_DOUBLE)
-              alpha_p = min(alpha_p, &
-                omega_pos(sol(:, ide) + dt*f_pc*rhs_o1(:, k), &
-                          dt*f_pc*(rhs_o2(:, k) - rhs_o1(:, k))))
-            end if
-          end do
+          if (convex_limiting) then
+            do k = 1, nsen
+              idse = mesh%vert(i)%sub_elem_neigh(k)
+              ide = mesh%sub_elem(idse)%mesh_elem
+              if (.not. mesh%elem(ide)%is_ghost) then
+                ! rhs est divise par la masse de la MAILLE : pour tester la mise a jour de la
+                ! SOUS-CELLULE, remettre a l'echelle par V_c/V_pc (densite uniforme dans la maille).
+                f_pc = mesh%elem(ide)%volume &
+                  /max(mesh%sub_elem(idse)%volume, 1.0e-300_DOUBLE)
+                alpha_p = min(alpha_p, &
+                  omega_pos(sol(:, ide) + dt*f_pc*rhs_o1(:, k), &
+                            dt*f_pc*(rhs_o2(:, k) - rhs_o1(:, k))))
+              end if
+            end do
+          end if
         end if
 
         if (present(alpha_p_arr)) alpha_p_arr(i) = alpha_p

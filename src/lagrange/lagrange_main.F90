@@ -113,7 +113,7 @@ program main
     divd_coef, divd_mode, divd_theta, divd_nl, &
     divd_wdbg, divd_wnode, divd_wmax, &
     sedov_nodal_deposit, sedov_energy, &
-    tang_mode, pi_bord_psw, &
+    tang_mode, pi_bord_psw, convex_limiting, &
     scheme, method_length, b2d_h, &
     n_bc, bc_name, bc_type, bc_val, &
     sol_uniform, boundary_2d, &
