@@ -415,7 +415,7 @@ module lagrange_module
   logical, public :: pi_bord_psw = .false.
   ! convex_limiting : limitation de l ordre 2 par positivite de chaque SOUS-CELLULE,
   ! dont la maille est une combinaison convexe. .false. laisse l ordre 2 pur.
-  logical, public :: convex_limiting = .true.
+  logical, public :: convex_limiting = .false.
   integer(kind=ENTIER), public :: tang_mode = 0
   integer(kind=ENTIER), public :: tang_n = 0, tang_nact = 0
   ! Plancher PUREMENT NUMERIQUE, en fraction de rho a, pour que M_p ne soit pas
