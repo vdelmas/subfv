@@ -229,6 +229,148 @@ contains
     close(vtkout)
   end subroutine write_sol_vtk
 
+  subroutine write_sol_auto(mesh, sol, filename)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(4, mesh%n_elems), intent(in) :: sol
+    character(len=255), intent(in) :: filename
+
+    integer(kind=ENTIER) :: i
+    character(len=255) :: fvtu
+
+    ! Legacy VTK knows tet/hex/prism/pyramid only; any other cell (polyhedra) goes to VTU
+    do i = 1, mesh%n_elems
+      if (mesh%elem(i)%elem_kind < 4 .or. mesh%elem(i)%elem_kind > 7) then
+        fvtu = filename(1:index(filename, ".vtk", back=.true.)-1)//".vtu"
+        call write_sol_vtu(mesh, sol, fvtu)
+        return
+      end if
+    end do
+    call write_sol_vtk(mesh, sol, filename)
+  end subroutine write_sol_auto
+
+  subroutine write_sol_vtu(mesh, sol, filename)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(4, mesh%n_elems), intent(in) :: sol
+    character(len=255), intent(in) :: filename
+
+    ! Geometry block copied from ns_io_module%write_sol_vtu (every cell written as a polyhedron)
+    integer(kind=ENTIER) :: fn, i, j, k, s, id_face, n_interior_elems, n_interior_vert
+    integer(kind=ENTIER), dimension(:), allocatable :: id_vert_no_ghost, local_id
+    real(kind=DOUBLE), dimension(3, mesh%n_vert) :: vorticity
+    real(kind=DOUBLE), dimension(mesh%n_vert) :: divergence
+    real(kind=DOUBLE) :: vorticity_norm, divergence_norm
+
+    allocate(id_vert_no_ghost(mesh%n_vert))
+    id_vert_no_ghost = 0
+    n_interior_vert = 0
+    do i = 1, mesh%n_vert
+      if (.not. mesh%vert(i)%is_ghost) then
+        n_interior_vert = n_interior_vert + 1
+        id_vert_no_ghost(i) = n_interior_vert
+      end if
+    end do
+    n_interior_elems = count(.not. mesh%elem(1:mesh%n_elems)%is_ghost)
+
+    open(newunit=fn, file=trim(adjustl(filename)))
+    write(fn, *) "<VTKFile type='UnstructuredGrid' version='1.0' &
+      &byte_order='LittleEndian' header_type='UInt64'>"
+    write(fn, *) "<UnstructuredGrid>\n<Piece NumberOfPoints='", n_interior_vert, &
+      &"' NumberOfCells='", n_interior_elems, "'>"
+
+    write(fn, *) "<Points>"
+    write(fn, *) " <DataArray type='Float64' Name='Points' NumberOfComponents='3' format='ascii'>"
+    do i = 1, mesh%n_vert
+      if (.not. mesh%vert(i)%is_ghost) write(fn, *) mesh%vert(i)%coord(:)
+    end do
+    write(fn, *) "</DataArray>"
+    write(fn, *) "</Points>"
+
+    write(fn, *) "<Cells>"
+    write(fn, *) "<DataArray type='Int64' Name='connectivity' format='ascii'>"
+    do i = 1, mesh%n_elems
+      if (.not. mesh%elem(i)%is_ghost) write(fn, *) id_vert_no_ghost(mesh%elem(i)%vert) - 1
+    end do
+    write(fn, *) "</DataArray>"
+    write(fn, *) "<DataArray type='Int64' Name='offsets' format='ascii'>"
+    s = 0
+    do i = 1, mesh%n_elems
+      if (.not. mesh%elem(i)%is_ghost) then
+        s = s + mesh%elem(i)%n_vert
+        write(fn, *) s
+      end if
+    end do
+    write(fn, *) "</DataArray>"
+    write(fn, *) "<DataArray type='UInt8' Name='types' format='ascii'>"
+    do i = 1, mesh%n_elems
+      if (.not. mesh%elem(i)%is_ghost) write(fn, *) 42 !Type for polyhedra
+    end do
+    write(fn, *) "</DataArray>"
+    write(fn, *) "<DataArray type='Int64' Name='faces' format='ascii'>"
+    do i = 1, mesh%n_elems
+      if (.not. mesh%elem(i)%is_ghost) then
+        write(fn, *) mesh%elem(i)%n_faces
+        do j = 1, mesh%elem(i)%n_faces
+          id_face = mesh%elem(i)%face(j)
+          allocate(local_id(mesh%face(id_face)%n_vert))
+          do k = 1, mesh%face(id_face)%n_vert
+            local_id(k) = id_vert_no_ghost(mesh%face(id_face)%vert(k))
+          end do
+          write(fn, *) mesh%face(id_face)%n_vert, local_id - 1
+          deallocate(local_id)
+        end do
+      end if
+    end do
+    write(fn, *) "</DataArray>"
+    write(fn, *) "<DataArray type='Int64' Name='faceoffsets' format='ascii'>"
+    s = 0
+    do i = 1, mesh%n_elems
+      if (.not. mesh%elem(i)%is_ghost) then
+        do j = 1, mesh%elem(i)%n_faces
+          s = s + mesh%face(mesh%elem(i)%face(j))%n_vert + 1
+        end do
+        s = s + 1
+        write(fn, *) s
+      end if
+    end do
+    write(fn, *) "</DataArray>"
+    write(fn, *) "</Cells>"
+
+    call compute_operators(mesh, sol, vorticity, vorticity_norm, divergence, divergence_norm)
+    write(fn, *) "<PointData>"
+    write(fn, *) "<DataArray type='Float64' Name='Vorticity' NumberOfComponents='3' format='ascii'>"
+    do i = 1, mesh%n_vert
+      if (.not. mesh%vert(i)%is_ghost) write(fn, *) vorticity(:, i)
+    end do
+    write(fn, *) "</DataArray>"
+    write(fn, *) "<DataArray type='Float64' Name='Divergence' format='ascii'>"
+    do i = 1, mesh%n_vert
+      if (.not. mesh%vert(i)%is_ghost) write(fn, *) divergence(i)
+    end do
+    write(fn, *) "</DataArray>"
+    write(fn, *) "</PointData>"
+
+    write(fn, *) "<CellData>"
+    write(fn, *) "<DataArray type='Float64' Name='Pressure' format='ascii'>"
+    do i = 1, mesh%n_elems
+      if (.not. mesh%elem(i)%is_ghost) write(fn, *) sol(1, i)
+    end do
+    write(fn, *) "</DataArray>"
+    write(fn, *) "<DataArray type='Float64' Name='Velocity' NumberOfComponents='3' format='ascii'>"
+    do i = 1, mesh%n_elems
+      if (.not. mesh%elem(i)%is_ghost) write(fn, *) sol(2:4, i)
+    end do
+    write(fn, *) "</DataArray>"
+    write(fn, *) "</CellData>"
+    write(fn, *) "</Piece>"
+    write(fn, *) "</UnstructuredGrid>"
+    write(fn, *) "</VTKFile>"
+    close(fn)
+  end subroutine write_sol_vtu
+
   pure subroutine rotate(v, n1, forward)
     implicit none
 

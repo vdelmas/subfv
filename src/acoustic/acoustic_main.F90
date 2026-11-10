@@ -159,7 +159,7 @@ program main
   if( mesh_was ) then
     call write_sol_vtk_wasilij(mesh, sol, output)
   else
-    call write_sol_vtk(mesh, sol, output)
+    call write_sol_auto(mesh, sol, output)
   end if
 
   if ( write_operators ) then
@@ -307,7 +307,7 @@ program main
   if( mesh_was ) then
     call write_sol_vtk_wasilij(mesh, sol, output)
   else
-    call write_sol_vtk(mesh, sol, output)
+    call write_sol_auto(mesh, sol, output)
   end if
 
   if ( write_operators ) then
@@ -327,7 +327,7 @@ program main
     if( mesh_was ) then
       call write_sol_vtk_wasilij(mesh, sol, output)
     else
-      call write_sol_vtk(mesh, sol, output)
+      call write_sol_auto(mesh, sol, output)
     end if
   else if(error_sphere) then
     call compute_error_sphere(mesh, sol)
@@ -346,7 +346,7 @@ program main
     if( mesh_was ) then
       call write_sol_vtk_wasilij(mesh, sol, output)
     else
-      call write_sol_vtk(mesh, sol, output)
+      call write_sol_auto(mesh, sol, output)
     end if
   end if
   call MPI_FINALIZE(mpi_ierr)
