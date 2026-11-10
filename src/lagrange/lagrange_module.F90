@@ -5700,8 +5700,10 @@ contains
             if (.not. vp_is_imposed(i)) then
               Mp = Mp + aw*lambda(1,j) &
                 * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
+              ! Etat fantome p_r = p_bc, v_r = v_l : avec Mp = A lambda, la solution a une face
+              ! doit etre v.n = v_l + (p_l - p_bc)/lambda. p_l manquait, p_bc avait le signe inverse.
               Rp = Rp + aw &
-                *(bc_val(1, -idr) + lambda(1,j)*vl) &
+                *(pl - bc_val(1, -idr) + lambda(1,j)*vl) &
                 *mesh%face(id_face)%norm
             end if
           else
@@ -6270,7 +6272,9 @@ contains
             else if (idr < 0 .and. trim(bc_type(-idr)) == 'pressure') then
               Mp = Mp + area*lam_l &
                 * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
-              Rp = Rp + area*(bc_val(1,-idr) + lam_l*vl)*mesh%face(id_face)%norm
+              ! Etat fantome p_r = p_bc, v_r = v_l : avec Mp = A lambda, v.n = v_l + (p_l - p_bc)/lambda.
+              ! p_l manquait, p_bc avait le signe inverse.
+              Rp = Rp + area*(pl - bc_val(1,-idr) + lam_l*vl)*mesh%face(id_face)%norm
             else
               if (.not. have_first_wall_norm) then
                 first_wall_norm = mesh%face(id_face)%norm
@@ -7245,7 +7249,9 @@ contains
             else if (idr < 0 .and. trim(bc_type(-idr)) == 'pressure') then
               Mp = Mp + area*lam_l &
                 * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
-              Rp = Rp + area*(bc_val(1,-idr) + lam_l*vl)*mesh%face(id_face)%norm
+              ! Etat fantome p_r = p_bc, v_r = v_l : avec Mp = A lambda, v.n = v_l + (p_l - p_bc)/lambda.
+              ! p_l manquait, p_bc avait le signe inverse.
+              Rp = Rp + area*(pl - bc_val(1,-idr) + lam_l*vl)*mesh%face(id_face)%norm
             else
               if (.not. have_first_wall_norm) then
                 first_wall_norm = mesh%face(id_face)%norm
