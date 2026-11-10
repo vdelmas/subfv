@@ -809,6 +809,9 @@ module lagrange_module
   ! Pose par compute_dt quand une BORNE est NaN, et reduit sur tous les rangs. Necessaire
   ! parce qu un NaN local defait le min sans rendre dt lui-meme NaN sur les autres rangs.
   logical, public :: dt_nan_detected = .false.
+  ! NaN dans la vitesse nodale d ORDRE 1, remis a zero a chaque appel de compute_rhs_lagrange.
+  ! Contrairement a l ordre 2 il n y a aucun ordre inferieur ou se replier : c est une panne.
+  integer(kind=ENTIER), public :: vp_o1_nan_n = 0, vp_o1_nan_node = -1
   logical, public :: pi_pif = .false.
   ! TEST D'ATTRIBUTION : prendre v_p du solveur 'vp' existant pour deplacer le
   ! maillage, et garder (Pi_f, U_f) de la construction par sous-face pour les
@@ -1303,6 +1306,7 @@ contains
 
     rhs = 0.0_DOUBLE
     if (present(alpha_p_arr)) alpha_p_arr = 1.0_DOUBLE
+    vp_o1_nan_n = 0; vp_o1_nan_node = -1
 
     do i = 1, mesh%n_vert
       nsfn = mesh%vert(i)%n_sub_faces_neigh
@@ -1313,6 +1317,13 @@ contains
       call compute_rhs_around_node(mesh, sol, i, nsfn, nsen, vp_o1_i, vp_is_imposed(i), &
         dt, rhs_o1, n_bc, bc_type, bc_val, b2d, mass, gamma_arr, &
         .false., grad_v, grad_p, div_v)
+
+      ! Mp peut etre singuliere (noeuds de milieu d arete) et inverse_3_by_3 divise par son
+      ! determinant sans garde : le NaN d ordre 1 passait inapercu. On le COMPTE.
+      if (any(rhs_o1 /= rhs_o1) .or. any(vp_o1_i /= vp_o1_i)) then
+        vp_o1_nan_n = vp_o1_nan_n + 1
+        if (vp_o1_nan_node < 0) vp_o1_nan_node = i
+      end if
 
       if (second_order) then
         allocate(rhs_o2(5, nsen))

@@ -12,6 +12,7 @@ program main
 
   integer(kind=ENTIER) :: fn
   integer :: mpi_ierr, me, num_procs
+  integer :: inan_vp
   type(mpi_send_recv_type) :: mpi_send_recv
   character(len=255) :: meshfile, meshfile_path
 
@@ -813,6 +814,16 @@ program main
     ! sont fait prendre. On le rend BRUYANT sans changer la semantique ; l'arret
     ! dur est derriere stop_on_nan_dt, parce que c'est un changement de
     ! comportement pour tous les schemas et qu'il appartient a Vincent.
+    ! Vitesse nodale d ORDRE 1 NaN : aucun ordre inferieur ou se replier, donc c est une
+    ! panne. Reduit pour que tous les rangs s arretent ensemble.
+    inan_vp = vp_o1_nan_n
+    if (num_procs > 1) call MPI_ALLREDUCE(MPI_IN_PLACE, inan_vp, 1, MPI_INTEGER, MPI_SUM, &
+      MPI_COMM_WORLD, mpi_ierr)
+    if (inan_vp > 0) then
+      if (me == 0) print*, "PANNE : vitesse nodale d'ordre 1 NaN sur", inan_vp, &
+        " noeud(s) au pas", iter, " -- Mp singuliere, 1er noeud local du rang 0 :", vp_o1_nan_node
+      error stop
+    end if
     if (dt /= dt .or. dt_nan_detected) then
       if (me == 0) print*, "PANNE : dt = NaN au pas", iter, " t =", t, &
         " -- la boucle en temps va se terminer SILENCIEUSEMENT avec EXIT_CODE 0."
