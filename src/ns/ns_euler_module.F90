@@ -39,6 +39,7 @@ contains
     real(kind=DOUBLE) :: M_helm, r_helm, delta_helm, H_helm
     real(kind=DOUBLE), dimension(5) :: sol_left, sol_right
     real(kind=DOUBLE) :: rmin, rmin_share
+    real(kind=DOUBLE) :: vol_dep, e_dep, r_i
     integer(kind=ENTIER) :: imin
 
     if (init_uniform) then
@@ -90,8 +91,9 @@ contains
         end if
       end do
 
+      ! Pose AVANT le test MPI : en sequentiel rmin_share etait sinon lu NON INITIALISE.
+      rmin_share = rmin
       if (num_procs > 1) then
-        rmin_share = rmin
         call MPI_ALLREDUCE(MPI_IN_PLACE, rmin_share, 1, MPI_DOUBLE, &
           MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
         if( abs(rmin - rmin_share) > 1e-14_DOUBLE ) then
@@ -107,20 +109,39 @@ contains
         sol(5, i) = 1e-12_DOUBLE/(gamma - 1.0_DOUBLE)
       end do
 
-      if( imin > 0 ) then
+      ! En MPI, rmin_share est le minimum GLOBAL et la ligne ci-dessus ne met imin a -1
+      ! que sur les rangs qui ne l atteignent PAS : k mailles a egalite deposaient donc
+      ! chacune l energie ENTIERE, soit k fois la valeur voulue. On partage au prorata du
+      ! volume, exactement comme le correctif lagrangien d69ac3a. Sans effet sans egalite.
+      e_dep = merge(0.984042_DOUBLE, 0.851072_DOUBLE, boundary_2d)
+      vol_dep = 0.0_DOUBLE
+      do i = 1, mesh%n_elems
+        if( mesh%elem(i)%is_ghost ) cycle
         if( boundary_2d ) then
-          sol(1, imin) = 1.0_DOUBLE
-          sol(2, imin) = 0.0_DOUBLE
-          sol(3, imin) = 0.0_DOUBLE
-          sol(4, imin) = 0.0_DOUBLE
-          sol(5, imin) = 0.984042_DOUBLE/mesh%elem(imin)%volume
+          r_i = norm2(mesh%elem(i)%coord(:2))
         else
-          sol(1, imin) = 1.0_DOUBLE
-          sol(2, imin) = 0.0_DOUBLE
-          sol(3, imin) = 0.0_DOUBLE
-          sol(4, imin) = 0.0_DOUBLE
-          sol(5, imin) = 0.851072_DOUBLE/mesh%elem(imin)%volume
+          r_i = norm2(mesh%elem(i)%coord)
         end if
+        if( abs(r_i - rmin_share) <= 1e-14_DOUBLE ) vol_dep = vol_dep + mesh%elem(i)%volume
+      end do
+      if( num_procs > 1 ) call MPI_ALLREDUCE(MPI_IN_PLACE, vol_dep, 1, MPI_DOUBLE, &
+        MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+      if( vol_dep > 0.0_DOUBLE ) then
+        do i = 1, mesh%n_elems
+          if( mesh%elem(i)%is_ghost ) cycle
+          if( boundary_2d ) then
+            r_i = norm2(mesh%elem(i)%coord(:2))
+          else
+            r_i = norm2(mesh%elem(i)%coord)
+          end if
+          if( abs(r_i - rmin_share) <= 1e-14_DOUBLE ) then
+            sol(1, i) = 1.0_DOUBLE
+            sol(2, i) = 0.0_DOUBLE
+            sol(3, i) = 0.0_DOUBLE
+            sol(4, i) = 0.0_DOUBLE
+            sol(5, i) = e_dep/vol_dep
+          end if
+        end do
       end if
     else if (init_kelvin) then
       M_helm   = 1e-2_DOUBLE
