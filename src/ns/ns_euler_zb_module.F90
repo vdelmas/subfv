@@ -973,23 +973,14 @@ contains
 
     integer(kind=ENTIER) :: j, id_sub_face, id_face
     integer(kind=ENTIER) :: le, re, lse, rse, lse_loc, rse_loc
-    real(kind=DOUBLE), dimension(3) :: norm, Bp, vl, vr
+    real(kind=DOUBLE), dimension(3) :: norm
 
     real(kind=DOUBLE) :: sum_area, vnl, vnr, al, ar, lambda, corr
     real(kind=DOUBLE), dimension(5) :: sol_p, sol_l, sol_r, u_bar
     real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, fminus, fplus, ff
 
-    logical :: vert_is_wall 
 
     rse_loc = 0
-    Bp = wall_normal(mesh, id_vert)
-    if( norm2(Bp) > 1e-12_DOUBLE ) then
-      Bp = Bp / norm2(Bp)
-      vert_is_wall = .true.
-    else
-      vert_is_wall = .false.
-    end if
-
     call compute_corr(mesh, id_vert, sol, grad, corr, h_p, second_order)
     u_vert = 0.0_DOUBLE
 
@@ -1003,17 +994,8 @@ contains
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
         second_order, sol_w_l, sol_w_r)
 
-      if( vert_is_wall ) then
-        vl = sol_w_l(2:4)
-        vl = vl - dot_product(vl, Bp)/dot_product(Bp, Bp)*Bp
-        vnl = dot_product(sol_w_l(2:4), norm)
-        vr = sol_w_r(2:4)
-        vr = vr - dot_product(vr, Bp)/dot_product(Bp, Bp)*Bp
-        vnr = dot_product(sol_w_r(2:4), norm)
-      else
-        vnl = dot_product(sol_w_l(2:4), norm)
-        vnr = dot_product(sol_w_r(2:4), norm)
-      end if
+      vnl = dot_product(sol_w_l(2:4), norm)
+      vnr = dot_product(sol_w_r(2:4), norm)
 
       al = sound_speed_w(sol_w_l)
       ar = sound_speed_w(sol_w_r)
@@ -1113,7 +1095,7 @@ contains
 
     integer(kind=ENTIER) :: j, id_sub_face, id_face
     integer(kind=ENTIER) :: le, re, lse, rse, lse_loc, rse_loc
-    real(kind=DOUBLE), dimension(3) :: norm, Bp, vl, vr
+    real(kind=DOUBLE), dimension(3) :: norm
 
     real(kind=DOUBLE) :: sum_area, vnl, vnr, al, ar, lambda, corr
     real(kind=DOUBLE) :: wpcf, min_apf, pr, pl, rhol, rhor
@@ -1121,17 +1103,8 @@ contains
     real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, fminus, fplus
     real(kind=DOUBLE) :: vm, rhom, am
 
-    logical :: vert_is_wall 
 
     rse_loc = 0
-    Bp = wall_normal(mesh, id_vert)
-    if( norm2(Bp) > 1e-12_DOUBLE ) then
-      Bp = Bp / norm2(Bp)
-      vert_is_wall = .true.
-    else
-      vert_is_wall = .false.
-    end if
-
     min_apf = huge(1.0_DOUBLE)
     do j=1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
@@ -1161,17 +1134,8 @@ contains
       call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
         second_order, sol_w_l, sol_w_r)
 
-      if( vert_is_wall ) then
-        vl = sol_w_l(2:4)
-        vl = vl - dot_product(vl, Bp)/dot_product(Bp, Bp)*Bp
-        vnl = dot_product(sol_w_l(2:4), norm)
-        vr = sol_w_r(2:4)
-        vr = vr - dot_product(vr, Bp)/dot_product(Bp, Bp)*Bp
-        vnr = dot_product(sol_w_r(2:4), norm)
-      else
-        vnl = dot_product(sol_w_l(2:4), norm)
-        vnr = dot_product(sol_w_r(2:4), norm)
-      end if
+      vnl = dot_product(sol_w_l(2:4), norm)
+      vnr = dot_product(sol_w_r(2:4), norm)
 
       al = sound_speed_w(sol_w_l)
       ar = sound_speed_w(sol_w_r)
