@@ -5706,14 +5706,24 @@ contains
                 * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
             end if
           else if (idr < 0 .and. trim(bc_type(-idr)) == 'pressure') then
+            ! Etat fantome p_r = p_bc, v_r = v_l, tau_r = tau_l : on prend les DEUX lambda,
+            ! comme le flux (lambda_r differe de lambda_l des que p_bc differe de p_l).
             lambda(1, j) = sqrt(gl*pl*sol_lr(1, 1, j))/sol_lr(1, 1, j)
+            if (lambda_acoustic_only) then
+              lambda(2, j) = sqrt(max(0.0_DOUBLE, gl*bc_val(1, -idr)*sol_lr(1, 1, j))) &
+                /sol_lr(1, 1, j)
+            else
+              lambda(1, j) = max(lambda(1, j), &
+                sqrt(max(0.0_DOUBLE, bc_val(1, -idr) - pl)/sol_lr(1, 1, j)))
+              lambda(2, j) = max(sqrt(max(0.0_DOUBLE, &
+                gl*bc_val(1, -idr)*sol_lr(1, 1, j)))/sol_lr(1, 1, j), &
+                sqrt(max(0.0_DOUBLE, pl - bc_val(1, -idr))/sol_lr(1, 1, j)))
+            end if
             if (.not. vp_is_imposed(i)) then
-              Mp = Mp + aw*lambda(1,j) &
+              Mp = Mp + aw*(lambda(1,j)+lambda(2,j)) &
                 * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
-              ! Etat fantome p_r = p_bc, v_r = v_l : avec Mp = A lambda, la solution a une face
-              ! doit etre v.n = v_l + (p_l - p_bc)/lambda. p_l manquait, p_bc avait le signe inverse.
               Rp = Rp + aw &
-                *(pl - bc_val(1, -idr) + lambda(1,j)*vl) &
+                *((lambda(1,j)+lambda(2,j))*vl + pl - bc_val(1, -idr)) &
                 *mesh%face(id_face)%norm
             end if
           else
@@ -6280,11 +6290,19 @@ contains
               Mp = Mp + area*2.0_DOUBLE*lam_l &
                 * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
             else if (idr < 0 .and. trim(bc_type(-idr)) == 'pressure') then
-              Mp = Mp + area*lam_l &
+              ! Etat fantome p_r = p_bc, v_r = v_l, tau_r = tau_l : on prend les DEUX lambda,
+              ! comme le flux (lambda_r differe de lambda_l des que p_bc differe de p_l).
+              if (lambda_acoustic_only) then
+                lam_r = sqrt(max(0.0_DOUBLE, gl*bc_val(1,-idr)*taul))/taul
+              else
+                lam_l = max(lam_l, sqrt(max(0.0_DOUBLE, bc_val(1,-idr) - pl)/taul))
+                lam_r = max(sqrt(max(0.0_DOUBLE, gl*bc_val(1,-idr)*taul))/taul, &
+                  sqrt(max(0.0_DOUBLE, pl - bc_val(1,-idr))/taul))
+              end if
+              Mp = Mp + area*(lam_l + lam_r) &
                 * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
-              ! Etat fantome p_r = p_bc, v_r = v_l : avec Mp = A lambda, v.n = v_l + (p_l - p_bc)/lambda.
-              ! p_l manquait, p_bc avait le signe inverse.
-              Rp = Rp + area*(pl - bc_val(1,-idr) + lam_l*vl)*mesh%face(id_face)%norm
+              Rp = Rp + area*((lam_l + lam_r)*vl + pl - bc_val(1,-idr)) &
+                *mesh%face(id_face)%norm
             else
               if (.not. have_first_wall_norm) then
                 first_wall_norm = mesh%face(id_face)%norm
@@ -7257,11 +7275,19 @@ contains
               Mp = Mp + area*2.0_DOUBLE*lam_l &
                 * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
             else if (idr < 0 .and. trim(bc_type(-idr)) == 'pressure') then
-              Mp = Mp + area*lam_l &
+              ! Etat fantome p_r = p_bc, v_r = v_l, tau_r = tau_l : on prend les DEUX lambda,
+              ! comme le flux (lambda_r differe de lambda_l des que p_bc differe de p_l).
+              if (lambda_acoustic_only) then
+                lam_r = sqrt(max(0.0_DOUBLE, gl*bc_val(1,-idr)*taul))/taul
+              else
+                lam_l = max(lam_l, sqrt(max(0.0_DOUBLE, bc_val(1,-idr) - pl)/taul))
+                lam_r = max(sqrt(max(0.0_DOUBLE, gl*bc_val(1,-idr)*taul))/taul, &
+                  sqrt(max(0.0_DOUBLE, pl - bc_val(1,-idr))/taul))
+              end if
+              Mp = Mp + area*(lam_l + lam_r) &
                 * tensor_product(mesh%face(id_face)%norm, mesh%face(id_face)%norm)
-              ! Etat fantome p_r = p_bc, v_r = v_l : avec Mp = A lambda, v.n = v_l + (p_l - p_bc)/lambda.
-              ! p_l manquait, p_bc avait le signe inverse.
-              Rp = Rp + area*(pl - bc_val(1,-idr) + lam_l*vl)*mesh%face(id_face)%norm
+              Rp = Rp + area*((lam_l + lam_r)*vl + pl - bc_val(1,-idr)) &
+                *mesh%face(id_face)%norm
             else
               if (.not. have_first_wall_norm) then
                 first_wall_norm = mesh%face(id_face)%norm
