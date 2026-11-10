@@ -104,7 +104,7 @@ program main
     theta_pi, theta_m_floor, mp_cvisc, diag_divratio, diag_firstprint, &
     md_cvisc, md_first, md_trrs, md_noswitch, md_trace, md_watch, &
     kap_floor, kap_one, kap_check, kap_front_jump, kap_fixed, diag_iso, &
-    stop_on_nan_dt, pif_vp_classic, pif_duk, pif_duk_it, &
+    pif_vp_classic, pif_duk, pif_duk_it, &
     kap_loc, kap_loc_c, kap_loc_mode, diag_dtb, &
     diag_force, fdiag_c1, fdiag_c2, fdiag_c3, &
     diag_area, diag_lamratio, diag_alpha, &
@@ -809,11 +809,9 @@ program main
 
     if (.not. dt_at_step_start) &
       call compute_dt(mesh, sol, dt, cfl, vp, me, num_procs, gamma_arr, bc_p=bc_p)
-    ! dt = NaN rend `t + dt < t_max` FAUX, donc la boucle se termine normalement
-    ! et le programme sort avec EXIT_CODE 0 sur un calcul mort. Trois sessions se
-    ! sont fait prendre. On le rend BRUYANT sans changer la semantique ; l'arret
-    ! dur est derriere stop_on_nan_dt, parce que c'est un changement de
-    ! comportement pour tous les schemas et qu'il appartient a Vincent.
+    ! dt = NaN rend `t + dt < t_max` FAUX : la boucle se terminerait normalement avec
+    ! EXIT_CODE 0 sur un calcul mort. Trois sessions s'y sont fait prendre, d'ou l'arret
+    ! immediat. dt_nan_detected etant reduit sur tous les rangs, l'arret est COLLECTIF.
     ! Vitesse nodale d ORDRE 1 NaN : aucun ordre inferieur ou se replier, donc c est une
     ! panne. Reduit pour que tous les rangs s arretent ensemble.
     inan_vp = vp_o1_nan_n
@@ -825,12 +823,8 @@ program main
       error stop
     end if
     if (dt /= dt .or. dt_nan_detected) then
-      if (me == 0) print*, "PANNE : dt = NaN au pas", iter, " t =", t, &
-        " -- la boucle en temps va se terminer SILENCIEUSEMENT avec EXIT_CODE 0."
-      if (stop_on_nan_dt) then
-        if (me == 0) print*, "PANNE : arret demande par stop_on_nan_dt."
-        error stop
-      end if
+      if (me == 0) print*, "PANNE : dt = NaN au pas", iter, " t =", t, " -- arret."
+      error stop
     end if
     ! Instrumentation : les bornes rapportees par compute_dt et le dt reellement
     ! retenu se contredisaient au pas 4 de vp_fbd (bornes 3.03e-05 et 6.02e-05, dt
@@ -1212,8 +1206,8 @@ program main
   if (me == 0) print*, "DTNAN bornes NaN sur tout le run : acoustique", &
     dtb_nan_tot_acou, " volume", dtb_nan_tot_vol, &
     " -- non nul => dt n'etait plus le minimum des bornes a partir de la"
-  if (me == 0 .and. dtb_nan_ghost + dtb_nan_reel > 0) &
-    print*, "DTNAN origine : mailles FANTOMES", dtb_nan_ghost, " reelles", dtb_nan_reel, &
+  if (me == 0 .and. dtb_nan_reel > 0) &
+    print*, "DTNAN origine : mailles internes", dtb_nan_reel, &
       " | source : sol", dtb_nan_src_sol, " vitesses nodales", dtb_nan_src_vp, &
       " volume", dtb_nan_src_vol
   if (dt_at_step_start .and. me == 0) print*, "DT2PH pas ou la phase 2 a reduit dt :", &

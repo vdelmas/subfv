@@ -805,7 +805,6 @@ module lagrange_module
   ! facon, et passer a .true. change le comportement de TOUS les schemas, donc
   ! c'est une decision de Vincent. Declare ici et non dans le bloc de la
   ! pseudo-inverse, qui a ete retire : ce diagnostic est GENERAL.
-  logical, public :: stop_on_nan_dt = .false.
   ! Pose par compute_dt quand une BORNE est NaN, et reduit sur tous les rangs. Necessaire
   ! parce qu un NaN local defait le min sans rendre dt lui-meme NaN sur les autres rangs.
   logical, public :: dt_nan_detected = .false.
@@ -958,7 +957,7 @@ module lagrange_module
   integer(kind=ENTIER), public :: dtb_n_nan_acou = 0, dtb_n_nan_vol = 0
   integer(kind=ENTIER), public :: dtb_i_first_nan = -1
   integer(kind=ENTIER_D), public :: dtb_nan_tot_acou = 0, dtb_nan_tot_vol = 0
-  integer(kind=ENTIER_D), public :: dtb_nan_ghost = 0, dtb_nan_reel = 0
+  integer(kind=ENTIER_D), public :: dtb_nan_reel = 0
   integer(kind=ENTIER_D), public :: dtb_nan_src_sol = 0, dtb_nan_src_vp = 0
   integer(kind=ENTIER_D), public :: dtb_nan_src_vol = 0
   real(kind=DOUBLE), public :: dtb_acou_m = 0.0_DOUBLE, dtb_acou_sal = 0.0_DOUBLE
@@ -8064,6 +8063,9 @@ contains
       dtb_n_nan_acou = 0; dtb_n_nan_vol = 0; dtb_i_first_nan = -1
     end if
     do i=1, mesh%n_elems
+      ! Mailles INTERNES seulement : dt est reduit par MPI, donc chaque maille est couverte
+      ! par son proprietaire. Une fantome a l etat casse ne faisait qu apporter une borne NaN.
+      if (mesh%elem(i)%is_ghost) cycle
       c = sqrt(max(0.0_DOUBLE, gamma_arr(i)*pressure(sol(:, i), gamma_arr(i))*sol(1, i)))
       c = max(c, 1.0e-10_DOUBLE)
       ! Lagrangian wave speed (acoustic impedance), homogeneous to rho*a.
@@ -8139,11 +8141,7 @@ contains
       ! max|v_p| exactement 1.0 -- et `dt` passe quand meme de 8.8e-14 a 0.728.
       ! On classe donc chaque borne NaN par sa source au lieu de la supposer.
       if (mass_c /= mass_c .or. sum_al /= sum_al .or. sum_av /= sum_av) then
-        if (mesh%elem(i)%is_ghost) then
-          dtb_nan_ghost = dtb_nan_ghost + 1
-        else
-          dtb_nan_reel = dtb_nan_reel + 1
-        end if
+        dtb_nan_reel = dtb_nan_reel + 1
         if (any(sol(:, i) /= sol(:, i))) dtb_nan_src_sol = dtb_nan_src_sol + 1
         if (sum_av /= sum_av) dtb_nan_src_vp = dtb_nan_src_vp + 1
         if (mesh%elem(i)%volume /= mesh%elem(i)%volume) &
