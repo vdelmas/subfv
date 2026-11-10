@@ -349,4 +349,5 @@ program main
       call write_sol_vtk(mesh, sol, output)
     end if
   end if
+  call MPI_FINALIZE(mpi_ierr)
 end program main
