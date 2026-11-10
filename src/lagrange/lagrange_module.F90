@@ -1293,7 +1293,7 @@ contains
     integer(kind=ENTIER) :: i, j, k, nsfn, nsen, idse, ide
     real(kind=DOUBLE), dimension(:,:), allocatable :: rhs_o1, rhs_o2
     real(kind=DOUBLE), dimension(3) :: vp_o1_i, vp_o2_i
-    real(kind=DOUBLE) :: alpha_p
+    real(kind=DOUBLE) :: alpha_p, f_pc
 
     rhs = 0.0_DOUBLE
     if (present(alpha_p_arr)) alpha_p_arr = 1.0_DOUBLE
@@ -1325,9 +1325,13 @@ contains
             idse = mesh%vert(i)%sub_elem_neigh(k)
             ide = mesh%sub_elem(idse)%mesh_elem
             if (.not. mesh%elem(ide)%is_ghost) then
+              ! rhs est divise par la masse de la MAILLE : pour tester la mise a jour de la
+              ! SOUS-CELLULE, remettre a l'echelle par V_c/V_pc (densite uniforme dans la maille).
+              f_pc = mesh%elem(ide)%volume &
+                /max(mesh%sub_elem(idse)%volume, 1.0e-300_DOUBLE)
               alpha_p = min(alpha_p, &
-                omega_pos(sol(:, ide) + dt*rhs_o1(:, k), &
-                          dt*(rhs_o2(:, k) - rhs_o1(:, k))))
+                omega_pos(sol(:, ide) + dt*f_pc*rhs_o1(:, k), &
+                          dt*f_pc*(rhs_o2(:, k) - rhs_o1(:, k))))
             end if
           end do
         end if
