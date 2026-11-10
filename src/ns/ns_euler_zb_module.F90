@@ -983,7 +983,7 @@ contains
 
     rse_loc = 0
     Bp = wall_normal(mesh, id_vert)
-    if( norm2(Bp) > 1e12_DOUBLE ) then
+    if( norm2(Bp) > 1e-12_DOUBLE ) then
       Bp = Bp / norm2(Bp)
       vert_is_wall = .true.
     else
@@ -1125,7 +1125,7 @@ contains
 
     rse_loc = 0
     Bp = wall_normal(mesh, id_vert)
-    if( norm2(Bp) > 1e12_DOUBLE ) then
+    if( norm2(Bp) > 1e-12_DOUBLE ) then
       Bp = Bp / norm2(Bp)
       vert_is_wall = .true.
     else
