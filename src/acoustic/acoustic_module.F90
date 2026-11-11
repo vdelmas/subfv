@@ -1,4 +1,5 @@
 module acoustic_module
+  use mpi
   use precision_module
   use mesh_module
   use mesh_reading_module
@@ -67,11 +68,15 @@ contains
     real(kind=DOUBLE), dimension(4, mesh%n_elems), intent(in) :: sol
 
     integer :: i
+    integer(kind=ENTIER) :: n_owned, mpi_ierr, me
     real(kind=DOUBLE) :: r, theta, phi, error, exact_sol(4), tot_volume
 
     error = 0.0_DOUBLE
     tot_volume = 0.0_DOUBLE
+    n_owned = 0
     do i=1,mesh%n_elems
+      if (mesh%elem(i)%is_ghost) cycle
+      n_owned = n_owned + 1
       r = norm2(mesh%elem(i)%coord)
       theta = atan2(norm2(mesh%elem(i)%coord(2:3)), mesh%elem(i)%coord(1))
       phi = atan2(mesh%elem(i)%coord(3), mesh%elem(i)%coord(2))
@@ -81,8 +86,12 @@ contains
       tot_volume = tot_volume + mesh%elem(i)%volume
     end do
 
+    call MPI_ALLREDUCE(MPI_IN_PLACE, error, 1, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, tot_volume, 1, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, n_owned, 1, MPI_INTEGER, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+    call MPI_COMM_RANK(MPI_COMM_WORLD, me, mpi_ierr)
     error = sqrt(error)
-    print*,(tot_volume/mesh%n_elems)**(1.0_DOUBLE/3.0_DOUBLE), error
+    if (me == 0) print*,(tot_volume/n_owned)**(1.0_DOUBLE/3.0_DOUBLE), error
   end subroutine compute_error_sphere
 
   pure subroutine exact_sphere(r, theta, phi, sol)
@@ -116,11 +125,15 @@ contains
     real(kind=DOUBLE), dimension(4, mesh%n_elems), intent(in) :: sol
 
     integer :: i
+    integer(kind=ENTIER) :: n_owned, mpi_ierr, me
     real(kind=DOUBLE) :: r, theta, error, exact_sol(4), tot_volume
 
     error = 0.0_DOUBLE
     tot_volume = 0.0_DOUBLE
+    n_owned = 0
     do i=1,mesh%n_elems
+      if (mesh%elem(i)%is_ghost) cycle
+      n_owned = n_owned + 1
       r = sqrt(mesh%elem(i)%coord(2)**2 + mesh%elem(i)%coord(1)**2)
       theta = atan2(mesh%elem(i)%coord(2), mesh%elem(i)%coord(1))
       call exact_cyl(r,theta,exact_sol)
@@ -128,8 +141,12 @@ contains
       tot_volume = tot_volume + mesh%elem(i)%volume
     end do
 
+    call MPI_ALLREDUCE(MPI_IN_PLACE, error, 1, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, tot_volume, 1, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+    call MPI_ALLREDUCE(MPI_IN_PLACE, n_owned, 1, MPI_INTEGER, MPI_SUM, MPI_COMM_WORLD, mpi_ierr)
+    call MPI_COMM_RANK(MPI_COMM_WORLD, me, mpi_ierr)
     error = sqrt(error)
-    print*,(tot_volume/mesh%n_elems)**(1.0_DOUBLE/3.0_DOUBLE), error
+    if (me == 0) print*,(tot_volume/n_owned)**(1.0_DOUBLE/3.0_DOUBLE), error
   end subroutine compute_error_cyl
 
   pure subroutine exact_cyl(r, theta, sol)
@@ -236,8 +253,45 @@ contains
     real(kind=DOUBLE), dimension(4, mesh%n_elems), intent(in) :: sol
     character(len=255), intent(in) :: filename
 
-    integer(kind=ENTIER) :: i
-    character(len=255) :: fvtu
+    integer(kind=ENTIER) :: i, num_procs, me, mpi_ierr, fn
+    character(len=255) :: fvtu, base, rank_char
+
+    call MPI_COMM_SIZE(MPI_COMM_WORLD, num_procs, mpi_ierr)
+    if (num_procs > 1) then
+      ! one VTU piece per rank (ghost cells filtered) and a PVTU written by rank 0
+      call MPI_COMM_RANK(MPI_COMM_WORLD, me, mpi_ierr)
+      base = filename(1:index(filename, ".vtk", back=.true.)-1)
+      write(rank_char, *) me
+      call write_sol_vtu(mesh, sol, trim(adjustl(rank_char))//"_"//trim(base)//".vtu")
+      if (me == 0) then
+        open(newunit=fn, file=trim(base)//".pvtu")
+        write(fn, *) "<VTKFile type='PUnstructuredGrid' version='0.1' byte_order='LittleEndian' header_type='UInt64'>"
+        write(fn, *) "<PUnstructuredGrid GhostLevel='0'>"
+        write(fn, *) "<PPoints><PDataArray type='Float64' Name='Points' NumberOfComponents='3'/></PPoints>"
+        write(fn, *) "<PCells>"
+        write(fn, *) "<PDataArray type='Int64' Name='connectivity' NumberOfComponents='1'/>"
+        write(fn, *) "<PDataArray type='Int64' Name='offsets' NumberOfComponents='1'/>"
+        write(fn, *) "<PDataArray type='UInt8' Name='types' NumberOfComponents='1'/>"
+        write(fn, *) "</PCells>"
+        write(fn, *) "<PPointData>"
+        write(fn, *) "<PDataArray type='Float64' Name='Vorticity' NumberOfComponents='3'/>"
+        write(fn, *) "<PDataArray type='Float64' Name='Divergence' NumberOfComponents='1'/>"
+        write(fn, *) "</PPointData>"
+        write(fn, *) "<PCellData>"
+        write(fn, *) "<PDataArray type='Float64' Name='Pressure' NumberOfComponents='1'/>"
+        write(fn, *) "<PDataArray type='Float64' Name='Velocity' NumberOfComponents='3'/>"
+        write(fn, *) "</PCellData>"
+        do i = 0, num_procs-1
+          write(rank_char, *) i
+          write(fn, *) "<Piece Source='"//trim(adjustl(rank_char))//"_"//trim(base)//".vtu'/>"
+        end do
+        write(fn, *) "</PUnstructuredGrid>"
+        write(fn, *) "</VTKFile>"
+        close(fn)
+      end if
+      call MPI_BARRIER(MPI_COMM_WORLD, mpi_ierr)
+      return
+    end if
 
     ! Legacy VTK knows tet/hex/prism/pyramid only; any other cell (polyhedra) goes to VTU
     do i = 1, mesh%n_elems
@@ -255,7 +309,7 @@ contains
 
     type(mesh_type), intent(in) :: mesh
     real(kind=DOUBLE), dimension(4, mesh%n_elems), intent(in) :: sol
-    character(len=255), intent(in) :: filename
+    character(len=*), intent(in) :: filename
 
     ! Geometry block copied from ns_io_module%write_sol_vtu (every cell written as a polyhedron)
     integer(kind=ENTIER) :: fn, i, j, k, s, id_face, n_interior_elems, n_interior_vert

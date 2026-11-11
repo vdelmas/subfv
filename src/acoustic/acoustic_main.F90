@@ -36,7 +36,7 @@ program main
   real(kind=DOUBLE) :: max_norm_circ
   real(kind=DOUBLE), dimension(3) :: norm, circ, coord_bound
 
-  integer(kind=ENTIER) :: me, num_procs, mpi_ierr
+  integer(kind=ENTIER) :: me, num_procs, mpi_ierr, bad_dt
   type(mpi_send_recv_type) :: mpi_send_recv
 
   integer(kind=ENTIER) :: iter, il, ir, id_vert, id_sub_face, id_face, id_elem
@@ -56,11 +56,6 @@ program main
   call MPI_COMM_SIZE(MPI_COMM_WORLD, num_procs, mpi_ierr)
   call MPI_COMM_RANK(MPI_COMM_WORLD, me, mpi_ierr)
 
-  if( num_procs > 1 ) then
-    print*,"Not yet fitted for MPI"
-    error stop
-  end if
-
   open (newunit=funit, file="input_data.f")
   read (nml=INPUT_PARAM, unit=funit)
   close (unit=funit)
@@ -72,10 +67,10 @@ program main
       n_bc, bc_name, me, num_procs, mpi_send_recv)
   end if
   call build_mesh(mesh, num_procs, mpi_send_recv, .true., boundary_2d)
-  call compute_geometry_mesh(mesh, .true., boundary_2d)
+  call compute_geometry_mesh(mesh, .true., boundary_2d, me, num_procs)
   if(smooth_deform) then
     call smooth_deform_mesh(mesh)
-    call compute_geometry_mesh(mesh, .true., boundary_2d)
+    call compute_geometry_mesh(mesh, .true., boundary_2d, me, num_procs)
   end if
 
   allocate(sol(4, mesh%n_elems))
@@ -150,6 +145,8 @@ program main
     print*,"Unknown init"
     error stop
   end if
+
+  if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 4, sol)
 
   t = 0.0_DOUBLE
   iter = 0
@@ -290,9 +287,22 @@ program main
       deallocate(lr_states)
     end do
 
+    ! dt is a local minimum; a non-finite dt is carried by an integer (MPI_MIN can drop a NaN)
+    if (num_procs > 1) then
+      bad_dt = merge(1, 0, .not. (dt == dt .and. dt < huge(dt)))
+      call MPI_ALLREDUCE(MPI_IN_PLACE, bad_dt, 1, MPI_INTEGER, MPI_MAX, MPI_COMM_WORLD, mpi_ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE, dt, 1, MPI_DOUBLE_PRECISION, MPI_MIN, MPI_COMM_WORLD, mpi_ierr)
+      if (bad_dt > 0) then
+        if (me == 0) print*, "Non-finite time step"
+        error stop
+      end if
+    end if
+
     do id_elem=1, mesh%n_elems
+      if (mesh%elem(id_elem)%is_ghost) cycle
       sol(:, id_elem) = sol(:, id_elem) + (cfl*dt/mesh%elem(id_elem)%volume)*flux(:, id_elem)
     end do
+    if (num_procs > 1) call mpi_memory_exchange(mpi_send_recv, mesh%n_elems, 4, sol)
 
     t = t + dt
     iter = iter + 1
