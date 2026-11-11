@@ -118,12 +118,12 @@ contains
     integer(kind=ENTIER) :: n_bdy_faces
     real(kind=DOUBLE), dimension(5) :: w
     integer(kind=ENTIER), dimension(:), allocatable :: face_ids
-    real(kind=DOUBLE), dimension(:), allocatable :: cp, q
+    real(kind=DOUBLE), dimension(:), allocatable :: cp, q, q_old
 
     integer(kind=ENTIER) :: nsfn, nsen
     real(kind=DOUBLE), dimension(:, :), allocatable :: N, S, S_tilde
     real(kind=DOUBLE), dimension(:), allocatable :: B, Tf, Te, mu_arr
-    real(kind=DOUBLE), dimension(3) :: qpc
+    real(kind=DOUBLE), dimension(3) :: qpc, qpc_old, nsk
     real(kind=DOUBLE), dimension(3, 3) :: mat
     real(kind=DOUBLE) :: kap
 
@@ -165,8 +165,11 @@ contains
     end if
 
     !Compute Q for the subfaces
-    allocate (q(n_bdy_faces))
+    ! q = flux applied by the solver (build_diff_nodal_system): sub-face area/normal, side sign.
+    ! q_old = former export (unsigned face%norm + mat^-1), kept one campaign for traceability.
+    allocate (q(n_bdy_faces), q_old(n_bdy_faces))
     q = 0.0_DOUBLE
+    q_old = 0.0_DOUBLE
     do i = 1, n_bdy_faces
       id_face = face_ids(i)
       id_elem = mesh%face(id_face)%left_neigh
@@ -206,6 +209,7 @@ contains
 
         mat = 0.0_DOUBLE
         qpc = 0.0_DOUBLE
+        qpc_old = 0.0_DOUBLE
         do k = 1, mesh%sub_elem(id_sub_elem)%n_sub_faces
           id_sub_face_k = mesh%sub_elem(id_sub_elem)%sub_face(k)
           id_face_k = mesh%sub_face(id_sub_face_k)%mesh_face
@@ -213,14 +217,21 @@ contains
 
           kap = kappa(mu_arr(id_elem))
 
-          qpc = qpc - kap*(Tf(id_sub_face_k_loc) - Te(id_sub_elem_loc))*mesh%face(id_face_k)%norm &
+          ! outward normal of the sub-elem, as in build_diff_nodal_system
+          nsk = mesh%sub_face(id_sub_face_k)%norm
+          if (mesh%sub_face(id_sub_face_k)%left_sub_elem_neigh /= id_sub_elem) nsk = -nsk
+          qpc = qpc - kap*(Tf(id_sub_face_k_loc) - Te(id_sub_elem_loc))*nsk &
+            *mesh%sub_face(id_sub_face_k)%area/mesh%sub_elem(id_sub_elem)%volume
+          qpc_old = qpc_old - kap*(Tf(id_sub_face_k_loc) - Te(id_sub_elem_loc))*mesh%face(id_face_k)%norm &
             *mesh%sub_face(id_sub_face_k)%area/mesh%sub_elem(id_sub_elem)%volume
           mat = mat + tensor_product(mesh%face(id_face_k)%norm, mesh%face(id_face_k)%norm)
         end do
 
+        ! no mat^-1 on q: the solver does not apply it (it stays on q_old only)
         call inv_lapack(3, mat)
-        qpc = matmul(mat, qpc)
-        q(i) = q(i) + mesh%sub_face(id_sub_face)%area*dot_product(qpc, mesh%face(id_face)%norm)
+        qpc_old = matmul(mat, qpc_old)
+        q(i) = q(i) + mesh%sub_face(id_sub_face)%area*dot_product(qpc, mesh%sub_face(id_sub_face)%norm)
+        q_old(i) = q_old(i) + mesh%sub_face(id_sub_face)%area*dot_product(qpc_old, mesh%face(id_face)%norm)
         deallocate (N, S, S_tilde, B, Te, Tf)
       end do
     end do
@@ -347,6 +358,15 @@ contains
       id_face = face_ids(i)
       if( .not. mesh%elem(mesh%face(id_face)%left_neigh)%is_ghost ) then
         write (fn, *) q(i)/mesh%face(id_face)%area
+      end if
+    end do
+    write(fn, *) "</DataArray>"
+
+    write(fn, *) "<DataArray type='Float64' Name='q_old' format='ascii' NumberOfComponents='1'>"
+    do i = 1, n_bdy_faces
+      id_face = face_ids(i)
+      if( .not. mesh%elem(mesh%face(id_face)%left_neigh)%is_ghost ) then
+        write (fn, *) q_old(i)/mesh%face(id_face)%area
       end if
     end do
     write(fn, *) "</DataArray>"
@@ -1041,6 +1061,7 @@ contains
       write(fn, *) "<PDataArray type='Float64' Name='Theta3' NumberOfComponents='1'/>"
       write(fn, *) "<PDataArray type='Float64' Name='Cp' NumberOfComponents='1'/>"
       write(fn, *) "<PDataArray type='Float64' Name='q' NumberOfComponents='1'/>"
+      write(fn, *) "<PDataArray type='Float64' Name='q_old' NumberOfComponents='1'/>"
       write(fn, *) "</PCellData>"
 
       do i=0, num_procs-1
