@@ -3168,7 +3168,8 @@ contains
 
     corr = 0.0_DOUBLE
     corr_a = 0.0_DOUBLE
-    if (need_ducros .and. eps_mode /= 4 .and. eps_mode /= 5 .and. eps_mode /= 8) then
+    if (need_ducros .and. eps_mode /= 4 .and. eps_mode /= 5 .and. eps_mode /= 8 &
+        .and. eps_mode /= 9) then
       select case (eps_mode)
       case (1)
         call compute_corr_pressure(mesh, id_vert, sol, grad, corr, second_order)
@@ -3198,6 +3199,10 @@ contains
     ! borne inferieure de la famille et sert de reference au balayage.
     if (eps_mode == 8) corr = zb_eps_coef*a_p
 
+    ! eps_mode 9 (WIP2_woeps) : corr reste a ZERO, pose plus haut. L advection
+    ! n a donc que |vstar|. Contrairement au mode 8 il ne depend d AUCUN
+    ! coefficient de namelist : le schema est sans eps par construction.
+
     ! Blend weight: compute_corr_ducros returns corr = w * 4 * a_p, where w is
     ! its dimensionless [0,1] shock indicator (Ducros filter gated by Mach and
     ! by compression). Recover w by dividing out the 4*a_p it multiplied in,
@@ -3218,8 +3223,10 @@ contains
     ! detecteur dans l advection de adv_mode 1 et 2 alors que le mode 8 est
     ! justement defini comme "la vitesse seule" -- la contradiction serait
     ! silencieuse. Il suit donc la meme regle que corr.
-    if (need_amiso .and. eps_mode /= 8) then
+    if (need_amiso .and. eps_mode /= 8 .and. eps_mode /= 9) then
       call compute_corr2(mesh, id_vert, sol, grad, corr_a, second_order)
+    else if (need_amiso .and. eps_mode == 9) then
+      corr_a = 0.0_DOUBLE
     else if (need_amiso) then
       corr_a = zb_eps_coef*a_p
     end if

@@ -126,6 +126,7 @@ module ns_global_data_module
   ! nodal p_p in the MOMENTUM flux, the classic Pi_s (v*.n) in the ENERGY flux (Vincent): conservative
   ! because the nodal velocity solve is sum A (Pi_l - Pi_r) n = 0; boundary / z-faces as psw
   integer, parameter :: SCHEME_MULTI_POINT_PV          = 73 ! "multi_point_pv"
+  integer, parameter :: SCHEME_WIP2_WOEPS            = 74 ! "WIP2_woeps" WIP2 sans le eps d advection
   integer, parameter :: SCHEME_ZB                   = 42 ! "ZB_*_*"
   ! ZB advection sub-scheme IDs
   integer, parameter :: SCHEME_ADV_AR1D     = 1  ! "AR1D"
@@ -156,7 +157,9 @@ module ns_global_data_module
   ! zb_adv_mode : flux d advection (0 a 5). Les deux se croisent librement.
   integer :: zb_lag_mode = -1
   integer :: zb_adv_mode = -1
-  ! zb_eps_mode : capteur de dissipation d advection (0 a 8). -1 = scheme_id.
+  ! zb_eps_mode : capteur de dissipation d advection (0 a 9). -1 = scheme_id.
+  !   Le mode 9 (schema WIP2_woeps) met corr a ZERO strictement : l advection
+  !   n a que |vstar|, sans aucun eps, et sans dependre de zb_eps_coef.
   ! zb_eps_coef : amplitude du mode 8, en fraction de la vitesse du son nodale.
   !   Le mode 8 n a AUCUN capteur : la stabilisation de l advection est la
   !   VITESSE seule, |vstar|, plus eps = zb_eps_coef * a_p. zb_eps_coef = 0
@@ -490,6 +493,8 @@ contains
       scheme_id = SCHEME_WIP
     else if (t == "WIP2") then
       scheme_id = SCHEME_WIP2
+    else if (t == "WIP2_woeps") then
+      scheme_id = SCHEME_WIP2_WOEPS
     else if (t == "WIP2_NOLM") then
       scheme_id = SCHEME_WIP2_NOLM
     else if (t == "WIP2_AADV") then

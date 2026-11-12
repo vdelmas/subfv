@@ -214,6 +214,7 @@ contains
       SCHEME_WIP2_ED1, SCHEME_WIP2_ED2, &
       SCHEME_WIP2_MD, SCHEME_WIP2_MD5, SCHEME_WIP2_MDH, SCHEME_USI3D, &
       SCHEME_WIP2_PPEP, SCHEME_WIP2_PPEPI, SCHEME_WIP2_PPEPV, SCHEME_WIP2_PPEPVI, &
+      SCHEME_WIP2_WOEPS, &
       SCHEME_MULTI_POINT_ENER, SCHEME_MULTI_POINT_ENER_ISO, &
       SCHEME_MULTI_POINT_ENER_V, SCHEME_MULTI_POINT_ENER_V_ISO, &
       SCHEME_MULTI_POINT_EPS, SCHEME_MULTI_POINT_EPS_ISO, &
@@ -364,7 +365,8 @@ contains
         .or. scheme_id == SCHEME_WIP2_MD .or. scheme_id == SCHEME_WIP2_MD5 &
         .or. scheme_id == SCHEME_WIP2_MDH .or. scheme_id == SCHEME_WIP2_PPEP &
         .or. scheme_id == SCHEME_WIP2_PPEPI &
-        .or. scheme_id == SCHEME_WIP2_PPEPV .or. scheme_id == SCHEME_WIP2_PPEPVI) then
+        .or. scheme_id == SCHEME_WIP2_PPEPV .or. scheme_id == SCHEME_WIP2_PPEPVI &
+        .or. scheme_id == SCHEME_WIP2_WOEPS) then
       do id_vert = 1, mesh%n_vert
         nsfn = mesh%vert(id_vert)%n_sub_faces_neigh
         nsen = mesh%vert(id_vert)%n_sub_elems_neigh
@@ -397,6 +399,9 @@ contains
           eps_mode = 6
         else if (scheme_id == SCHEME_WIP2_ED2) then
           eps_mode = 7
+        else if (scheme_id == SCHEME_WIP2_WOEPS) then
+          ! WIP2 sans le eps : l advection n a que |vstar|, corr reste nul.
+          eps_mode = 9
         else
           eps_mode = 0
         end if
