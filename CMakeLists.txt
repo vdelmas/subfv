@@ -33,15 +33,56 @@ target_include_directories(core PUBLIC ${CMAKE_BINARY_DIR}/mod/core)
 # optionally, ParMETIS (otherwise only SUBFV_PARTITIONER=block is available).
 option(SUBFV_ENABLE_CGNS "Read .cgns meshes in parallel with in-code partitioning" ON)
 if(SUBFV_ENABLE_CGNS)
-  set(CGNS_ROOT "$ENV{HOME}/opt/cgns" CACHE PATH "CGNS install prefix")
-  set(HDF5_ROOT "$ENV{HOME}/opt/hdf5" CACHE PATH "HDF5 (parallel) install prefix")
-  set(PARMETIS_ROOT "$ENV{HOME}/opt/parmetis" CACHE PATH "ParMETIS/METIS/GKlib install prefix")
-  find_library(CGNS_LIBRARY cgns HINTS ${CGNS_ROOT}/lib)
+  # Prefixes pris dans l ENVIRONNEMENT quand il les fournit (module de cluster,
+  # variable exportee), sinon ~/opt. Aucun chemin n est impose : le meme arbre se
+  # configure en local et sur un cluster sans -D.
+  foreach(dep CGNS HDF5 PARMETIS)
+    if(NOT ${dep}_ROOT)
+      string(TOLOWER ${dep} dep_lc)
+      # HDF5_ROOT_DIR est la variable du module hdf5 de Curta ; HDF5_DIR celle d autres sites.
+      foreach(var ${dep}_ROOT ${dep}_ROOT_DIR ${dep}_DIR)
+        if(NOT ${dep}_ROOT AND DEFINED ENV{${var}})
+          set(${dep}_ROOT "$ENV{${var}}")
+        endif()
+      endforeach()
+      if(NOT ${dep}_ROOT)
+        set(${dep}_ROOT "$ENV{HOME}/opt/${dep_lc}")
+      endif()
+    endif()
+  endforeach()
+  find_library(CGNS_LIBRARY cgns HINTS ${CGNS_ROOT}/lib ${CGNS_ROOT}/lib64)
   find_path(CGNS_MOD_DIR cgns.mod HINTS ${CGNS_ROOT}/include)
-  find_library(HDF5_C_LIBRARY hdf5 HINTS ${HDF5_ROOT}/lib NO_DEFAULT_PATH)
-  if(NOT CGNS_LIBRARY OR NOT CGNS_MOD_DIR OR NOT HDF5_C_LIBRARY)
-    message(WARNING "subfv: CGNS/HDF5 not found (CGNS_ROOT=${CGNS_ROOT}, HDF5_ROOT=${HDF5_ROOT}): "
-      "building WITHOUT the parallel .cgns reader (.msh + subfv-gmsh only)")
+  # Pas de NO_DEFAULT_PATH : HDF5 vient souvent d un module ou du systeme, et le
+  # HINTS ne doit pas devenir une interdiction de chercher ailleurs.
+  find_library(HDF5_C_LIBRARY hdf5 HINTS ${HDF5_ROOT}/lib ${HDF5_ROOT}/lib64)
+  # Le lecteur .cgns est PARALLELE. Sans NO_DEFAULT_PATH on peut tomber sur le
+  # HDF5 du systeme, qui est souvent SEQUENTIEL : on exige donc H5_HAVE_PARALLEL
+  # plutot que de lier en silence une bibliotheque qui ne convient pas.
+  set(HDF5_IS_PARALLEL OFF)
+  if(HDF5_C_LIBRARY)
+    get_filename_component(_h5dir "${HDF5_C_LIBRARY}" DIRECTORY)
+    find_path(HDF5_CONF_DIR
+      NAMES H5pubconf.h H5pubconf-64.h
+      HINTS ${HDF5_ROOT}/include "${_h5dir}/../include" /usr/include)
+    foreach(_h5conf H5pubconf.h H5pubconf-64.h)
+      if(NOT HDF5_IS_PARALLEL AND HDF5_CONF_DIR AND EXISTS "${HDF5_CONF_DIR}/${_h5conf}")
+        file(STRINGS "${HDF5_CONF_DIR}/${_h5conf}" _h5par
+             REGEX "define[ \t]+H5_HAVE_PARALLEL[ \t]+1")
+        if(_h5par)
+          set(HDF5_IS_PARALLEL ON)
+        endif()
+      endif()
+    endforeach()
+  endif()
+  if(NOT CGNS_LIBRARY OR NOT CGNS_MOD_DIR OR NOT HDF5_C_LIBRARY OR NOT HDF5_IS_PARALLEL)
+    if(HDF5_C_LIBRARY AND NOT HDF5_IS_PARALLEL)
+      message(WARNING "subfv: HDF5 found (${HDF5_C_LIBRARY}) but NOT parallel: "
+        "building WITHOUT the parallel .cgns reader. Load a parallel HDF5 module "
+        "(it exports HDF5_ROOT_DIR) or pass -DHDF5_ROOT=<prefix>.")
+    else()
+      message(WARNING "subfv: CGNS/HDF5 not found (CGNS_ROOT=${CGNS_ROOT}, HDF5_ROOT=${HDF5_ROOT}): "
+        "building WITHOUT the parallel .cgns reader (.msh + subfv-gmsh only)")
+    endif()
     set(SUBFV_ENABLE_CGNS OFF)
   endif()
 endif()
