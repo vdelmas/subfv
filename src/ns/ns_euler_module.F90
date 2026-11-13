@@ -431,7 +431,7 @@ contains
         end if
         call compute_rhs_around_vert_WIP2(mesh, sol, grad, &
           nsen, flux_sum_vert, sum_lambda_vert, &
-          id_vert, second_order, scheme_id == SCHEME_WIP2, adv_mode, eps_mode, &
+          id_vert, second_order, adv_mode, eps_mode, &
           scheme_id == SCHEME_WIP2_ENTH .or. scheme_id == SCHEME_WIP2_ENTH_EJUMP &
           .or. scheme_id == SCHEME_WIP2_TP_ENTH, &
           scheme_id == SCHEME_WIP2_TP .or. scheme_id == SCHEME_WIP2_TP_ENTH, &

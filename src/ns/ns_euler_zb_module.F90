@@ -2955,7 +2955,7 @@ contains
   ! pressure/velocity coupling that the low-Mach limit needs.
   subroutine compute_rhs_around_vert_WIP2(mesh, sol, grad, &
       nsen, flux_sum_vert, sum_lambda_vert, &
-      id_vert, second_order, low_mach, adv_mode, eps_mode, enth_fix, tp_fix, ep_mode, lag_mode)
+      id_vert, second_order, adv_mode, eps_mode, enth_fix, tp_fix, ep_mode, lag_mode)
     use linear_solver_module
     use ns_global_data_module, only: boundary_2d, zb_eps_coef, zb_pivp, zb_ppus, zb_tang, zb_lag, &
       grad_filled, zb_pdiv
@@ -2969,7 +2969,6 @@ contains
     real(kind=DOUBLE), dimension(5, nsen), intent(inout) :: flux_sum_vert
     integer(kind=ENTIER), intent(in) :: id_vert
     logical, intent(in) :: second_order
-    logical, intent(in) :: low_mach
     ! 0 -> WIP's Rusanov-at-vstar advection with the Ducros sensor
     !      (best low-Mach slope, least accurate on Sedov)
     ! 1 -> AMISO advection: nodal upwind state blended with a pressure-corrected
@@ -3107,7 +3106,7 @@ contains
     real(kind=DOUBLE) :: pdis, pdfa, pddl, pddr, pdel, pder
     real(kind=DOUBLE) :: lambda_l, lambda_r, lambda_lts
     real(kind=DOUBLE) :: rhol, rhor, pl, pr, vnl, vnr, al, ar
-    real(kind=DOUBLE) :: a_p, ma_node, theta, corr, vstar
+    real(kind=DOUBLE) :: a_p, ma_node, corr, vstar
     real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, sol_w
     real(kind=DOUBLE), dimension(5) :: sol_l, sol_r, sol_m
     real(kind=DOUBLE), dimension(5) :: ff_lag, ff_lag_l, ff_lag_r, ff_adv, fminus, fplus
@@ -3148,11 +3147,6 @@ contains
     v_p = v_p / mesh%vert(id_vert)%volume
     ma_node = norm2(v_p) / a_p
 
-    if (low_mach) then
-      theta = min(1.0_DOUBLE, ma_node)
-    else
-      theta = 1.0_DOUBLE
-    end if
 
     ! nodal velocity + its Mach, needed by the Tallois multidimensional correction
     theta_n = 0.0_DOUBLE
@@ -3335,7 +3329,7 @@ contains
           pdis = pdel*pddl
         end if
       end if
-      pbar_f = (pl/lambda_l + pr/lambda_r - theta*pdis)/invlamb
+      pbar_f = (pl/lambda_l + pr/lambda_r - pdis)/invlamb
 
       weight = mesh%sub_face(id_sub_face)%area*invlamb
       if (re <= 0) weight = 0.5_DOUBLE*weight
