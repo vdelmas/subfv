@@ -130,6 +130,14 @@ program main
   read(unit=fn, nml=INPUT_PARAM)
   close(fn)
 
+  ! compute_error n'a de solution exacte que pour le vortex (init 2) et Taylor-Green (init 10) :
+  ! refuser au demarrage plutot que calculer une erreur contre la mauvaise solution.
+  if (compute_error .and. init /= 2 .and. init /= 10) then
+    if (me == 0) print*, "ERREUR : compute_error = .true. avec init =", init, &
+      " -- solution exacte connue seulement pour init = 2 (vortex) et init = 10 (Taylor-Green)."
+    error stop 3
+  end if
+
   ! "classic_rhoa" is the EUCCLHYD-original variant of "classic": the sub-face
   ! swept-mass coefficient uses the pure acoustic impedance lambda = rho*a,
   ! without the pressure-/velocity-jump (Dukowicz-like) terms. Selecting it by
@@ -1176,8 +1184,12 @@ program main
       ! Taylor-Green: the rate is measured on the pressure, rho being uniform here.
       call compute_error_taylor_green(mesh, new_sol, gamma_arr, h_extrude, h_err, &
         l1err, l2err, linferr)
-    else
+    else if (init == 2) then
       call compute_error_vortex(mesh, new_sol, t, h_extrude, h_err, l1err, l2err, linferr)
+    else
+      ! Inatteignable (refuse au demarrage) : garde contre un repli silencieux sur le vortex.
+      if (me == 0) print*, "ERREUR : pas de solution exacte pour init =", init
+      error stop 3
     end if
     if (me == 0) print *, "FINAL t=", t, "h=", h_err, "L1=", l1err, "L2=", l2err, "Linf=", linferr
   end if
