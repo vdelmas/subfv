@@ -262,6 +262,9 @@ module ns_global_data_module
   ! diagnostic: at the first flux call, write every interior sub-face side of the
   ! multi_point_ener* node passes to ener_sides_<rank>.txt (no effect on the solution)
   logical :: ener_dump_sides = .FALSE.
+  ! diagnostic: multi_point_pressure star-state eps* per sub-face side, first 8 flux calls,
+  ! to mpp_eps_<rank>.txt (no effect on the solution)
+  logical :: mpp_eps_diag = .FALSE.
   ! CFL number of the convex-combination argument in LOCAL time stepping: the point-implicit
   ! update divides by V/dt + sum_lambda/ener_theta, so the weight kept on the cell's own
   ! state is alpha_c = 1 - ener_theta (cfl = 1e5 makes V/dt negligible). 1 = historical
@@ -359,7 +362,7 @@ contains
       zb_lag_mode, zb_adv_mode, zb_eps_mode, zb_eps_coef, &
       zb_pivp, zb_ppus, zb_tang, vp_gcorr, zb_lag, &
       wip_diss, zb_pdiv, &
-      local_time_step, ener_lambda_pos, ener_dump_sides, ener_theta, ener_internal, ener_pstar, &
+      local_time_step, ener_lambda_pos, ener_dump_sides, mpp_eps_diag, ener_theta, ener_internal, ener_pstar, &
       bc_style, boundary_2d, &
       write_residual, n_iter_residual, &
       final_res, n_max_iter, &

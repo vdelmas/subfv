@@ -16,6 +16,9 @@ module ns_euler_rs_module
   ! entropy count (a boundary_2d z-face or a wall has v* = u = 0, rho* = rho and
   ! eps* = eps - D^2/(2 lam^2): it would count as an entropy decrease wherever p_p /= p)
   logical :: ener_ent_interior = .true.
+  ! last multi_point_pressure call: eps*_l, closed form_l, eps_l, eps*_r, closed form_r, eps_r,
+  ! then the work and acoustic terms of the closed form, left and right
+  real(kind=DOUBLE), dimension(10) :: mpp_diag = 0.0_DOUBLE
 
 contains
   subroutine three_wave(sol_w_l, sol_w_r, n, lr_flux, sl, sr)
@@ -1167,6 +1170,18 @@ contains
 
     sl = vn_l - lambda_l/rhol
     sr = vn_r + lambda_r/rhor
+
+    ! diagnostic only: star internal energies, computed and in closed form
+    mpp_diag(3) = el - 0.5_DOUBLE*dot_product(sol_w_l(2:4), sol_w_l(2:4))
+    mpp_diag(1) = (sol_l_et(5) - 0.5_DOUBLE*dot_product(sol_l_et(2:4), sol_l_et(2:4))/rhol_et)/rhol_et
+    mpp_diag(2) = mpp_diag(3) - p_nodal*(vn_bar - vn_l)/lambda_l - 0.5_DOUBLE*((pl - p_nodal)/lambda_l)**2
+    mpp_diag(6) = er - 0.5_DOUBLE*dot_product(sol_w_r(2:4), sol_w_r(2:4))
+    mpp_diag(4) = (sol_r_et(5) - 0.5_DOUBLE*dot_product(sol_r_et(2:4), sol_r_et(2:4))/rhor_et)/rhor_et
+    mpp_diag(5) = mpp_diag(6) + p_nodal*(vn_bar - vn_r)/lambda_r - 0.5_DOUBLE*((p_nodal - pr)/lambda_r)**2
+    mpp_diag(7) = -p_nodal*(vn_bar - vn_l)/lambda_l
+    mpp_diag(8) = -0.5_DOUBLE*((pl - p_nodal)/lambda_l)**2
+    mpp_diag(9) = p_nodal*(vn_bar - vn_r)/lambda_r
+    mpp_diag(10) = -0.5_DOUBLE*((p_nodal - pr)/lambda_r)**2
 
     lr_flux(:, 1) = 0.5_DOUBLE*(fl + fr) - 0.5_DOUBLE* &
       (abs(sl)*(sol_l_et - sol_l) + &

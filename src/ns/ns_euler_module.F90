@@ -17,6 +17,10 @@ module ns_euler_module
   integer :: ener_dump_unit = -1
   logical :: ener_dumping = .false.
   integer(kind=8) :: ener_calls = 0_8
+  ! mpp_eps_diag: per-rank unit and flux-call counter
+  integer :: mpp_unit = -1
+  logical :: mpp_open = .false.
+  integer(kind=8) :: mpp_calls = 0_8
   real(kind=DOUBLE), dimension(10), parameter :: ener_edges = (/ -100.0_DOUBLE, -10.0_DOUBLE, &
     -1.0_DOUBLE, 0.0_DOUBLE, 0.1_DOUBLE, 0.5_DOUBLE, 0.9_DOUBLE, 1.1_DOUBLE, 2.0_DOUBLE, 10.0_DOUBLE /)
 
@@ -205,8 +209,8 @@ contains
       grad, sum_lambda, second_order, vp, h_p, mat_h_p)
     use mpi
     use ns_global_data_module, only: zb_lag_mode, zb_adv_mode, zb_eps_mode, &
-      bc_style, scheme, exclude_bound_vert, ener_dump_sides, &
-      scheme_id, scheme_adv_id, scheme_lag_id, &
+      bc_style, scheme, exclude_bound_vert, ener_dump_sides, mpp_eps_diag, &
+      scheme_id, scheme_adv_id, scheme_lag_id, SCHEME_MULTI_POINT_PRESSURE, &
       SCHEME_ZB, SCHEME_WIP, SCHEME_WIP2, SCHEME_WIP2_NOLM, SCHEME_WIP2_AADV, SCHEME_WIP2_HYB, &
       SCHEME_WIP2_EJUMP, SCHEME_WIP2_EDIV, SCHEME_WIP2_EMAX, &
       SCHEME_WIP2_ENTH, SCHEME_WIP2_ENTH_EJUMP, &
@@ -481,6 +485,18 @@ contains
         eps_cell_neg = 0
         eps_cell_zf = 0
       end if
+      if (mpp_eps_diag .and. scheme_id == SCHEME_MULTI_POINT_PRESSURE .and. .not. mpp_open) then
+        block
+          integer :: rk, ie
+          character(len=64) :: fn
+          call MPI_COMM_RANK(MPI_COMM_WORLD, rk, ie)
+          write(fn, '(a,i0,a)') 'mpp_eps_', rk, '.txt'
+          open(newunit=mpp_unit, file=trim(fn), status='replace')
+          mpp_open = .true.
+          write(mpp_unit, '(a)') '# call xv yv le re xl yl xr yr area p_p p_l p_r eps*_l form_l eps_l ' // &
+            'eps*_r form_r eps_r work_l acou_l work_r acou_r'
+        end block
+      end if
       do id_vert = 1, mesh%n_vert
         nsfn = mesh%vert(id_vert)%n_sub_faces_neigh
         nsen = mesh%vert(id_vert)%n_sub_elems_neigh
@@ -497,6 +513,10 @@ contains
           sum_lambda(ide) = sum_lambda(ide) + sum_lambda_vert(j)
         end do
       end do
+      if (mpp_open) then
+        mpp_calls = mpp_calls + 1
+        flush(mpp_unit)
+      end if
       if (scheme_id == SCHEME_MULTI_POINT_ENER .or. scheme_id == SCHEME_MULTI_POINT_ENER_ISO .or. &
           scheme_id == SCHEME_MULTI_POINT_ENER_V .or. scheme_id == SCHEME_MULTI_POINT_ENER_V_ISO .or. &
           scheme_id == SCHEME_MULTI_POINT_EPS .or. scheme_id == SCHEME_MULTI_POINT_EPS_ISO .or. &
@@ -517,7 +537,7 @@ contains
       nsfn, nsen, v_vert, sum_lambda_vert, flux_sum_vert, &
       second_order, id_vert, vp)
     use ns_global_data_module, only: bc_style, scheme, exclude_bound_vert, &
-      scheme_id, ener_lambda_pos, ener_internal, ener_pstar, &
+      scheme_id, ener_lambda_pos, ener_internal, ener_pstar, mpp_eps_diag, &
       SCHEME_MULTI_POINT, SCHEME_MULTI_POINT_ISO, SCHEME_MULTI_POINT_PRESSURE, &
       SCHEME_MULTI_POINT_PRESSURE_PH, &
       SCHEME_THREE_WAVE, SCHEME_TWO_WAVE, SCHEME_MODIFIED_THREE_WAVE, &
@@ -1461,6 +1481,11 @@ contains
         call multi_point_pressure(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
           mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), p_nodal, &
           lambda(1, j), lambda(2, j), sl, sr)
+        if (mpp_eps_diag .and. mpp_calls < 8 .and. .not. mesh%vert(id_vert)%is_ghost) &
+          write(mpp_unit, '(i3,2f10.5,2i8,4f10.5,es12.4,3es13.5,10es13.5)') mpp_calls, &
+          mesh%vert(id_vert)%coord(1:2), le, re, mesh%elem(le)%coord(1:2), &
+          merge(mesh%elem(max(re, 1))%coord(1:2), (/ -9.0_DOUBLE, -9.0_DOUBLE /), re > 0), &
+          mesh%sub_face(id_sub_face)%area, p_nodal, sol_w_lr(5, 1, j), sol_w_lr(5, 2, j), mpp_diag
       case (SCHEME_MULTI_POINT_PRESSURE_PH)
         call multi_point_pressure_ph(sol_w_lr(:, 1, j), sol_w_lr(:, 2, j), &
           mesh%sub_face(id_sub_face)%norm, lr_flux(:, :, j), p_nodal, &
