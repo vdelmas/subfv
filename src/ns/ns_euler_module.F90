@@ -227,7 +227,8 @@ contains
       SCHEME_ADV_ARMD, SCHEME_ADV_ARMDU, &
       SCHEME_ADV_ARMDMAT, SCHEME_ADV_ARMDUMAT, &
       SCHEME_LAG_LS, SCHEME_LAG_LSU, SCHEME_ADV_ARMDWIP, &
-      SCHEME_LAG_LSWIP, SCHEME_LAG_LPP, SCHEME_LAG_LVPPP, SCHEME_LAG_LS1D, SCHEME_LAG_LPF
+      SCHEME_LAG_LSWIP, SCHEME_LAG_LPP, SCHEME_LAG_LVPPP, SCHEME_LAG_LS1D, SCHEME_LAG_LPF, &
+      SCHEME_LAG_LVPPPEP, SCHEME_LAG_LVPPPESPP, SCHEME_LAG_LVPPPPVP
     use linear_solver_module
     use mpi
     implicit none
@@ -330,6 +331,15 @@ contains
         case (SCHEME_LAG_LPF)
           call compute_rhs_around_vert_LPF(mesh, sol, grad, &
             nsen, flux_sum_vert, id_vert, second_order)
+        case (SCHEME_LAG_LVPPPEP)
+          call compute_rhs_around_vert_LVPPPEP(mesh, sol, grad, &
+            nsen, flux_sum_vert, id_vert, vp, second_order, .false.)
+        case (SCHEME_LAG_LVPPPESPP)
+          call compute_rhs_around_vert_LVPPPEP(mesh, sol, grad, &
+            nsen, flux_sum_vert, id_vert, vp, second_order, .true.)
+        case (SCHEME_LAG_LVPPPPVP)
+          call compute_rhs_around_vert_LVPPPPVP(mesh, sol, grad, &
+            nsen, flux_sum_vert, id_vert, vp, second_order)
         case default
           print*,"Unknown ZB Lagrange"
           error stop

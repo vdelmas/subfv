@@ -953,7 +953,7 @@ contains
       nsen, u_vert, sum_lambda_vert, flux_sum_vert, &
       second_order, id_vert, h_p)
     use ns_global_data_module, only: bc_style, scheme, &
-      exclude_bound_vert, boundary_2d
+      exclude_bound_vert, boundary_2d, zb_adv_woeps, zb_corr_form, zb_corr_scale
     use linear_solver_module
     use mpi
     implicit none
@@ -981,7 +981,14 @@ contains
 
 
     rse_loc = 0
-    call compute_corr(mesh, id_vert, sol, grad, corr, h_p, second_order)
+    call compute_corr(mesh, id_vert, sol, grad, corr, h_p, second_order, zb_corr_form)
+    ! F = eq. (15) saut de pression normalise, H = eq. (14) Ducros (tex/wip.tex)
+    if (zb_corr_form == 6) call compute_corr_pressure(mesh, id_vert, sol, grad, corr, second_order)
+    if (zb_corr_form == 8) call compute_corr_ducros(mesh, id_vert, sol, grad, corr, second_order)
+    ! zb_corr_scale : DIAGNOSTIC (not a scheme parameter), applied after every saturation
+    corr = zb_corr_scale*corr
+    ! zb_adv_woeps : advection sans le eps (corr nul partout, comme WIP2_woeps)
+    if (zb_adv_woeps) corr = 0.0_DOUBLE
     u_vert = 0.0_DOUBLE
 
     sol_p = 0.0_DOUBLE
@@ -1075,7 +1082,7 @@ contains
       nsen, u_vert, sum_lambda_vert, flux_sum_vert, &
       second_order, id_vert, h_p)
     use ns_global_data_module, only: bc_style, scheme, &
-      exclude_bound_vert, boundary_2d
+      exclude_bound_vert, boundary_2d, zb_adv_woeps, zb_corr_form, zb_corr_scale
     use linear_solver_module
     use mpi
     implicit none
@@ -1122,7 +1129,15 @@ contains
     u_vert = 0.0_DOUBLE
 
     !call compute_corr(mesh, id_vert, sol, grad, corr, h_p, second_order)
-    call compute_corr2(mesh, id_vert, sol, grad, corr, second_order)
+    call compute_corr2(mesh, id_vert, sol, grad, corr, second_order, zb_corr_form, h_p(id_vert))
+    if (zb_corr_form == 6) call compute_corr_pressure(mesh, id_vert, sol, grad, corr, second_order)
+    if (zb_corr_form == 7) call compute_corr(mesh, id_vert, sol, grad, corr, h_p, second_order, 7)
+    if (zb_corr_form == 9) call compute_corr(mesh, id_vert, sol, grad, corr, h_p, second_order, 9)
+    if (zb_corr_form == 8) call compute_corr_ducros(mesh, id_vert, sol, grad, corr, second_order)
+    ! zb_corr_scale : DIAGNOSTIC (not a scheme parameter), applied after every saturation
+    corr = zb_corr_scale*corr
+    ! zb_adv_woeps : corr nul, donc ni dans lambda ni dans le melange isotrope ff
+    if (zb_adv_woeps) corr = 0.0_DOUBLE
 
     sol_p = 0.0_DOUBLE
     sum_area = 0.0_DOUBLE
@@ -1394,9 +1409,11 @@ contains
     end do
   end function corner_normal
 
-  subroutine compute_corr(mesh, id_vert, sol, grad, corr, h_p, second_order)
-    use ns_global_data_module, only : scheme
+  subroutine compute_corr(mesh, id_vert, sol, grad, corr, h_p, second_order, form)
+    use ns_global_data_module, only : scheme, zb_corr_dim
     implicit none
+    ! form (zb_corr_form, AM only) : 0/1 A, 2 B, 3 C, 4 D (= B ici), 5 E, 7 G ; absent = A
+    integer(kind=ENTIER), intent(in), optional :: form
 
     type(mesh_type), intent(in) :: mesh
     integer(kind=ENTIER), intent(in) :: id_vert
@@ -1459,11 +1476,46 @@ contains
     end do
     grad_p = grad_p / mesh%vert(id_vert)%volume
 
-    !corr = min(1.0_DOUBLE, max(-div_v/a_p, 0.0_DOUBLE))*a_p
-    !corr = max(0.0_DOUBLE, min(abs(div_v)/a_p, 1.0_DOUBLE))*a_p
     corr = max(0.0_DOUBLE, &
       min(h_p(id_vert)*abs(div_v)/a_p+h_p(id_vert)*norm2(grad_p)/a_p**2, 1.0_DOUBLE))&
     *a_p
+    ! zb_corr_dim = 1 (AM path only, i.e. form present): div_v [1/s] needs h, grad_p [Pa/m] needs h/(rho_p a^2)
+    if (present(form) .and. zb_corr_dim == 1) then
+      select case (form)
+      case (0, 1)   ! A
+        corr = max(0.0_DOUBLE, min(h_p(id_vert)*abs(div_v)/a_p &
+          + h_p(id_vert)*norm2(grad_p)/(rho_p*a_p**2), 1.0_DOUBLE))*a_p
+      case (2, 4)   ! B (= D)
+        corr = min(1.0_DOUBLE, max(-h_p(id_vert)*div_v/a_p, 0.0_DOUBLE))*a_p
+      case (3)      ! C
+        corr = max(0.0_DOUBLE, min(h_p(id_vert)*abs(div_v)/a_p, 1.0_DOUBLE))*a_p
+      case (5)      ! E
+        corr = max(min(1.0_DOUBLE, max(-h_p(id_vert)*div_v/a_p, 0.0_DOUBLE)), &
+          min(1.0_DOUBLE, max(0.0_DOUBLE, h_p(id_vert)*norm2(grad_p)/(rho_p*a_p**2))))*a_p
+      case (7)      ! G : already dimensionless
+        corr = max(0.0_DOUBLE, min(1.0_DOUBLE, max(-h_p(id_vert)*div_v/a_p, &
+          h_p(id_vert)*norm2(grad_p)/(rho_p*a_p**2))))*a_p
+      case (9)      ! S : G with the SUM of its two indicators instead of the max
+        corr = min(1.0_DOUBLE, max(0.0_DOUBLE, h_p(id_vert)*abs(div_v)/a_p &
+          + h_p(id_vert)*norm2(grad_p)/(rho_p*a_p**2)))*a_p
+      end select
+    else if (present(form)) then
+      select case (form)
+      case (2, 4)   ! B (= D) : compression seule
+        corr = min(1.0_DOUBLE, max(-div_v/a_p, 0.0_DOUBLE))*a_p
+      case (3)      ! C : |div v|
+        corr = max(0.0_DOUBLE, min(abs(div_v)/a_p, 1.0_DOUBLE))*a_p
+      case (5)      ! E : max(compression, |grad p|/a), quantites de compute_corr
+        corr = max(min(1.0_DOUBLE, max(-div_v/a_p, 0.0_DOUBLE)), &
+          min(1.0_DOUBLE, max(0.0_DOUBLE, norm2(grad_p)/a_p)))*a_p
+      case (7)      ! G : eq. (13) de tex/wip.tex telle qu ecrite (max, rho_p au denominateur)
+        corr = max(0.0_DOUBLE, min(1.0_DOUBLE, max(-h_p(id_vert)*div_v/a_p, &
+          h_p(id_vert)*norm2(grad_p)/(rho_p*a_p**2))))*a_p
+      case (9)      ! S : G with the SUM of its two indicators instead of the max
+        corr = min(1.0_DOUBLE, max(0.0_DOUBLE, h_p(id_vert)*abs(div_v)/a_p &
+          + h_p(id_vert)*norm2(grad_p)/(rho_p*a_p**2)))*a_p
+      end select
+    end if
   end subroutine compute_corr
 
   subroutine compute_corrM(mesh, id_vert, sol, grad, corr, mat_h_p, second_order)
@@ -1581,7 +1633,8 @@ contains
     end do
     grad_sol = grad_sol / mesh%vert(id_vert)%volume
 
-    call compute_corr(mesh, id_vert, sol, grad, corr, h_p, second_order)
+    ! form 0 = A, passed so that ARMDWIP follows zb_corr_dim like AM (0 = legacy)
+    call compute_corr(mesh, id_vert, sol, grad, corr, h_p, second_order, 0)
     !call compute_corrM(mesh, id_vert, sol, grad, corr, mat_h_p, second_order)
 
     !call compute_nodal_velocity_LSM(mesh, id_vert, sol, grad, vp, mat_h_p, second_order)
@@ -1974,10 +2027,13 @@ contains
     vp = matmul(mat, rhs)
   end subroutine compute_nodal_velocity_LVP
 
-  subroutine compute_corr2(mesh, id_vert, sol, grad, corr, second_order)
-    use ns_global_data_module, only : scheme, boundary_2d
+  subroutine compute_corr2(mesh, id_vert, sol, grad, corr, second_order, form, h)
+    use ns_global_data_module, only : scheme, boundary_2d, zb_corr_dim
     use linear_solver_module
     implicit none
+    ! form (zb_corr_form, AMISO only) : 0/4 D, 5 E, 2 B (= D ici), 3 C, 1 A (exige h) ; absent = D
+    integer(kind=ENTIER), intent(in), optional :: form
+    real(kind=DOUBLE), intent(in), optional :: h
 
     type(mesh_type), intent(in) :: mesh
     integer(kind=ENTIER), intent(in) :: id_vert
@@ -2060,8 +2116,27 @@ contains
 
     corr_div_v = min(1.0_DOUBLE, max(0.0_DOUBLE, -div_v/a_p))*a_p
     corr_grad_p = min(1.0_DOUBLE, max(0.0_DOUBLE, norm2(grad_p)/a_p))*a_p
-    !corr = max(corr_div_v, corr_grad_p)
     corr = corr_div_v
+    ! zb_corr_dim = 1 (AMISO path only): div_v here is a velocity (no h), grad_p a pressure (needs rho_p a^2)
+    if (present(form) .and. zb_corr_dim == 1) then
+      select case (form)
+      case (5)      ! E
+        corr = max(corr_div_v, min(1.0_DOUBLE, max(0.0_DOUBLE, norm2(grad_p)/(rho_p*a_p**2)))*a_p)
+      case (3)      ! C (unchanged)
+        corr = max(0.0_DOUBLE, min(abs(div_v)/a_p, 1.0_DOUBLE))*a_p
+      case (1)      ! A without h
+        corr = max(0.0_DOUBLE, min(abs(div_v)/a_p + norm2(grad_p)/(rho_p*a_p**2), 1.0_DOUBLE))*a_p
+      end select
+    else if (present(form)) then
+      select case (form)
+      case (5)      ! E
+        corr = max(corr_div_v, corr_grad_p)
+      case (3)      ! C : |div v|, quantites de compute_corr2
+        corr = max(0.0_DOUBLE, min(abs(div_v)/a_p, 1.0_DOUBLE))*a_p
+      case (1)      ! A, quantites de compute_corr2
+        corr = max(0.0_DOUBLE, min(h*abs(div_v)/a_p + h*norm2(grad_p)/a_p**2, 1.0_DOUBLE))*a_p
+      end select
+    end if
   end subroutine compute_corr2
 
   subroutine compute_corr_ducros(mesh, id_vert, sol, grad, corr, second_order)
@@ -2360,6 +2435,159 @@ contains
     end do
   end subroutine compute_rhs_around_vert_LVPPP
 
+  ! LVPPPEP / LVPPPESPP : la partie lagrangienne de LVPPP (p_p n en QdM, meme p_p nodal) avec une
+  ! energie NODALE X_p (totale e_p, ou interne eps_p si internal) : flux d energie unilateraux
+  !   (pv)*_l = p_l u_l - lambda_l (X_p - X_l),  (pv)*_r = p_r u_r + lambda_r (X_p - X_r),
+  ! X_p telescopique sur les sous-faces interieures hors faces z (donc conservatif au noeud),
+  ! lambda = celui de compute_nodal_pressure_LPP. Bord et faces z : comme LVPPP.
+  subroutine compute_rhs_around_vert_LVPPPEP(mesh, sol, grad, &
+      nsen, flux_sum_vert, id_vert, vp, second_order, internal)
+    use ns_global_data_module, only: boundary_2d
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(inout) :: vp
+    real(kind=DOUBLE), dimension(:, :, :), intent(in) :: grad
+    integer(kind=ENTIER), intent(in) :: nsen
+    real(kind=DOUBLE), dimension(5, nsen), intent(inout) :: flux_sum_vert
+    integer(kind=ENTIER), intent(in) :: id_vert
+    logical, intent(in) :: second_order, internal
+
+    integer(kind=ENTIER) :: j, id_sub_face, le, re, lse, rse, lse_loc, rse_loc, pass
+    real(kind=DOUBLE), dimension(3) :: norm
+    real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, u_l, u_r, fminus, fplus
+    real(kind=DOUBLE) :: pp, rhol, rhor, vnl, vnr, pl, pr, al, ar, lambda_l, lambda_r
+    real(kind=DOUBLE) :: x_l, x_r, x_p, num, den
+    logical :: inner
+
+    rse_loc = 0
+    call compute_nodal_velocity_LVP(mesh, id_vert, sol, grad, vp(:,id_vert), second_order)
+    call compute_nodal_pressure_LPP(mesh, id_vert, sol, grad, pp, second_order)
+
+    num = 0.0_DOUBLE
+    den = 0.0_DOUBLE
+    x_p = 0.0_DOUBLE
+    do pass = 1, 2
+      do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+        id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+        le = mesh%sub_face(id_sub_face)%left_elem_neigh
+        re = mesh%sub_face(id_sub_face)%right_elem_neigh
+        norm = mesh%sub_face(id_sub_face)%norm
+        inner = re > 0 .and. .not. (boundary_2d .and. abs(norm(3)) > 1e-3)
+
+        call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
+          second_order, sol_w_l, sol_w_r)
+        rhol = sol_w_l(1); vnl = dot_product(sol_w_l(2:4), norm); pl = sol_w_l(5); al = sound_speed_w(sol_w_l)
+        rhor = sol_w_r(1); vnr = dot_product(sol_w_r(2:4), norm); pr = sol_w_r(5); ar = sound_speed_w(sol_w_r)
+        lambda_l = max(al*rhol, sqrt(rhol*max(0.0_DOUBLE, pr - pl)), -rhol*(vnr - vnl))
+        lambda_r = max(ar*rhor, sqrt(rhor*max(0.0_DOUBLE, pl - pr)), -rhor*(vnr - vnl))
+        u_l = primit_to_conserv(sol_w_l)
+        u_r = primit_to_conserv(sol_w_r)
+        x_l = u_l(5)/rhol
+        x_r = u_r(5)/rhor
+        if (internal) then
+          x_l = x_l - 0.5_DOUBLE*dot_product(sol_w_l(2:4), sol_w_l(2:4))
+          x_r = x_r - 0.5_DOUBLE*dot_product(sol_w_r(2:4), sol_w_r(2:4))
+        end if
+
+        if (pass == 1) then
+          if (inner) then
+            num = num + mesh%sub_face(id_sub_face)%area*(lambda_l*x_l + lambda_r*x_r + pl*vnl - pr*vnr)
+            den = den + mesh%sub_face(id_sub_face)%area*(lambda_l + lambda_r)
+          end if
+          cycle
+        end if
+
+        fminus(1) = 0.0_DOUBLE
+        fminus(2:4) = pp*norm
+        fminus(5) = pp*dot_product(vp(:, id_vert), norm)
+        fplus = fminus
+        if (inner .and. den > 0.0_DOUBLE) then
+          fminus(5) = pl*vnl - lambda_l*(x_p - x_l)
+          fplus(5) = pr*vnr + lambda_r*(x_p - x_r)
+        end if
+        if (boundary_2d .and. abs(norm(3)) > 1e-3) then
+          fminus = 0.0_DOUBLE
+          fplus = 0.0_DOUBLE
+        end if
+
+        lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
+        lse_loc = mesh%sub_elem(lse)%id_loc_around_node
+        rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
+        if (rse > 0) rse_loc = mesh%sub_elem(rse)%id_loc_around_node
+        if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+          flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+          if (rse > 0) then
+            if (mesh%sub_elem(rse)%mesh_vert == id_vert) &
+              flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fplus
+          end if
+        end if
+      end do
+      if (pass == 1 .and. den > 0.0_DOUBLE) x_p = num/den
+    end do
+  end subroutine compute_rhs_around_vert_LVPPPEP
+
+  ! LVPPPPVP : port of the Lagrangian vp_pp_ppvp, sub-face variant (the one that works there).
+  ! LVPPP's Lagrangian part (p_p n in momentum) with energy flux pbar_f (v_p.n) per sub-face,
+  ! pbar_f the 1D sub-face pressure of compute_nodal_pressure_LPP (same lambda). Single-valued,
+  ! odd under face reversal, zero when the sub-face sweeps no volume. z-faces: as LVPPP.
+  subroutine compute_rhs_around_vert_LVPPPPVP(mesh, sol, grad, &
+      nsen, flux_sum_vert, id_vert, vp, second_order)
+    use ns_global_data_module, only: boundary_2d
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    real(kind=DOUBLE), dimension(5, mesh%n_elems), intent(in) :: sol
+    real(kind=DOUBLE), dimension(3, mesh%n_vert), intent(inout) :: vp
+    real(kind=DOUBLE), dimension(:, :, :), intent(in) :: grad
+    integer(kind=ENTIER), intent(in) :: nsen
+    real(kind=DOUBLE), dimension(5, nsen), intent(inout) :: flux_sum_vert
+    integer(kind=ENTIER), intent(in) :: id_vert
+    logical, intent(in) :: second_order
+
+    integer(kind=ENTIER) :: j, id_sub_face, le, re, lse, rse, lse_loc, rse_loc
+    real(kind=DOUBLE), dimension(3) :: norm
+    real(kind=DOUBLE), dimension(5) :: sol_w_l, sol_w_r, fminus
+    real(kind=DOUBLE) :: pp, rhol, rhor, vnl, vnr, pl, pr, al, ar, lambda_l, lambda_r, pbar
+
+    rse_loc = 0
+    call compute_nodal_velocity_LVP(mesh, id_vert, sol, grad, vp(:,id_vert), second_order)
+    call compute_nodal_pressure_LPP(mesh, id_vert, sol, grad, pp, second_order)
+
+    do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
+      id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)
+      le = mesh%sub_face(id_sub_face)%left_elem_neigh
+      re = mesh%sub_face(id_sub_face)%right_elem_neigh
+      norm = mesh%sub_face(id_sub_face)%norm
+
+      call reconstruct_lr_w(mesh, sol, grad, id_vert, id_sub_face, le, re, &
+        second_order, sol_w_l, sol_w_r)
+      rhol = sol_w_l(1); vnl = dot_product(sol_w_l(2:4), norm); pl = sol_w_l(5); al = sound_speed_w(sol_w_l)
+      rhor = sol_w_r(1); vnr = dot_product(sol_w_r(2:4), norm); pr = sol_w_r(5); ar = sound_speed_w(sol_w_r)
+      lambda_l = max(al*rhol, sqrt(rhol*max(0.0_DOUBLE, pr - pl)), -rhol*(vnr - vnl))
+      lambda_r = max(ar*rhor, sqrt(rhor*max(0.0_DOUBLE, pl - pr)), -rhor*(vnr - vnl))
+      pbar = (pl/lambda_l + pr/lambda_r - (vnr - vnl))/(1.0_DOUBLE/lambda_l + 1.0_DOUBLE/lambda_r)
+
+      fminus(1) = 0.0_DOUBLE
+      fminus(2:4) = pp*norm
+      fminus(5) = pbar*dot_product(vp(:, id_vert), norm)
+      if (boundary_2d .and. abs(norm(3)) > 1e-3) fminus = 0.0_DOUBLE
+
+      lse = mesh%sub_face(id_sub_face)%left_sub_elem_neigh
+      lse_loc = mesh%sub_elem(lse)%id_loc_around_node
+      rse = mesh%sub_face(id_sub_face)%right_sub_elem_neigh
+      if (rse > 0) rse_loc = mesh%sub_elem(rse)%id_loc_around_node
+      if (mesh%sub_elem(lse)%mesh_vert == id_vert) then
+        flux_sum_vert(:, lse_loc) = flux_sum_vert(:, lse_loc) + mesh%sub_face(id_sub_face)%area*fminus
+        if (rse > 0) then
+          if (mesh%sub_elem(rse)%mesh_vert == id_vert) &
+            flux_sum_vert(:, rse_loc) = flux_sum_vert(:, rse_loc) - mesh%sub_face(id_sub_face)%area*fminus
+        end if
+      end if
+    end do
+  end subroutine compute_rhs_around_vert_LVPPPPVP
+
   subroutine compute_rhs_around_vert_LS1D(mesh, sol, grad, &
       nsen, flux_sum_vert, &
       id_vert, second_order)
@@ -2646,7 +2874,7 @@ contains
       nsen, flux_sum_vert, sum_lambda_vert, &
       id_vert, vp, h_p, second_order)
     use ns_global_data_module, only: bc_style, scheme, &
-      exclude_bound_vert, boundary_2d, wip_diss, grad_filled
+      exclude_bound_vert, boundary_2d, wip_diss, grad_filled, zb_corr_form
     use linear_solver_module
     use mpi
     implicit none
@@ -2769,6 +2997,9 @@ contains
     call compute_corr_ducros(mesh, id_vert, sol, grad, corr, second_order)
     !call compute_corr_pressure(mesh, id_vert, sol, grad, corr, second_order)
     !call compute_corr_pressure_div(mesh, id_vert, sol, grad, corr, second_order)
+    ! zb_corr_form : F = eq. (15) (forme annoncee par tex/wip.tex), G = eq. (13) ; 8 = H = ce defaut
+    if (zb_corr_form == 6) call compute_corr_pressure(mesh, id_vert, sol, grad, corr, second_order)
+    if (zb_corr_form == 7) call compute_corr(mesh, id_vert, sol, grad, corr, h_p, second_order, 7)
 
     do j = 1, mesh%vert(id_vert)%n_sub_faces_neigh
       id_sub_face = mesh%vert(id_vert)%sub_face_neigh(j)

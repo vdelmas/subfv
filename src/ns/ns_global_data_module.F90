@@ -150,6 +150,9 @@ module ns_global_data_module
   integer, parameter :: SCHEME_LAG_LVPPP = 6  ! "LVPPP"
   integer, parameter :: SCHEME_LAG_LS1D = 7  ! "LS1D"
   integer, parameter :: SCHEME_LAG_LPF  = 8  ! "LPF"
+  integer, parameter :: SCHEME_LAG_LVPPPEP   = 9   ! "LVPPPEP"   LVPPP + energie totale nodale e_p
+  integer, parameter :: SCHEME_LAG_LVPPPESPP = 10  ! "LVPPPESPP" LVPPP + energie interne nodale eps_p
+  integer, parameter :: SCHEME_LAG_LVPPPPVP  = 11  ! "LVPPPPVP"  LVPPP, energie pbar_f (v_p.n) par sous-face
   ! Runtime scheme selection (set by init_bc_flags)
   integer :: scheme_id = 0
   ! Pilotage par namelist du balayage ZB/WIP2. -1 = laisser le scheme_id decider.
@@ -265,6 +268,15 @@ module ns_global_data_module
   ! diagnostic: multi_point_pressure star-state eps* per sub-face side, first 8 flux calls,
   ! to mpp_eps_<rank>.txt (no effect on the solution)
   logical :: mpp_eps_diag = .FALSE.
+  ! ZB_AM_* / ZB_AMISO_* : advection sans le eps (corr = 0 ; lambda = max(1e-8, -vnl, vnr))
+  logical :: zb_adv_woeps = .FALSE.
+  ! ZB_AM_* / ZB_AMISO_* / WIP : forme du eps d advection (corr). 0 = defaut du code (A pour AM, D pour AMISO,
+  ! Ducros pour WIP) ; 6 F eq.(15), 7 G eq.(13), 8 H eq.(14) de tex/wip.tex
+  integer :: zb_corr_form = 0
+  ! DIAGNOSTIC only (asked by Vincent): corr = zb_corr_scale*corr in AM/AMISO after the form. 1 = code
+  real(kind=DOUBLE) :: zb_corr_scale = 1.0_DOUBLE
+  ! corr forms of AM/AMISO: 1 = dimensionally corrected (default), 0 = legacy (reproduces bc7e1e62)
+  integer :: zb_corr_dim = 1
   ! CFL number of the convex-combination argument in LOCAL time stepping: the point-implicit
   ! update divides by V/dt + sum_lambda/ener_theta, so the weight kept on the cell's own
   ! state is alpha_c = 1 - ener_theta (cfl = 1e5 makes V/dt negligible). 1 = historical
@@ -362,7 +374,9 @@ contains
       zb_lag_mode, zb_adv_mode, zb_eps_mode, zb_eps_coef, &
       zb_pivp, zb_ppus, zb_tang, vp_gcorr, zb_lag, &
       wip_diss, zb_pdiv, &
-      local_time_step, ener_lambda_pos, ener_dump_sides, mpp_eps_diag, ener_theta, ener_internal, ener_pstar, &
+      local_time_step, ener_lambda_pos, ener_dump_sides, &
+      mpp_eps_diag, zb_adv_woeps, zb_corr_form, zb_corr_scale, zb_corr_dim, &
+      ener_theta, ener_internal, ener_pstar, &
       bc_style, boundary_2d, &
       write_residual, n_iter_residual, &
       final_res, n_max_iter, &
@@ -570,6 +584,9 @@ contains
       if (t_lag == "LSU") then; scheme_lag_id = SCHEME_LAG_LSU;   recognized = .true.; end if
       if (t_lag == "LS1D") then; scheme_lag_id = SCHEME_LAG_LS1D; recognized = .true.; end if
       if (t_lag == "LPF")  then; scheme_lag_id = SCHEME_LAG_LPF;  recognized = .true.; end if
+      if (t_lag == "LVPPPEP")   then; scheme_lag_id = SCHEME_LAG_LVPPPEP;   recognized = .true.; end if
+      if (t_lag == "LVPPPESPP") then; scheme_lag_id = SCHEME_LAG_LVPPPESPP; recognized = .true.; end if
+      if (t_lag == "LVPPPPVP")  then; scheme_lag_id = SCHEME_LAG_LVPPPPVP;  recognized = .true.; end if
       if (.not. recognized) then
         print *, "ERROR: ZB Lagrange unrecognized: '", trim(t_lag), "'"
         error stop
