@@ -179,6 +179,54 @@ contains
     end do
   end function compute_subelem_volume
 
+  pure function compute_subelem_volume_nonplanar(mesh, i) result(vol)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: i
+    real(kind=DOUBLE) :: vol
+
+    integer(kind=ENTIER) :: j, k, kp, km, idvp, idv, idvm
+    integer(kind=ENTIER) :: id_sub_face, id_vert, id_face, id_elem
+    real(kind=DOUBLE), dimension(3) :: cf, cp, cpm, cpp, ce
+
+    id_elem = mesh%sub_elem(i)%mesh_elem
+    ce = mesh%elem(id_elem)%coord
+
+    vol = 0.0_DOUBLE
+    do j=1, mesh%sub_elem(i)%n_sub_faces
+      id_sub_face = mesh%sub_elem(i)%sub_face(j)
+      id_vert = mesh%sub_face(id_sub_face)%mesh_vert
+      id_face = mesh%sub_face(id_sub_face)%mesh_face
+
+      cf = compute_face_cgeom(mesh, id_face)
+      do k=1, mesh%face(id_face)%n_vert
+        idv = mesh%face(id_face)%vert(k)
+        if( idv == id_vert ) then
+          kp = 1+mod((k-1)+1, mesh%face(id_face)%n_vert)
+          km = 1+mod((k-1)-1+mesh%face(id_face)%n_vert,&
+            mesh%face(id_face)%n_vert)
+          exit
+        end if
+      end do
+      idvp = mesh%face(id_face)%vert(kp)
+      idvm = mesh%face(id_face)%vert(km)
+      cp = mesh%vert(idv)%coord
+      cpm = 0.5_DOUBLE*(mesh%vert(idvm)%coord+cp)
+      cpp = 0.5_DOUBLE*(mesh%vert(idvp)%coord+cp)
+
+      if( mesh%face(id_face)%left_neigh == id_elem ) then
+        vol = vol &
+          + (dot_product(cross_product(cpm-cf, cp-cf), cf-ce))/6.0_DOUBLE&
+          + (dot_product(cross_product(cp-cf, cpp-cf), cf-ce))/6.0_DOUBLE
+      else
+        vol = vol &
+          + (dot_product(cross_product(cpp-cf, cp-cf), cf-ce))/6.0_DOUBLE&
+          + (dot_product(cross_product(cp-cf, cpm-cf), cf-ce))/6.0_DOUBLE
+      end if
+    end do
+  end function compute_subelem_volume_nonplanar
+
   pure function compute_face_norm(mesh, i) result(norm)
     implicit none
 
