@@ -275,6 +275,43 @@ contains
       + cross_product(cp-cf, cpp-cf))
   end function compute_subface_norm
 
+  pure function compute_subface_norm_nonplanar(mesh, i) result(norm)
+    implicit none
+
+    type(mesh_type), intent(in) :: mesh
+    integer(kind=ENTIER), intent(in) :: i
+    real(kind=DOUBLE), dimension(3) :: norm
+
+    integer(kind=ENTIER) :: id_face, id_vert, n
+    integer(kind=ENTIER) :: j, jp, jm, idvp, k, idvm
+
+    real(kind=DOUBLE), dimension(3) :: cpm, cp, cpp, cf, sf
+
+    id_vert = mesh%sub_face(i)%mesh_vert
+    id_face = mesh%sub_face(i)%mesh_face
+    n = mesh%face(id_face)%n_vert
+    cf = compute_face_cgeom(mesh, id_face)
+
+    sf = 0.0_DOUBLE
+    do j=1, n
+      jp = 1+mod(j, n)
+      sf = sf + cross_product(mesh%vert(mesh%face(id_face)%vert(j))%coord-cf, &
+        mesh%vert(mesh%face(id_face)%vert(jp))%coord-cf)
+      if( mesh%face(id_face)%vert(j) == id_vert ) k = j
+    end do
+
+    jp = 1+mod(k, n)
+    jm = 1+mod(k-2+n, n)
+    idvp = mesh%face(id_face)%vert(jp)
+    idvm = mesh%face(id_face)%vert(jm)
+    cp = mesh%vert(id_vert)%coord
+    cpm = mesh%vert(idvm)%coord
+    cpp = mesh%vert(idvp)%coord
+
+    norm = (cross_product(cpm-cf, cp-cf) + cross_product(cp-cf, cpp-cf) &
+      + sf/real(n, DOUBLE))/6.0_DOUBLE
+  end function compute_subface_norm_nonplanar
+
   subroutine compute_vert_volume(mesh)
     implicit none
 
